@@ -54,12 +54,14 @@ Player Sorter is a comprehensive desktop application designed to organize and ma
 ### Get Started
 
 #### For *Windows* and *Linux*
-Download and run the executable for your OS.
+Download and run the executable[^1] for your OS.
 
-#### For MacOS
+#### For *MacOS*
 
 [!NOTE]
 I'm not planning to add an executable for MacOS because of lacking a device running MacOS needed to compile the executable, so you'll have to run the .py file directly.
 
 1. Make sure Python is installed and properly configured.
 2. Simply run `python player_sorter.py` and select your theme to begin organizing professional tournaments in minutes!
+
+[^1]: The executables are generated with Pyinstaller. If you don't like the binaries or something doesn't work, you can generate them yourself. [Good first read](https://github.com/oop7/Py-to-EXE-Guide)
