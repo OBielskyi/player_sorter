@@ -1522,11 +1522,11 @@ class PlayerSorterApp:
         note_frame.pack(pady=10, padx=20, fill=tk.X)
         ttk.Label(
             note_frame,
-            text=f"Scheveningen has fixed rounds:\n"
-            f"Team size: {self.scheveningen_team_size} players per team\n"
-            (
-            f"Total rounds: {self.scheveningen_team_size} "
-            "(each player plays each opponent once)"
+            text=(
+                f"Scheveningen has fixed rounds:\n"
+                f"Team size: {self.scheveningen_team_size} players per team\n"
+                f"Total rounds: {self.scheveningen_team_size} "
+                "(each player plays each opponent once)"
             ),
             font=("Arial", 9),
             justify=tk.LEFT,
