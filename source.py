@@ -270,11 +270,11 @@ class PlayerSorterApp:
         try:
             # Try Windows/Linux method first
             self.root.state("zoomed")
-        except:
+        except tk.TclError:
             try:
                 # Try macOS method
                 self.root.attributes("-zoomed", True)
-            except:
+            except Exception:
                 # Fallback: maximize manually by setting geometry to screen size
                 screen_width = self.root.winfo_screenwidth()
                 screen_height = self.root.winfo_screenheight()
@@ -314,7 +314,7 @@ class PlayerSorterApp:
                     if theme == "Simple White":
                         theme = "Simple Light"
                     return theme
-        except:
+        except (OSError, json.JSONDecodeError):
             pass
         return "Simple Light"  # Default theme
 
@@ -323,7 +323,7 @@ class PlayerSorterApp:
         try:
             with open("player_sorter_theme.json", "w") as f:
                 json.dump({"theme": theme_name}, f)
-        except:
+        except (OSError, TypeError):
             pass
 
     def apply_theme(self, theme_name):
@@ -344,7 +344,7 @@ class PlayerSorterApp:
         if theme_name != "Simple Light":
             try:
                 style.theme_use("clam")  # Most customizable theme
-            except:
+            except tk.TclError:
                 pass
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
