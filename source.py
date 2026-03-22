@@ -4870,7 +4870,6 @@ class PlayerSorterApp:
                 for p in players:
                     if p.name in player.opponents:
                         # Find result against this opponent
-                        idx = player.opponents.index(p.name)
                         # Simplified: assume we can determine result from records
                         tb_score += p.points * 0.5  # Approximate
             elif self.tiebreak_method == "rating":
@@ -5129,7 +5128,7 @@ class PlayerSorterApp:
 
 def main():
     root = tk.Tk()
-    app = PlayerSorterApp(root)
+    PlayerSorterApp(root)
     root.mainloop()
 
 
