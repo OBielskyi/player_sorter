@@ -1,0 +1,19 @@
+[tool.ruff]
+# Set the maximum line length to 88 (similar to Black).
+line-length = 88
+
+[tool.ruff.lint]
+# Enable Pyflakes (F), PEP8-style (E), and isort (I) rules.
+select = ["E", "F", "I"]
+ignore = []
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    "venv",
+    "__pycache__",
+]
+
+[tool.ruff.format]
+# Enable auto-formatting
+quote-style = "double"
