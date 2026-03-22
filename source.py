@@ -186,7 +186,8 @@ class Player:
 
     @property
     def display_name(self):
-        """Get name for display (prioritize nickname for e-sports, full name for chess)"""
+        """Get name for display
+        (prioritize nickname for e-sports, full name for chess)"""
         return self.name
 
     @property
@@ -269,11 +270,11 @@ class PlayerSorterApp:
         try:
             # Try Windows/Linux method first
             self.root.state("zoomed")
-        except:
+        except tk.TclError:
             try:
                 # Try macOS method
                 self.root.attributes("-zoomed", True)
-            except:
+            except Exception:
                 # Fallback: maximize manually by setting geometry to screen size
                 screen_width = self.root.winfo_screenwidth()
                 screen_height = self.root.winfo_screenheight()
@@ -291,7 +292,9 @@ class PlayerSorterApp:
         self.half_bye_enabled = False  # Track if half-byes are allowed
         self.withdrawal_enabled = False  # Track if withdrawals are allowed
         self.max_rounds = None  # Maximum rounds (None = unlimited)
-        self.rating_mode = None  # 'automatic', 'manual', or 'unranked' for chess; 'ranked' or 'unranked' for esports
+        self.rating_mode = None
+        """'automatic', 'manual', or 'unranked' for chess;
+        'ranked' or 'unranked' for e-sports"""
         self.min_elo = 1000  # Minimum ELO for tournament (chess only)
         self.max_elo = None  # Maximum ELO for tournament (chess only, None = unlimited)
 
@@ -311,7 +314,7 @@ class PlayerSorterApp:
                     if theme == "Simple White":
                         theme = "Simple Light"
                     return theme
-        except:
+        except (OSError, json.JSONDecodeError):
             pass
         return "Simple Light"  # Default theme
 
@@ -320,7 +323,7 @@ class PlayerSorterApp:
         try:
             with open("player_sorter_theme.json", "w") as f:
                 json.dump({"theme": theme_name}, f)
-        except:
+        except (OSError, TypeError):
             pass
 
     def apply_theme(self, theme_name):
@@ -341,7 +344,7 @@ class PlayerSorterApp:
         if theme_name != "Simple Light":
             try:
                 style.theme_use("clam")  # Most customizable theme
-            except:
+            except tk.TclError:
                 pass
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
@@ -759,7 +762,8 @@ class PlayerSorterApp:
         self.show_half_bye_option()
 
     def show_half_bye_option(self):
-        """Show tournament configuration options (half-byes, withdrawals, max rounds, rating mode)"""
+        """Show tournament configuration options
+        (half-byes, withdrawals, max rounds, rating mode)"""
         self.clear_window()
 
         frame = ttk.Frame(self.root, padding="30")
@@ -893,7 +897,10 @@ class PlayerSorterApp:
 
         ttk.Label(
             wd_frame,
-            text="Allow players to withdraw from the tournament between rounds?\nWithdrawn players keep their score but stop playing.",
+            text=(
+                "Allow players to withdraw from the tournament between rounds?\n"
+                "Withdrawn players keep their score but stop playing."
+            ),
             font=("Arial", 11),
             wraplength=700,
         ).pack(pady=8)
@@ -1079,7 +1086,10 @@ class PlayerSorterApp:
                     if self.max_elo < self.min_elo:
                         messagebox.showwarning(
                             "Invalid Input",
-                            f"Maximum ELO ({self.max_elo}) must be greater than or equal to minimum ELO ({self.min_elo})",
+                            (
+                            f"Maximum ELO ({self.max_elo}) must be greater than "
+                            f"or equal to minimum ELO ({self.min_elo})"
+                            ),
                         )
                         return
                 except ValueError:
@@ -1161,7 +1171,8 @@ class PlayerSorterApp:
         self.show_scheveningen_settings()
 
     def show_knockout_settings(self):
-        """Show Knockout tournament settings (rating mode only, no half-byes/withdrawals/max rounds)"""
+        """Show Knockout tournament settings
+        (rating mode only, no half-byes/withdrawals/max rounds)"""
         self.clear_window()
 
         frame = ttk.Frame(self.root, padding="20")
@@ -1344,7 +1355,10 @@ class PlayerSorterApp:
                     if self.max_elo < self.min_elo:
                         messagebox.showwarning(
                             "Invalid Input",
-                            f"Maximum ELO ({self.max_elo}) must be greater than or equal to minimum ELO ({self.min_elo})",
+                            (
+                            f"Maximum ELO ({self.max_elo}) must be greater than "
+                            f"or equal to minimum ELO ({self.min_elo})"
+                            ),
                         )
                         return
                 except ValueError:
@@ -1479,7 +1493,10 @@ class PlayerSorterApp:
 
         ttk.Label(
             wd_frame,
-            text="Allow players to withdraw from the tournament between rounds?\nWithdrawn players keep their score but stop playing.",
+            text=(
+                "Allow players to withdraw from the tournament between rounds?\n"
+                "Withdrawn players keep their score but stop playing."
+            ),
             font=("Arial", 10),
             wraplength=450,
         ).pack(pady=5)
@@ -1505,9 +1522,12 @@ class PlayerSorterApp:
         note_frame.pack(pady=10, padx=20, fill=tk.X)
         ttk.Label(
             note_frame,
-            text=f"Scheveningen has fixed rounds:\n"
-            f"Team size: {self.scheveningen_team_size} players per team\n"
-            f"Total rounds: {self.scheveningen_team_size} (each player plays each opponent once)",
+            text=(
+                f"Scheveningen has fixed rounds:\n"
+                f"Team size: {self.scheveningen_team_size} players per team\n"
+                f"Total rounds: {self.scheveningen_team_size} "
+                "(each player plays each opponent once)"
+            ),
             font=("Arial", 9),
             justify=tk.LEFT,
         ).pack()
@@ -1620,7 +1640,10 @@ class PlayerSorterApp:
                     if self.max_elo < self.min_elo:
                         messagebox.showwarning(
                             "Invalid Input",
-                            f"Maximum ELO ({self.max_elo}) must be greater than or equal to minimum ELO ({self.min_elo})",
+                            (
+                            f"Maximum ELO ({self.max_elo}) must be greater than "
+                            f"or equal to minimum ELO ({self.min_elo})"
+                            ),
                         )
                         return
                 except ValueError:
@@ -1886,7 +1909,10 @@ class PlayerSorterApp:
             if not ((first_name and last_name) or nickname):
                 messagebox.showwarning(
                     "Input Error",
-                    "Please enter either:\n- First Name AND Last Name\n- OR Nickname\n- OR all three",
+                    (
+                    "Please enter either:\n- First Name AND Last Name\n"
+                    "- OR Nickname\n- OR all three"
+                    ),
                 )
                 return
         else:
@@ -2070,7 +2096,10 @@ class PlayerSorterApp:
             if data.get("game_type") != self.game_type:
                 messagebox.showwarning(
                     "Wrong Game Type",
-                    f"Save file is for {data.get('game_type', 'unknown')} but current mode is {self.game_type}",
+                    (
+                    f"Save file is for {data.get('game_type', 'unknown')} "
+                    f"but current mode is {self.game_type}"
+                    ),
                 )
                 return False
 
@@ -2079,7 +2108,8 @@ class PlayerSorterApp:
 
             # Load players
             for player_data in data.get("players", []):
-                # Support both old format (name) and new format (first_name, last_name, nickname)
+                """Support both old format (name) and
+                new format (first_name, last_name, nickname)"""
                 if "first_name" in player_data or "nickname" in player_data:
                     # New format
                     player = Player(
@@ -2421,7 +2451,10 @@ class PlayerSorterApp:
             leftover_frame.pack(fill=tk.X, padx=5, pady=5)
             ttk.Label(
                 leftover_frame,
-                text=f"{leftover.name} ({rating_name}: {leftover.rating}, WR: {leftover.win_rate:.1f}%)",
+                text=(
+                f"{leftover.name} ({rating_name}: {leftover.rating}, "
+                f"WR: {leftover.win_rate:.1f}%)"
+                ),
                 font=("Arial", 10),
             ).pack(anchor=tk.W)
             # Bye round counts as 1 full point
@@ -2710,7 +2743,10 @@ class PlayerSorterApp:
         active_players = [p for p in self.players if not p.eliminated]
         title = ttk.Label(
             frame,
-            text=f"Battle Royale - Round {self.current_round} ({len(active_players)} players remaining)",
+            text=(
+                f"Battle Royale - Round {self.current_round} "
+                f"({len(active_players)} players remaining)"
+            ),
             font=("Arial", 16, "bold"),
         )
         title.pack(pady=10)
@@ -3278,7 +3314,10 @@ class PlayerSorterApp:
 
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
-                text=f"Team {i} (Avg {rating_name}: {avg_rating:.1f}, Total WR: {total_winrate:.1f}%)",
+                text=(
+                    f"Team {i} (Avg {rating_name}: {avg_rating:.1f}, "
+                    f"Total WR: {total_winrate:.1f}%)"
+                ),
                 padding="10",
             )
             team_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -3288,7 +3327,10 @@ class PlayerSorterApp:
                 player_frame.pack(fill=tk.X, pady=2)
 
                 # Player info
-                info_text = f"{player.name} ({rating_name}: {player.rating}, WR: {player.win_rate:.1f}%)"
+                info_text = (
+                    f"{player.name} ({rating_name}: {player.rating}, "
+                    f"WR: {player.win_rate:.1f}%)"
+                )
                 ttk.Label(
                     player_frame, text=info_text, font=("Arial", 9), width=40
                 ).pack(side=tk.LEFT)
@@ -3397,7 +3439,10 @@ class PlayerSorterApp:
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
-                text=f"#{rank} - Team {team_num} (Total WR: {total_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})",
+                text=(
+                    f"#{rank} - Team {team_num} (Total WR: {total_wr:.1f}%, "
+                    f"Avg {rating_name}: {avg_rating:.1f})"
+                ),
                 padding="10",
             )
             team_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -3419,7 +3464,8 @@ class PlayerSorterApp:
             for player in sorted(team, key=lambda p: p.win_rate, reverse=True):
                 player_text = (
                     f"  • {player.name} - {rating_name}: {player.rating}, "
-                    f"WR: {player.win_rate:.1f}% ({player.wins}W-{player.losses}L-{player.draws}D)"
+                    f"WR: {player.win_rate:.1f}% "
+                    f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
                 ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
                     anchor=tk.W, pady=1
@@ -3516,7 +3562,10 @@ class PlayerSorterApp:
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
-                text=f"#{rank} - Team {team_num} (Total WR: {total_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})",
+                text=(
+                    f"#{rank} - Team {team_num} "
+                    f"(Total WR: {total_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})"
+                ),
                 padding="10",
             )
             team_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -3538,7 +3587,8 @@ class PlayerSorterApp:
             for player in sorted(team, key=lambda p: p.win_rate, reverse=True):
                 player_text = (
                     f"  • {player.name} - {rating_name}: {player.rating}, "
-                    f"WR: {player.win_rate:.1f}% ({player.wins}W-{player.losses}L-{player.draws}D)"
+                    f"WR: {player.win_rate:.1f}% "
+                    f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
                 ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
                     anchor=tk.W, pady=1
@@ -3565,7 +3615,8 @@ class PlayerSorterApp:
         """
         Calculate ELO rating change based on game result
         result: 1.0 for win, 0.5 for draw, 0.0 for loss
-        mode: 'otb' for Online/OTB (K=32), 'correspondence' for Daily/Correspondence (K=48)
+        mode: 'otb' for Online/OTB (K=32),
+        'correspondence' for Daily/Correspondence (K=48)
         """
         # Set K-factor based on mode
         if mode == "correspondence":
@@ -3755,7 +3806,10 @@ class PlayerSorterApp:
             if len(self.players) < required:
                 messagebox.showwarning(
                     "Not Enough Players",
-                    f"Need exactly {required} players for Scheveningen with {self.scheveningen_team_size} per team",
+                    (
+                        f"Need exactly {required} players for Scheveningen "
+                        f"with {self.scheveningen_team_size} per team"
+                    ),
                 )
                 return
         elif len(self.players) < min_req:
@@ -4180,7 +4234,10 @@ class PlayerSorterApp:
 
             ttk.Label(
                 halfbye_frame,
-                text="Players can request a half-bye (0.5 points) to skip the next round.",
+                text=(
+                    "Players can request a half-bye (0.5 points) "
+                    "to skip the next round."
+                ),
                 font=("Arial", 9),
             ).pack(pady=5)
 
@@ -4212,7 +4269,10 @@ class PlayerSorterApp:
 
             ttk.Label(
                 withdrawal_frame,
-                text="Select players to withdraw from the tournament (they keep their current score).",
+                text=(
+                    "Select players to withdraw from the tournament "
+                    "(they keep their current score)."
+                ),
                 font=("Arial", 9),
             ).pack(pady=5)
 
@@ -4261,7 +4321,8 @@ class PlayerSorterApp:
             ).pack(side=tk.LEFT, padx=5)
 
     def next_scheveningen_round(self):
-        """Process half-bye and withdrawal requests, then continue to next Scheveningen round"""
+        """Process half-bye and withdrawal requests,
+        then continue to next Scheveningen round"""
         # Apply withdrawal requests if enabled
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
             for player_name, var in self.withdrawal_vars.items():
@@ -4646,7 +4707,10 @@ class PlayerSorterApp:
 
             ttk.Label(
                 halfbye_frame,
-                text="Players can request a half-bye (0.5 points) to skip the next round.",
+                text=(
+                    "Players can request a half-bye (0.5 points) "
+                    "to skip the next round."
+                ),
                 font=("Arial", 9),
             ).pack(pady=5)
 
@@ -4677,7 +4741,10 @@ class PlayerSorterApp:
 
             ttk.Label(
                 withdrawal_frame,
-                text="Select players to withdraw from the tournament (they keep their current score).",
+                text=(
+                    "Select players to withdraw from the tournament "
+                    "(they keep their current score)."
+                ),
                 font=("Arial", 9),
             ).pack(pady=5)
 
@@ -4827,7 +4894,8 @@ class PlayerSorterApp:
         )
 
         # Integrate withdrawn players into the main ranking based on points
-        # Players with equal points: active players rank first (they completed the tournament)
+        """Players with equal points: active players rank first
+        (they completed the tournament)"""
         final_result = []
         active_idx = 0
         withdrawn_idx = 0
