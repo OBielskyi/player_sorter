@@ -59,7 +59,7 @@ Download and run the executable[^1] for your OS.
 #### For *MacOS*
 
 [!NOTE]
-I'm not planning to add an executable for MacOS because of lacking a device running MacOS needed to compile the executable [^2], so you'll have to run the .py file directly.
+I'm not planning to add an executable for MacOS because of lacking a device running MacOS needed to compile the executable[^2], so you'll have to run the .py file directly.
 
 1. Make sure Python is installed and properly configured.
 2. Simply run `python player_sorter.py` and select your theme to begin organizing professional tournaments in minutes!
