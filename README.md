@@ -59,9 +59,10 @@ Download and run the executable[^1] for your OS.
 #### For *MacOS*
 
 [!NOTE]
-I'm not planning to add an executable for MacOS because of lacking a device running MacOS needed to compile the executable, so you'll have to run the .py file directly.
+I'm not planning to add an executable for MacOS because of lacking a device running MacOS needed to compile the executable, so you'll have to run the .py file directly. [^2]
 
 1. Make sure Python is installed and properly configured.
 2. Simply run `python player_sorter.py` and select your theme to begin organizing professional tournaments in minutes!
 
-[^1]: The executables are generated with Pyinstaller. If you don't like the binaries or something doesn't work, you can generate them yourself. [Good first read](https://github.com/oop7/Py-to-EXE-Guide)
+[^1]: The executables before version 1.2.0 are generated with *Pyinstaller* (V1.2.0 introduced faster and smaller *Nuitka*-compiled executables). If you don't like the binaries or something doesn't work, you can create them yourself.
+[^2]: It's also possible (and not too difficult) to create your own executable binary for your OS. [Good first read](https://github.com/oop7/Py-to-EXE-Guide)
