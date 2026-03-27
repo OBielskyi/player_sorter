@@ -2,6 +2,12 @@
 
 **A professional, feature-rich tournament management application for chess and e-sports competitions.**
 
+![Screenshot 1](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/1.png)
+![Screenshot 2](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/2.png)
+![Screenshot 3](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/3.png)
+![Screenshot 4](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/4.png)
+[More screenshots?](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/)
+
 ## Description
 
 Player Sorter is a comprehensive desktop application designed to organize and manage tournaments with ease. Built with Python and tkinter, it requires no external dependencies and runs seamlessly on Windows, macOS, and Linux.
