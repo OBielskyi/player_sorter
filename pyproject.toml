@@ -17,3 +17,8 @@ exclude = [
 [tool.ruff.format]
 # Enable auto-formatting
 quote-style = "double"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.9",
+]
