@@ -2827,11 +2827,6 @@ class PlayerSorterApp:
         ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
             side=tk.LEFT, padx=5
         )
-        ttk.Button(
-            btn_frame,
-            text="💾 Save & Exit",
-            command=self._save_and_exit_tournament,
-        ).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Finish Round", command=self.finish_dual_round).pack(
             side=tk.LEFT, padx=5
         )
@@ -4776,9 +4771,24 @@ class PlayerSorterApp:
                 font=("Arial", 10),
             ).pack(anchor=tk.W, pady=2)
 
-        ttk.Button(frame, text="← Back to Setup", command=self.back_to_setup).pack(
-            pady=20
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
+            side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="📋 View Round-by-Round Details",
+            command=lambda: self.show_round_by_round_viewer(
+                self.tournament_history, readonly=True
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
     # ===== SHARED TOURNAMENT METHODS =====
     def _record_round_to_history(self, system):
@@ -5226,6 +5236,11 @@ class PlayerSorterApp:
         ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="💾 Save & Exit",
+            command=self._save_and_exit_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
         # Check if tournament should continue or auto-finish
         should_auto_finish = False
