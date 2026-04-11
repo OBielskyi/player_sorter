@@ -244,14 +244,19 @@ class Player:
 
     @classmethod
     def from_dict(cls, data):
+        # Support legacy saves that stored a single "name" field
+        name_str = data.get("name", "")
+        name_parts = name_str.split(" ", 1)
         player = cls(
-            data["name"],
-            data["rating"],
-            data.get("wins", 0),
-            data.get("losses", 0),
-            data.get("draws", 0),
-            data.get("byes", 0),
-            data.get("half_byes", 0),
+            first_name=name_parts[0] if len(name_parts) > 0 else "",
+            last_name=name_parts[1] if len(name_parts) > 1 else "",
+            nickname="",
+            rating=data.get("rating", 0),
+            wins=data.get("wins", 0),
+            losses=data.get("losses", 0),
+            draws=data.get("draws", 0),
+            byes=data.get("byes", 0),
+            half_byes=data.get("half_byes", 0),
         )
         player.eliminated = data.get("eliminated", False)
         player.withdrawn = data.get("withdrawn", False)
@@ -631,6 +636,7 @@ class PlayerSorterApp:
 
         # If only one file, load it directly
         if len(file_entries) == 1:
+            self.clear_window()
             self._open_tournament_entry(file_entries[0])
             return
 
@@ -709,7 +715,9 @@ class PlayerSorterApp:
         def on_delete():
             selected = tree.selection()
             if not selected:
-                messagebox.showwarning("No Selection", "Please select a tournament to delete.")
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to delete."
+                )
                 return
             filepath = selected[0]
             entry = next(e for e in file_entries if e["filepath"] == filepath)
@@ -2053,7 +2061,7 @@ class PlayerSorterApp:
         ttk.Button(
             button_frame,
             text="Load Players",
-            command=lambda: self.load_players() and self.refresh_player_list(),
+            command=self._load_and_refresh,
         ).pack(side=tk.LEFT, padx=5)
 
         # Action buttons
@@ -2067,7 +2075,7 @@ class PlayerSorterApp:
             action_frame,
             text="Start Game",
             command=self.start_game,
-            style="Accent.TButton",
+            style="Large.TButton",
         ).pack(side=tk.RIGHT, padx=5)
 
         # Bind Enter key to add player - all fields
@@ -2384,6 +2392,11 @@ class PlayerSorterApp:
             messagebox.showerror("Load Error", f"Failed to load players: {str(e)}")
             return False
 
+    def _load_and_refresh(self):
+        """Load players from file and refresh the list display."""
+        if self.load_players():
+            self.refresh_player_list()
+
     def auto_load_players(self):
         """Automatically load players when entering player input screen"""
         if self.load_players():
@@ -2400,8 +2413,6 @@ class PlayerSorterApp:
         File naming convention:
         tournament_YYYY-MM-DD_HH-MM-SS_SYSTEM_[finished|unfinished].json
         """
-        import datetime
-
         # Use stored start time, or generate one now as fallback
         timestamp = getattr(self, "tournament_start_time", None)
         if not timestamp:
@@ -2645,10 +2656,6 @@ class PlayerSorterApp:
                 value="unranked",
             ).pack(anchor=tk.W, pady=5, padx=20)
 
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=20)
-
         # Max Rounds input for Dual and Teams mode
         if self.sort_mode in ["dual", "teams"]:
             rounds_frame = ttk.LabelFrame(frame, text="Tournament Length", padding="15")
@@ -2882,7 +2889,9 @@ class PlayerSorterApp:
         """Process dual round results and show standings"""
         # Check all matches have results
         for pair, result_var in self.dual_results:
-            if result_var.get() == "" and result_var.get() != "bye":
+            if(result_var.get() == ""
+               or result_var.get() not in ["p1_win", "p2_win", "draw", "bye"]
+            ):
                 messagebox.showwarning(
                     "Incomplete", "Please set results for all matches"
                 )
@@ -4232,11 +4241,6 @@ class PlayerSorterApp:
         for player in self.players:
             player.opponents = []
             player.colors = []
-
-        self.tournament_history = []
-        self.tournament_start_time = datetime.datetime.now().strftime(
-            "%Y-%m-%d_%H-%M-%S"
-        )
 
         if self.tournament_system == "swiss":
             self.show_swiss_round()
