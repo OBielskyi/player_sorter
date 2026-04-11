@@ -7,6 +7,7 @@ Supports Chess (ELO) and E-sports (Trophies) with three modes:
 - Teams: Create balanced teams
 """
 
+import datetime
 import json
 import os
 import random
@@ -243,14 +244,19 @@ class Player:
 
     @classmethod
     def from_dict(cls, data):
+        # Support legacy saves that stored a single "name" field
+        name_str = data.get("name", "")
+        name_parts = name_str.split(" ", 1)
         player = cls(
-            data["name"],
-            data["rating"],
-            data.get("wins", 0),
-            data.get("losses", 0),
-            data.get("draws", 0),
-            data.get("byes", 0),
-            data.get("half_byes", 0),
+            first_name=name_parts[0] if len(name_parts) > 0 else "",
+            last_name=name_parts[1] if len(name_parts) > 1 else "",
+            nickname="",
+            rating=data.get("rating", 0),
+            wins=data.get("wins", 0),
+            losses=data.get("losses", 0),
+            draws=data.get("draws", 0),
+            byes=data.get("byes", 0),
+            half_byes=data.get("half_byes", 0),
         )
         player.eliminated = data.get("eliminated", False)
         player.withdrawn = data.get("withdrawn", False)
@@ -283,6 +289,10 @@ class PlayerSorterApp:
         # Allow window resizing
         self.root.resizable(True, True)
 
+        # Fullscreen toggle: F11 and Alt+Enter
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Alt-Return>", self._toggle_fullscreen)
+
         self.game_type = None
         self.sort_mode = None
         self.players: List[Player] = []
@@ -292,6 +302,9 @@ class PlayerSorterApp:
         self.half_bye_enabled = False  # Track if half-byes are allowed
         self.withdrawal_enabled = False  # Track if withdrawals are allowed
         self.max_rounds = None  # Maximum rounds (None = unlimited)
+        self.tournament_history = []
+        # List of round dicts, populated during tournament play
+        self.tournament_start_time = None
         self.rating_mode = None
         """'automatic', 'manual', or 'unranked' for chess;
         'ranked' or 'unranked' for e-sports"""
@@ -302,6 +315,11 @@ class PlayerSorterApp:
         self.apply_theme(self.current_theme)
 
         self.show_theme_selection()
+
+    def _toggle_fullscreen(self, event=None):
+        """Toggle true fullscreen mode (F11 / Alt+Enter)."""
+        is_fullscreen = self.root.attributes("-fullscreen")
+        self.root.attributes("-fullscreen", not is_fullscreen)
 
     def load_theme_preference(self):
         """Load saved theme preference"""
@@ -340,12 +358,17 @@ class PlayerSorterApp:
         # Configure ttk styles
         style = ttk.Style()
 
-        # Try to use a theme that supports dark backgrounds if needed
-        if theme_name != "Simple Light":
-            try:
-                style.theme_use("clam")  # Most customizable theme
-            except tk.TclError:
-                pass
+        # Always use 'clam' as the base ttk theme.
+        # On Windows the default 'vista'/'winnative' theme intercepts colour
+        # properties and ignores custom styles on first paint, making Simple
+        # Light look broken until a round-trip through another theme forces
+        # clam to be active.  Unconditionally setting clam here means all
+        # themes — including Simple Light — render correctly from the very
+        # first launch on every platform.
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
         style.configure("TFrame", background=theme["bg"])
@@ -549,10 +572,236 @@ class PlayerSorterApp:
             command=lambda: self.select_game_type("esports"),
         ).pack(side=tk.LEFT, padx=15)
 
+        # Load tournament button
+        ttk.Button(
+            frame,
+            text="📂 Load a Tournament",
+            width=30,
+            command=self.show_load_tournament_screen,
+        ).pack(pady=10)
+
         # Theme switcher button at bottom
         ttk.Button(
             frame, text="🎨 Change Theme", width=20, command=self.show_theme_selection
         ).pack(pady=20)
+
+    def show_load_tournament_screen(self):
+        """Scan the current directory for saved tournament files and let the user
+        pick one to view (finished) or resume (unfinished)."""
+        import glob
+
+        # Find all tournament save files
+        pattern = "tournament_*_*.json"
+        files = glob.glob(pattern)
+
+        if not files:
+            messagebox.showinfo(
+                "No Tournaments Found",
+                "No saved tournament files were found in the program's directory.",
+            )
+            return
+
+        # Parse each file to get metadata without loading fully
+        file_entries = []
+        for filepath in files:
+            try:
+                with open(filepath, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                file_entries.append(
+                    {
+                        "filepath": filepath,
+                        "finished": meta.get("finished", False),
+                        "system": meta.get("tournament_system", "unknown"),
+                        "start_time": meta.get("tournament_start_time", "unknown"),
+                        "current_round": meta.get("current_round", 0),
+                        "player_count": len(meta.get("players", [])),
+                    }
+                )
+            except Exception:
+                continue  # Skip unreadable files silently
+
+        if not file_entries:
+            messagebox.showerror(
+                "Error", "Found tournament files but could not read any."
+            )
+            return
+
+        # Sort: unfinished first, then finished — both groups newest to oldest
+        unfinished = sorted(
+            [e for e in file_entries if not e["finished"]],
+            key=lambda e: e["start_time"],
+            reverse=True,
+        )
+        finished = sorted(
+            [e for e in file_entries if e["finished"]],
+            key=lambda e: e["start_time"],
+            reverse=True,
+        )
+        file_entries = unfinished + finished
+
+        # If only one file, load it directly
+        if len(file_entries) == 1:
+            self.clear_window()
+            self._open_tournament_entry(file_entries[0])
+            return
+
+        # Otherwise display list for user to choose from
+        self.clear_window()
+        frame = ttk.Frame(self.root, padding="40")
+        frame.pack(expand=True, fill=tk.BOTH)
+
+        ttk.Label(frame, text="Load a Tournament", font=("Arial", 24, "bold")).pack(
+            pady=20
+        )
+        ttk.Label(
+            frame,
+            text="Select a tournament to view or resume. "
+            "Unfinished tournaments are listed first.",
+            font=("Arial", 12),
+        ).pack(pady=5)
+
+        list_frame = ttk.Frame(frame)
+        list_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        cols = ["status", "date_time", "system", "rounds_played", "players"]
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=15)
+        tree.heading("status", text="Status")
+        tree.heading("date_time", text="Date & Time")
+        tree.heading("system", text="System")
+        tree.heading("rounds_played", text="Rounds Played")
+        tree.heading("players", text="Players")
+        tree.column("status", width=110)
+        tree.column("date_time", width=180)
+        tree.column("system", width=120)
+        tree.column("rounds_played", width=120)
+        tree.column("players", width=70)
+
+        system_display = {
+            "swiss": "Swiss",
+            "round_robin": "Round-Robin",
+            "knockout": "Knockout",
+            "scheveningen": "Scheveningen",
+        }
+
+        for entry in file_entries:
+            status = "⚠ UNFINISHED" if not entry["finished"] else "✓ Finished"
+            dt = entry["start_time"].replace("_", " ")  # Nicer display
+            sys_name = system_display.get(entry["system"], entry["system"].title())
+            tree.insert(
+                "",
+                tk.END,
+                iid=entry["filepath"],  # Use filepath as row ID for easy retrieval
+                values=(
+                    status,
+                    dt,
+                    sys_name,
+                    entry["current_round"],
+                    entry["player_count"],
+                ),
+            )
+
+        scroll = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscroll=scroll.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=15)
+
+        def on_load():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning("No Selection", "Please select a tournament.")
+                return
+            filepath = selected[0]  # We used filepath as iid
+            entry = next(e for e in file_entries if e["filepath"] == filepath)
+            self._open_tournament_entry(entry)
+
+        def on_delete():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to delete."
+                )
+                return
+            filepath = selected[0]
+            entry = next(e for e in file_entries if e["filepath"] == filepath)
+            dt_display = entry["start_time"].replace("_", " ")
+            status_word = "unfinished" if not entry["finished"] else "finished"
+            confirmed = messagebox.askyesno(
+                "Confirm Deletion",
+                f"Permanently delete this {status_word} tournament?\n\n"
+                f"  Date/Time: {dt_display}\n"
+                f"  System:    {entry['system'].replace('_', '-').title()}\n\n"
+                "This cannot be undone.",
+            )
+            if not confirmed:
+                return
+            try:
+                os.remove(filepath)
+            except OSError as exc:
+                messagebox.showerror("Delete Failed", f"Could not delete file:\n{exc}")
+                return
+            # Remove from our in-memory list and the treeview, then refresh
+            file_entries[:] = [e for e in file_entries if e["filepath"] != filepath]
+            tree.delete(filepath)
+            # If no entries remain, go back to the main screen
+            if not file_entries:
+                messagebox.showinfo("All Gone", "No saved tournaments remaining.")
+                self.show_initial_selection()
+
+        ttk.Button(btn_frame, text="Back", command=self.show_initial_selection).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(
+            btn_frame,
+            text="Delete Selected",
+            command=on_delete,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="Load Selected Tournament",
+            style="Large.TButton",
+            command=on_load,
+        ).pack(side=tk.LEFT, padx=5)
+
+    def _open_tournament_entry(self, entry: dict):
+        """Load a tournament file and dispatch to viewer or resumption."""
+        success = self.load_tournament_from_file(entry["filepath"])
+        if not success:
+            return
+
+        if entry["finished"]:
+            # View-only: go straight to round-by-round viewer
+            self.show_round_by_round_viewer(self.tournament_history, readonly=True)
+        else:
+            # Resume: advance to the next round
+            self._resume_unfinished_tournament()
+
+    def _resume_unfinished_tournament(self):
+        """Resume an unfinished tournament from where it was saved.
+        The last fully-finished round is current_round; we advance to current_round + 1.
+        """
+        system = self.tournament_system
+        next_round = self.current_round + 1
+        self.current_round = next_round
+
+        if system == "swiss":
+            self.show_swiss_round()
+        elif system == "round_robin":
+            self.show_round_robin_round()
+        elif system == "knockout":
+            self.show_knockout_round()
+        elif system == "scheveningen":
+            # For scheveningen, schev_round counter drives the flow
+            # It was saved at the end of the last completed schev_round
+            # show_scheveningen_round() increments schev_round at the top,
+            # so set it back by 1
+            self.schev_round = getattr(self, "schev_round", 0)
+            # schev_round is already the LAST completed round in the save file,
+            # and show_scheveningen_round() does schev_round += 1 before doing anything,
+            # so we do NOT decrement — just call it directly
+            self.show_scheveningen_round()
 
     def select_game_type(self, game_type: str):
         """Handle game type selection"""
@@ -1087,8 +1336,8 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                            f"Maximum ELO ({self.max_elo}) must be greater than "
-                            f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum ELO ({self.max_elo}) must be greater than "
+                                f"or equal to minimum ELO ({self.min_elo})"
                             ),
                         )
                         return
@@ -1356,8 +1605,8 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                            f"Maximum ELO ({self.max_elo}) must be greater than "
-                            f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum ELO ({self.max_elo}) must be greater than "
+                                f"or equal to minimum ELO ({self.min_elo})"
                             ),
                         )
                         return
@@ -1379,16 +1628,16 @@ class PlayerSorterApp:
         self.clear_window()
 
         frame = ttk.Frame(self.root, padding="20")
-        frame.pack(expand=True)
+        frame.pack(expand=True, fill=tk.BOTH)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Tournament Settings", font=("Arial", 16, "bold")
+            frame, text="Scheveningen - Tournament Settings", font=("Arial", 22, "bold")
         )
         title.pack(pady=20)
 
         # Scrollable frame
         theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, height=400, bg=theme["bg"], highlightthickness=0)
+        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
@@ -1403,13 +1652,13 @@ class PlayerSorterApp:
         rating_frame = ttk.LabelFrame(
             scrollable_frame, text="Rating Changes", padding="15"
         )
-        rating_frame.pack(pady=10, padx=20, fill=tk.X)
+        rating_frame.pack(pady=15, padx=30, fill=tk.X)
 
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
                 text="How should ELO ratings change after games?",
-                font=("Arial", 10, "bold"),
+                font=("Arial", 12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -1442,7 +1691,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 10, "bold"),
+                font=("Arial", 12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -1462,13 +1711,13 @@ class PlayerSorterApp:
 
         # Half-Byes (Scheveningen supports this)
         hb_frame = ttk.LabelFrame(scrollable_frame, text="Half-Byes", padding="15")
-        hb_frame.pack(pady=10, padx=20, fill=tk.X)
+        hb_frame.pack(pady=15, padx=30, fill=tk.X)
 
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 10),
-            wraplength=450,
+            font=("Arial", 11),
+            wraplength=700,
         ).pack(pady=5)
 
         self.half_bye_var = tk.BooleanVar(value=False)
@@ -1489,7 +1738,7 @@ class PlayerSorterApp:
         wd_frame = ttk.LabelFrame(
             scrollable_frame, text="Player Withdrawals", padding="15"
         )
-        wd_frame.pack(pady=10, padx=20, fill=tk.X)
+        wd_frame.pack(pady=15, padx=30, fill=tk.X)
 
         ttk.Label(
             wd_frame,
@@ -1497,8 +1746,8 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 10),
-            wraplength=450,
+            font=("Arial", 11),
+            wraplength=700,
         ).pack(pady=5)
 
         self.withdrawal_var = tk.BooleanVar(value=False)
@@ -1519,7 +1768,7 @@ class PlayerSorterApp:
         note_frame = ttk.LabelFrame(
             scrollable_frame, text="Tournament Length", padding="10"
         )
-        note_frame.pack(pady=10, padx=20, fill=tk.X)
+        note_frame.pack(pady=15, padx=30, fill=tk.X)
         ttk.Label(
             note_frame,
             text=(
@@ -1528,7 +1777,7 @@ class PlayerSorterApp:
                 f"Total rounds: {self.scheveningen_team_size} "
                 "(each player plays each opponent once)"
             ),
-            font=("Arial", 9),
+            font=("Arial", 10),
             justify=tk.LEFT,
         ).pack()
 
@@ -1537,12 +1786,12 @@ class PlayerSorterApp:
             elo_frame = ttk.LabelFrame(
                 scrollable_frame, text="ELO Requirements", padding="15"
             )
-            elo_frame.pack(pady=10, padx=20, fill=tk.X)
+            elo_frame.pack(pady=15, padx=30, fill=tk.X)
 
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum ELO for tournament participants:",
-                font=("Arial", 10),
+                font=("Arial", 11),
             ).pack(pady=5)
 
             # Minimum ELO
@@ -1641,8 +1890,8 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                            f"Maximum ELO ({self.max_elo}) must be greater than "
-                            f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum ELO ({self.max_elo}) must be greater than "
+                                f"or equal to minimum ELO ({self.min_elo})"
                             ),
                         )
                         return
@@ -1817,7 +2066,7 @@ class PlayerSorterApp:
         ttk.Button(
             button_frame,
             text="Load Players",
-            command=lambda: self.load_players() and self.refresh_player_list(),
+            command=self._load_and_refresh,
         ).pack(side=tk.LEFT, padx=5)
 
         # Action buttons
@@ -1831,7 +2080,7 @@ class PlayerSorterApp:
             action_frame,
             text="Start Game",
             command=self.start_game,
-            style="Accent.TButton",
+            style="Large.TButton",
         ).pack(side=tk.RIGHT, padx=5)
 
         # Bind Enter key to add player - all fields
@@ -1910,8 +2159,8 @@ class PlayerSorterApp:
                 messagebox.showwarning(
                     "Input Error",
                     (
-                    "Please enter either:\n- First Name AND Last Name\n"
-                    "- OR Nickname\n- OR all three"
+                        "Please enter either:\n- First Name AND Last Name\n"
+                        "- OR Nickname\n- OR all three"
                     ),
                 )
                 return
@@ -2097,8 +2346,8 @@ class PlayerSorterApp:
                 messagebox.showwarning(
                     "Wrong Game Type",
                     (
-                    f"Save file is for {data.get('game_type', 'unknown')} "
-                    f"but current mode is {self.game_type}"
+                        f"Save file is for {data.get('game_type', 'unknown')} "
+                        f"but current mode is {self.game_type}"
                     ),
                 )
                 return False
@@ -2148,6 +2397,11 @@ class PlayerSorterApp:
             messagebox.showerror("Load Error", f"Failed to load players: {str(e)}")
             return False
 
+    def _load_and_refresh(self):
+        """Load players from file and refresh the list display."""
+        if self.load_players():
+            self.refresh_player_list()
+
     def auto_load_players(self):
         """Automatically load players when entering player input screen"""
         if self.load_players():
@@ -2156,6 +2410,170 @@ class PlayerSorterApp:
     def auto_save_players(self):
         """Automatically save players after game ends"""
         self.save_players()
+
+    def save_tournament_to_file(self, finished: bool) -> str | None:
+        """Serialise the current tournament to a JSON file.
+        Returns the filename on success, or None on failure.
+
+        File naming convention:
+        tournament_YYYY-MM-DD_HH-MM-SS_SYSTEM_[finished|unfinished].json
+        """
+        # Use stored start time, or generate one now as fallback
+        timestamp = getattr(self, "tournament_start_time", None)
+        if not timestamp:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+        system_label = getattr(self, "tournament_system", "tournament")
+        status_label = "finished" if finished else "unfinished"
+
+        filename = f"tournament_{timestamp}_{system_label}_{status_label}.json"
+
+        # Build serialisable player list (full state, not just to_dict())
+        players_data = []
+        for player in self.players:
+            players_data.append(
+                {
+                    "first_name": player.first_name,
+                    "last_name": player.last_name,
+                    "nickname": player.nickname,
+                    "rating": player.rating,
+                    "wins": player.wins,
+                    "losses": player.losses,
+                    "draws": player.draws,
+                    "byes": player.byes,
+                    "half_byes": player.half_byes,
+                    "eliminated": player.eliminated,
+                    "withdrawn": player.withdrawn,
+                    "withdrawal_round": player.withdrawal_round,
+                    "opponents": player.opponents,
+                    "colors": player.colors,
+                    "requested_half_bye": player.requested_half_bye,
+                }
+            )
+
+        # For scheveningen: also save team membership
+        schev_team_a_names = [p.name for p in getattr(self, "schev_team_a", [])]
+        schev_team_b_names = [p.name for p in getattr(self, "schev_team_b", [])]
+
+        data = {
+            "version": "2.0.0-alpha",
+            "finished": finished,
+            "tournament_system": getattr(self, "tournament_system", None),
+            "tiebreak_method": getattr(self, "tiebreak_method", None),
+            "half_bye_enabled": getattr(self, "half_bye_enabled", False),
+            "withdrawal_enabled": getattr(self, "withdrawal_enabled", False),
+            "max_rounds": getattr(self, "max_rounds", None),
+            "rating_mode": getattr(self, "rating_mode", None),
+            "elo_submode": getattr(self, "elo_submode", None),
+            "min_elo": getattr(self, "min_elo", None),
+            "max_elo": getattr(self, "max_elo", None),
+            "current_round": self.current_round,
+            "tournament_start_time": timestamp,
+            "schev_round": getattr(self, "schev_round", None),
+            "schev_total_rounds": getattr(self, "schev_total_rounds", None),
+            "scheveningen_team_size": getattr(self, "scheveningen_team_size", None),
+            "schev_team_a_names": schev_team_a_names,
+            "schev_team_b_names": schev_team_b_names,
+            "players": players_data,
+            "tournament_history": getattr(self, "tournament_history", []),
+        }
+
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return filename
+        except Exception as e:
+            messagebox.showerror("Save Error", f"Could not save tournament:\n{e}")
+            return None
+
+    def _save_and_exit_tournament(self):
+        """Save tournament as unfinished and return to main menu."""
+        filename = self.save_tournament_to_file(finished=False)
+        if filename:
+            messagebox.showinfo(
+                "Saved",
+                f"Tournament saved to:\n{filename}\n\n"
+                "You can resume it later via 'Load a Tournament'.",
+            )
+            self.in_game = False
+            self.tournament_history = []
+            self.show_initial_selection()
+
+    def _save_finished_tournament(self):
+        """Save a completed tournament to file."""
+        filename = self.save_tournament_to_file(finished=True)
+        if filename:
+            messagebox.showinfo("Saved", f"Tournament saved to:\n{filename}")
+
+    def load_tournament_from_file(self, filepath: str) -> bool:
+        """Load a saved tournament file and restore all state.
+        Returns True on success, False on failure."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("Load Error", f"Could not read file:\n{e}")
+            return False
+
+        # Restore settings
+        self.tournament_system = data.get("tournament_system")
+        self.tiebreak_method = data.get("tiebreak_method")
+        self.half_bye_enabled = data.get("half_bye_enabled", False)
+        self.withdrawal_enabled = data.get("withdrawal_enabled", False)
+        self.max_rounds = data.get("max_rounds")
+        self.rating_mode = data.get("rating_mode", "unranked")
+        self.elo_submode = data.get("elo_submode")
+        self.min_elo = data.get("min_elo")
+        self.max_elo = data.get("max_elo")
+        self.current_round = data.get("current_round", 1)
+        self.tournament_start_time = data.get("tournament_start_time")
+        self.sort_mode = "tournament"
+        self.game_type = "chess"
+        self.in_game = True
+        self.tournament_history = data.get("tournament_history", [])
+
+        # Restore scheveningen state
+        self.schev_round = data.get("schev_round") or 0
+        self.schev_total_rounds = data.get("schev_total_rounds") or 0
+        self.scheveningen_team_size = data.get("scheveningen_team_size") or 0
+
+        # Restore players
+        self.players = []
+        player_map = {}  # name -> Player object for team reconstruction
+
+        for pd in data.get("players", []):
+            player = Player(
+                first_name=pd.get("first_name", ""),
+                last_name=pd.get("last_name", ""),
+                nickname=pd.get("nickname", ""),
+                rating=pd.get("rating", 0),
+                wins=pd.get("wins", 0),
+                losses=pd.get("losses", 0),
+                draws=pd.get("draws", 0),
+                byes=pd.get("byes", 0),
+                half_byes=pd.get("half_byes", 0),
+            )
+            player.eliminated = pd.get("eliminated", False)
+            player.withdrawn = pd.get("withdrawn", False)
+            player.withdrawal_round = pd.get("withdrawal_round")
+            player.opponents = pd.get("opponents", [])
+            player.colors = pd.get("colors", [])
+            player.requested_half_bye = pd.get("requested_half_bye", False)
+            self.players.append(player)
+            player_map[player.name] = player
+
+        # Restore scheveningen teams (by matching saved names to Player objects)
+        schev_a_names = data.get("schev_team_a_names", [])
+        schev_b_names = data.get("schev_team_b_names", [])
+        if schev_a_names:
+            self.schev_team_a = [
+                player_map[n] for n in schev_a_names if n in player_map
+            ]
+            self.schev_team_b = [
+                player_map[n] for n in schev_b_names if n in player_map
+            ]
+
+        return True
 
     def start_game(self):
         """Start the game based on mode"""
@@ -2242,10 +2660,6 @@ class PlayerSorterApp:
                 variable=self.rating_mode_var,
                 value="unranked",
             ).pack(anchor=tk.W, pady=5, padx=20)
-
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=20)
 
         # Max Rounds input for Dual and Teams mode
         if self.sort_mode in ["dual", "teams"]:
@@ -2452,8 +2866,8 @@ class PlayerSorterApp:
             ttk.Label(
                 leftover_frame,
                 text=(
-                f"{leftover.name} ({rating_name}: {leftover.rating}, "
-                f"WR: {leftover.win_rate:.1f}%)"
+                    f"{leftover.name} ({rating_name}: {leftover.rating}, "
+                    f"WR: {leftover.win_rate:.1f}%)"
                 ),
                 font=("Arial", 10),
             ).pack(anchor=tk.W)
@@ -2480,7 +2894,9 @@ class PlayerSorterApp:
         """Process dual round results and show standings"""
         # Check all matches have results
         for pair, result_var in self.dual_results:
-            if result_var.get() == "" and result_var.get() != "bye":
+            if(result_var.get() == ""
+               or result_var.get() not in ["p1_win", "p2_win", "draw", "bye"]
+            ):
                 messagebox.showwarning(
                     "Incomplete", "Please set results for all matches"
                 )
@@ -3820,6 +4236,10 @@ class PlayerSorterApp:
             return
 
         self.in_game = True
+        self.tournament_history = []
+        self.tournament_start_time = datetime.datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
         self.current_round = 1
 
         # Clear previous tournament data
@@ -4302,6 +4722,11 @@ class PlayerSorterApp:
         ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="💾 Save & Exit",
+            command=self._save_and_exit_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
         # Check if tournament is complete
         if self.schev_round >= self.schev_total_rounds:
@@ -4402,11 +4827,103 @@ class PlayerSorterApp:
                 font=("Arial", 10),
             ).pack(anchor=tk.W, pady=2)
 
-        ttk.Button(frame, text="← Back to Setup", command=self.back_to_setup).pack(
-            pady=20
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
+            side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="📋 View Round-by-Round Details",
+            command=lambda: self.show_round_by_round_viewer(
+                self.tournament_history, readonly=True
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
     # ===== SHARED TOURNAMENT METHODS =====
+    def _record_round_to_history(self, system):
+        """Capture the current round's pairings and standings into tournament_history.
+        Call this AFTER results have been applied to Player objects."""
+        round_num = self.current_round  # For scheveningen, use self.schev_round instead
+
+        # For scheveningen, use the schev_round counter
+        if system == "scheveningen":
+            round_num = getattr(self, "schev_round", self.current_round)
+
+        # Build pairings record from self.tournament_results
+        pairings_record = []
+        for board_idx, (pairing, result_var) in enumerate(self.tournament_results, 1):
+            p1, p2, pairing_type = pairing
+            result = result_var.get()
+
+            entry = {
+                "board": board_idx,
+                "player1": p1.name if p1 else None,
+                "player2": p2.name if p2 else None,
+                "result": result,  # "p1_win", "p2_win", "draw", "bye", "half_bye"
+                "type": "bye" if p2 is None else "game",
+            }
+            pairings_record.append(entry)
+
+        # Build standings snapshot AFTER results applied (captures post-round state)
+        # For scheveningen, use combined player list
+        if system == "scheveningen":
+            all_players = getattr(self, "schev_team_a", []) + getattr(
+                self, "schev_team_b", []
+            )
+            sorted_snap = self.apply_tiebreak(all_players)
+        else:
+            sorted_snap = self.apply_tiebreak(self.players)
+
+        standings_snapshot = []
+        for rank, (player, tb_score) in enumerate(sorted_snap, 1):
+            # Determine status for display
+            if player.withdrawn:
+                status = f"Withdrew after R{player.withdrawal_round}"
+            elif player.eliminated:
+                status = "Eliminated"
+            else:
+                status = "Active"
+
+            # For scheveningen, record team membership
+            team = None
+            if system == "scheveningen":
+                if player in getattr(self, "schev_team_a", []):
+                    team = "A"
+                elif player in getattr(self, "schev_team_b", []):
+                    team = "B"
+
+            standings_snapshot.append(
+                {
+                    "rank": rank,
+                    "name": player.name,
+                    "rating": player.rating,
+                    "points": player.points,
+                    "wins": player.wins,
+                    "losses": player.losses,
+                    "draws": player.draws,
+                    "byes": player.byes,
+                    "half_byes": player.half_byes,
+                    "tiebreak": round(tb_score, 2) if tb_score is not None else None,
+                    "status": status,
+                    "team": team,
+                }
+            )
+
+        round_record = {
+            "round_number": round_num,
+            "system": system,
+            "pairings": pairings_record,
+            "standings_after_round": standings_snapshot,
+        }
+
+        self.tournament_history.append(round_record)
 
     def display_tournament_pairings(self, parent_frame, pairings, system):
         """Display tournament pairings with result selection"""
@@ -4561,6 +5078,8 @@ class PlayerSorterApp:
                 # In knockout, draws might need resolution - for now treat as p1 win
                 elif result == "draw" and p2:
                     p2.eliminated = True
+
+        self._record_round_to_history(system)
 
         # Apply rating changes based on mode
         if self.rating_mode == "automatic" and self.game_type == "chess":
@@ -4773,6 +5292,11 @@ class PlayerSorterApp:
         ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="💾 Save & Exit",
+            command=self._save_and_exit_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
         # Check if tournament should continue or auto-finish
         should_auto_finish = False
@@ -5041,9 +5565,24 @@ class PlayerSorterApp:
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        ttk.Button(frame, text="← Back to Setup", command=self.back_to_setup).pack(
-            pady=10
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="← Back to Setup", command=self.back_to_setup).pack(
+            side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="📋 View Round-by-Round Details",
+            command=lambda: self.show_round_by_round_viewer(
+                self.tournament_history, readonly=True
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
 
     def show_tournament_winner(self, winner):
         """Show tournament winner"""
@@ -5085,9 +5624,175 @@ class PlayerSorterApp:
         )
         ttk.Button(
             btn_frame,
+            text="📋 View Round-by-Round Details",
+            command=lambda: self.show_round_by_round_viewer(
+                self.tournament_history, readonly=True
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
             text="View Final Standings",
             command=self.show_tournament_final_standings,
         ).pack(side=tk.LEFT, padx=5)
+
+    def show_round_by_round_viewer(self, history: list, readonly: bool = True):
+        """Display a round-by-round viewer.
+        history: list of round dicts (from tournament_history or loaded file).
+        readonly: if True, no resume button is shown.
+        """
+        if not history:
+            messagebox.showinfo("No Data", "No round history available to display.")
+            return
+
+        self.clear_window()
+        frame = ttk.Frame(self.root, padding="20")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="Tournament Round-by-Round Details",
+            font=("Arial", 18, "bold"),
+        ).pack(pady=10)
+
+        # Round selector
+        selector_frame = ttk.Frame(frame)
+        selector_frame.pack(pady=5)
+
+        ttk.Label(selector_frame, text="Select Round:", font=("Arial", 12)).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        round_labels = [f"Round {r['round_number']}" for r in history]
+        round_var = tk.StringVar(value=round_labels[0])
+
+        round_dropdown = ttk.Combobox(
+            selector_frame,
+            textvariable=round_var,
+            values=round_labels,
+            state="readonly",
+            width=15,
+            font=("Arial", 11),
+        )
+        round_dropdown.pack(side=tk.LEFT, padx=5)
+
+        # Content area (will be refreshed on round selection)
+        content_frame = ttk.Frame(frame)
+        content_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+
+        def render_round(event=None):
+            # Destroy and recreate content frame
+            for widget in content_frame.winfo_children():
+                widget.destroy()
+
+            selected_label = round_var.get()
+            round_index = round_labels.index(selected_label)
+            round_data = history[round_index]
+
+            # Left panel: pairings
+            left_frame = ttk.LabelFrame(
+                content_frame, text="Pairings & Results", padding="10"
+            )
+            left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+            pair_tree = ttk.Treeview(
+                left_frame,
+                columns=["board", "player1", "result_label", "player2"],
+                show="headings",
+                height=14,
+            )
+            pair_tree.heading("board", text="#")
+            pair_tree.heading("player1", text="Player 1 (White)")
+            pair_tree.heading("result_label", text="Result")
+            pair_tree.heading("player2", text="Player 2 (Black)")
+            pair_tree.column("board", width=30)
+            pair_tree.column("player1", width=160)
+            pair_tree.column("result_label", width=120)
+            pair_tree.column("player2", width=160)
+
+            result_map = {
+                "p1_win": "1 – 0",
+                "p2_win": "0 – 1",
+                "draw": "½ – ½",
+                "bye": "BYE (+1 pt)",
+                "half_bye": "HALF-BYE (+0.5)",
+            }
+
+            for p in round_data["pairings"]:
+                p2_display = p["player2"] if p["player2"] else "—"
+                result_display = result_map.get(p["result"], p["result"])
+                pair_tree.insert(
+                    "",
+                    tk.END,
+                    values=(p["board"], p["player1"], result_display, p2_display),
+                )
+
+            pair_scroll = ttk.Scrollbar(
+                left_frame, orient=tk.VERTICAL, command=pair_tree.yview
+            )
+            pair_tree.configure(yscroll=pair_scroll.set)
+            pair_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            pair_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+            # Right panel: standings after this round
+            right_frame = ttk.LabelFrame(
+                content_frame, text="Standings After This Round", padding="10"
+            )
+            right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+            cols = ["rank", "name", "points", "record", "tiebreak", "status"]
+            stand_tree = ttk.Treeview(
+                right_frame, columns=cols, show="headings", height=14
+            )
+            stand_tree.heading("rank", text="#")
+            stand_tree.heading("name", text="Name")
+            stand_tree.heading("points", text="Pts")
+            stand_tree.heading("record", text="W-L-D")
+            stand_tree.heading("tiebreak", text="TB")
+            stand_tree.heading("status", text="Status")
+            stand_tree.column("rank", width=30)
+            stand_tree.column("name", width=140)
+            stand_tree.column("points", width=40)
+            stand_tree.column("record", width=80)
+            stand_tree.column("tiebreak", width=55)
+            stand_tree.column("status", width=120)
+
+            for s in round_data["standings_after_round"]:
+                record = f"{s['wins']}W-{s['losses']}L-{s['draws']}D"
+                stand_tree.insert(
+                    "",
+                    tk.END,
+                    values=(
+                        s["rank"],
+                        s["name"],
+                        s["points"],
+                        record,
+                        s["tiebreak"] if s["tiebreak"] is not None else "-",
+                        s["status"],
+                    ),
+                )
+
+            stand_scroll = ttk.Scrollbar(
+                right_frame, orient=tk.VERTICAL, command=stand_tree.yview
+            )
+            stand_tree.configure(yscroll=stand_scroll.set)
+            stand_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            stand_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        round_dropdown.bind("<<ComboboxSelected>>", render_round)
+        render_round()  # Render first round immediately
+
+        # Navigation buttons
+        btn_frame = ttk.Frame(frame)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="← Back", command=self.show_initial_selection).pack(
+            side=tk.LEFT, padx=5
+        )
 
     # ============ END TOURNAMENT MODE ============
 
