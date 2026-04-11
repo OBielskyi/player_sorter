@@ -284,6 +284,10 @@ class PlayerSorterApp:
         # Allow window resizing
         self.root.resizable(True, True)
 
+        # Fullscreen toggle: F11 and Alt+Enter
+        self.root.bind("<F11>", self._toggle_fullscreen)
+        self.root.bind("<Alt-Return>", self._toggle_fullscreen)
+
         self.game_type = None
         self.sort_mode = None
         self.players: List[Player] = []
@@ -306,6 +310,11 @@ class PlayerSorterApp:
         self.apply_theme(self.current_theme)
 
         self.show_theme_selection()
+
+    def _toggle_fullscreen(self, event=None):
+        """Toggle true fullscreen mode (F11 / Alt+Enter)."""
+        is_fullscreen = self.root.attributes("-fullscreen")
+        self.root.attributes("-fullscreen", not is_fullscreen)
 
     def load_theme_preference(self):
         """Load saved theme preference"""
@@ -700,9 +709,7 @@ class PlayerSorterApp:
         def on_delete():
             selected = tree.selection()
             if not selected:
-                messagebox.showwarning(
-                    "No Selection", "Please select a tournament to delete."
-                )
+                messagebox.showwarning("No Selection", "Please select a tournament to delete.")
                 return
             filepath = selected[0]
             entry = next(e for e in file_entries if e["filepath"] == filepath)
