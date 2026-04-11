@@ -607,10 +607,12 @@ class PlayerSorterApp:
             )
             return
 
-        # Sort: unfinished first, then by start_time descending (newest first)
-        file_entries.sort(key=lambda e: (e["finished"], e["start_time"]), reverse=False)
-        # Reverse the finished ones (newest first within each group)
-        unfinished = [e for e in file_entries if not e["finished"]]
+        # Sort: unfinished first, then finished — both groups newest to oldest
+        unfinished = sorted(
+            [e for e in file_entries if not e["finished"]],
+            key=lambda e: e["start_time"],
+            reverse=True,
+        )
         finished = sorted(
             [e for e in file_entries if e["finished"]],
             key=lambda e: e["start_time"],
@@ -695,9 +697,47 @@ class PlayerSorterApp:
             entry = next(e for e in file_entries if e["filepath"] == filepath)
             self._open_tournament_entry(entry)
 
-        ttk.Button(btn_frame, text="← Back", command=self.show_initial_selection).pack(
+        def on_delete():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to delete."
+                )
+                return
+            filepath = selected[0]
+            entry = next(e for e in file_entries if e["filepath"] == filepath)
+            dt_display = entry["start_time"].replace("_", " ")
+            status_word = "unfinished" if not entry["finished"] else "finished"
+            confirmed = messagebox.askyesno(
+                "Confirm Deletion",
+                f"Permanently delete this {status_word} tournament?\n\n"
+                f"  Date/Time: {dt_display}\n"
+                f"  System:    {entry['system'].replace('_', '-').title()}\n\n"
+                "This cannot be undone.",
+            )
+            if not confirmed:
+                return
+            try:
+                os.remove(filepath)
+            except OSError as exc:
+                messagebox.showerror("Delete Failed", f"Could not delete file:\n{exc}")
+                return
+            # Remove from our in-memory list and the treeview, then refresh
+            file_entries[:] = [e for e in file_entries if e["filepath"] != filepath]
+            tree.delete(filepath)
+            # If no entries remain, go back to the main screen
+            if not file_entries:
+                messagebox.showinfo("All Gone", "No saved tournaments remaining.")
+                self.show_initial_selection()
+
+        ttk.Button(btn_frame, text="Back", command=self.show_initial_selection).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="Delete Selected",
+            command=on_delete,
+        ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
             text="Load Selected Tournament",
@@ -1568,16 +1608,16 @@ class PlayerSorterApp:
         self.clear_window()
 
         frame = ttk.Frame(self.root, padding="20")
-        frame.pack(expand=True)
+        frame.pack(expand=True, fill=tk.BOTH)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Tournament Settings", font=("Arial", 16, "bold")
+            frame, text="Scheveningen - Tournament Settings", font=("Arial", 22, "bold")
         )
         title.pack(pady=20)
 
         # Scrollable frame
         theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, height=400, bg=theme["bg"], highlightthickness=0)
+        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
@@ -1592,13 +1632,13 @@ class PlayerSorterApp:
         rating_frame = ttk.LabelFrame(
             scrollable_frame, text="Rating Changes", padding="15"
         )
-        rating_frame.pack(pady=10, padx=20, fill=tk.X)
+        rating_frame.pack(pady=15, padx=30, fill=tk.X)
 
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
                 text="How should ELO ratings change after games?",
-                font=("Arial", 10, "bold"),
+                font=("Arial", 12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -1631,7 +1671,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 10, "bold"),
+                font=("Arial", 12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -1651,13 +1691,13 @@ class PlayerSorterApp:
 
         # Half-Byes (Scheveningen supports this)
         hb_frame = ttk.LabelFrame(scrollable_frame, text="Half-Byes", padding="15")
-        hb_frame.pack(pady=10, padx=20, fill=tk.X)
+        hb_frame.pack(pady=15, padx=30, fill=tk.X)
 
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 10),
-            wraplength=450,
+            font=("Arial", 11),
+            wraplength=700,
         ).pack(pady=5)
 
         self.half_bye_var = tk.BooleanVar(value=False)
@@ -1678,7 +1718,7 @@ class PlayerSorterApp:
         wd_frame = ttk.LabelFrame(
             scrollable_frame, text="Player Withdrawals", padding="15"
         )
-        wd_frame.pack(pady=10, padx=20, fill=tk.X)
+        wd_frame.pack(pady=15, padx=30, fill=tk.X)
 
         ttk.Label(
             wd_frame,
@@ -1686,8 +1726,8 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 10),
-            wraplength=450,
+            font=("Arial", 11),
+            wraplength=700,
         ).pack(pady=5)
 
         self.withdrawal_var = tk.BooleanVar(value=False)
@@ -1708,7 +1748,7 @@ class PlayerSorterApp:
         note_frame = ttk.LabelFrame(
             scrollable_frame, text="Tournament Length", padding="10"
         )
-        note_frame.pack(pady=10, padx=20, fill=tk.X)
+        note_frame.pack(pady=15, padx=30, fill=tk.X)
         ttk.Label(
             note_frame,
             text=(
@@ -1717,7 +1757,7 @@ class PlayerSorterApp:
                 f"Total rounds: {self.scheveningen_team_size} "
                 "(each player plays each opponent once)"
             ),
-            font=("Arial", 9),
+            font=("Arial", 10),
             justify=tk.LEFT,
         ).pack()
 
@@ -1726,12 +1766,12 @@ class PlayerSorterApp:
             elo_frame = ttk.LabelFrame(
                 scrollable_frame, text="ELO Requirements", padding="15"
             )
-            elo_frame.pack(pady=10, padx=20, fill=tk.X)
+            elo_frame.pack(pady=15, padx=30, fill=tk.X)
 
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum ELO for tournament participants:",
-                font=("Arial", 10),
+                font=("Arial", 11),
             ).pack(pady=5)
 
             # Minimum ELO
