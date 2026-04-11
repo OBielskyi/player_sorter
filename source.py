@@ -358,12 +358,17 @@ class PlayerSorterApp:
         # Configure ttk styles
         style = ttk.Style()
 
-        # Try to use a theme that supports dark backgrounds if needed
-        if theme_name != "Simple Light":
-            try:
-                style.theme_use("clam")  # Most customizable theme
-            except tk.TclError:
-                pass
+        # Always use 'clam' as the base ttk theme.
+        # On Windows the default 'vista'/'winnative' theme intercepts colour
+        # properties and ignores custom styles on first paint, making Simple
+        # Light look broken until a round-trip through another theme forces
+        # clam to be active.  Unconditionally setting clam here means all
+        # themes — including Simple Light — render correctly from the very
+        # first launch on every platform.
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
         style.configure("TFrame", background=theme["bg"])
