@@ -2456,7 +2456,7 @@ class PlayerSorterApp:
         schev_team_b_names = [p.name for p in getattr(self, "schev_team_b", [])]
 
         data = {
-            "version": "2.0.0-alpha",
+            "version": "2.0.0",
             "finished": finished,
             "tournament_system": getattr(self, "tournament_system", None),
             "tiebreak_method": getattr(self, "tiebreak_method", None),
@@ -2894,9 +2894,12 @@ class PlayerSorterApp:
         """Process dual round results and show standings"""
         # Check all matches have results
         for pair, result_var in self.dual_results:
-            if(result_var.get() == ""
-               or result_var.get() not in ["p1_win", "p2_win", "draw", "bye"]
-            ):
+            if result_var.get() == "" or result_var.get() not in [
+                "p1_win",
+                "p2_win",
+                "draw",
+                "bye",
+            ]:
                 messagebox.showwarning(
                     "Incomplete", "Please set results for all matches"
                 )
