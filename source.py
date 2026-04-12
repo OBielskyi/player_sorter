@@ -299,6 +299,7 @@ class PlayerSorterApp:
         self.current_round = 0
         self.teams: List[List[Player]] = []
         self.in_game = False  # Track if we're in an active game
+        self.editing_player_index = None  # Index of player being edited, or None
         self.half_bye_enabled = False  # Track if half-byes are allowed
         self.withdrawal_enabled = False  # Track if withdrawals are allowed
         self.max_rounds = None  # Maximum rounds (None = unlimited)
@@ -358,13 +359,11 @@ class PlayerSorterApp:
         # Configure ttk styles
         style = ttk.Style()
 
-        # Always use 'clam' as the base ttk theme.
-        # On Windows the default 'vista'/'winnative' theme intercepts colour
+        # Always use clam as the base ttk theme.
+        # On Windows the default vista/winnative theme intercepts colour
         # properties and ignores custom styles on first paint, making Simple
         # Light look broken until a round-trip through another theme forces
-        # clam to be active.  Unconditionally setting clam here means all
-        # themes — including Simple Light — render correctly from the very
-        # first launch on every platform.
+        # clam to be active. Unconditionally setting clam here fixes this.
         try:
             style.theme_use("clam")
         except tk.TclError:
@@ -1910,6 +1909,7 @@ class PlayerSorterApp:
 
     def show_player_input(self):
         """Show player input interface"""
+        self.editing_player_index = None  # Cancel any edit in progress
         self.clear_window()
 
         # Main container with more padding
@@ -2115,6 +2115,7 @@ class PlayerSorterApp:
             return
 
         index = self.tree.index(selected[0])
+        self.editing_player_index = index  # Remember which player we're editing
         player = self.players[index]
 
         # Load player data into entry fields
@@ -2206,31 +2207,41 @@ class PlayerSorterApp:
                     )
                     return
 
-        # Check if updating existing player (match by full identity)
-        existing_player = None
-        for player in self.players:
-            # Match by exact name combination
-            if (
-                player.first_name == first_name
-                and player.last_name == last_name
-                and player.nickname == nickname
-            ):
-                existing_player = player
-                break
-
-        if existing_player:
-            # Update existing player
-            existing_player.rating = rating
+        # Check if we are updating an existing player (edit mode)
+        if self.editing_player_index is not None:
+            # Update the player at the remembered index — works even if
+            # the user changed name fields, which is exactly what caused
+            # the "mitosis" bug when matching by name.
+            player = self.players[self.editing_player_index]
+            player.first_name = first_name
+            player.last_name = last_name
+            player.nickname = nickname
+            player.rating = rating
+            self.editing_player_index = None  # Clear edit mode
             self.add_update_btn.config(text="Add Player")
         else:
-            # Add new player
-            player = Player(
-                first_name=first_name,
-                last_name=last_name,
-                nickname=nickname,
-                rating=rating,
-            )
-            self.players.append(player)
+            # No edit in progress — check for exact-name duplicate first
+            existing_player = None
+            for p in self.players:
+                if (
+                    p.first_name == first_name
+                    and p.last_name == last_name
+                    and p.nickname == nickname
+                ):
+                    existing_player = p
+                    break
+            if existing_player:
+                # Exact duplicate typed in manually — just update rating
+                existing_player.rating = rating
+            else:
+                # Genuinely new player
+                player = Player(
+                    first_name=first_name,
+                    last_name=last_name,
+                    nickname=nickname,
+                    rating=rating,
+                )
+                self.players.append(player)
 
         # Clear entries
         self.first_name_entry.delete(0, tk.END)
@@ -2261,12 +2272,16 @@ class PlayerSorterApp:
 
         index = self.tree.index(selected[0])
         del self.players[index]
+        self.editing_player_index = None  # Cancel any pending edit
+        self.add_update_btn.config(text="Add Player")
         self.refresh_player_list()
 
     def clear_players(self):
         """Clear all players"""
         if self.players and messagebox.askyesno("Confirm", "Clear all players?"):
             self.players.clear()
+            self.editing_player_index = None  # Cancel any pending edit
+            self.add_update_btn.config(text="Add Player")
             self.refresh_player_list()
 
     def refresh_player_list(self):
@@ -2456,7 +2471,7 @@ class PlayerSorterApp:
         schev_team_b_names = [p.name for p in getattr(self, "schev_team_b", [])]
 
         data = {
-            "version": "2.0.0",
+            "version": "2.0.1",
             "finished": finished,
             "tournament_system": getattr(self, "tournament_system", None),
             "tiebreak_method": getattr(self, "tiebreak_method", None),
@@ -2488,6 +2503,9 @@ class PlayerSorterApp:
 
     def _save_and_exit_tournament(self):
         """Save tournament as unfinished and return to main menu."""
+        # Flush any pending half-bye / withdrawal checkbox states to player
+        # objects BEFORE serialising, so they survive the save/resume cycle.
+        self._flush_pending_round_requests()
         filename = self.save_tournament_to_file(finished=False)
         if filename:
             messagebox.showinfo(
@@ -2563,8 +2581,11 @@ class PlayerSorterApp:
             player_map[player.name] = player
 
         # Restore scheveningen teams (by matching saved names to Player objects)
+        # Always initialise both lists so schev screens never hit AttributeError.
         schev_a_names = data.get("schev_team_a_names", [])
         schev_b_names = data.get("schev_team_b_names", [])
+        self.schev_team_a = []
+        self.schev_team_b = []
         if schev_a_names:
             self.schev_team_a = [
                 player_map[n] for n in schev_a_names if n in player_map
@@ -2899,6 +2920,7 @@ class PlayerSorterApp:
                 "p2_win",
                 "draw",
                 "bye",
+                "half_bye",
             ]:
                 messagebox.showwarning(
                     "Incomplete", "Please set results for all matches"
@@ -4250,6 +4272,11 @@ class PlayerSorterApp:
             player.opponents = []
             player.colors = []
 
+        self.tournament_history = []
+        self.tournament_start_time = datetime.datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+
         if self.tournament_system == "swiss":
             self.show_swiss_round()
         elif self.tournament_system == "round_robin":
@@ -5346,29 +5373,34 @@ class PlayerSorterApp:
                 command=self.show_tournament_final_standings,
             ).pack(side=tk.LEFT, padx=5)
 
-    def next_tournament_round_with_settings(self, system):
-        """Process half-bye and withdrawal requests, then continue to next round"""
-        # Apply withdrawal requests if enabled
+    def _flush_pending_round_requests(self):
+        """Write any pending half-bye and withdrawal checkbox states to player
+        objects.  Must be called before saving or advancing to the next round
+        so that requests made on the standings screen are not lost.
+        Safe to call even when the checkboxes were never shown (no-ops).
+        """
+        # Apply withdrawal requests
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
             for player_name, var in self.withdrawal_vars.items():
                 if var.get():
-                    # Find player and mark as withdrawn
                     for player in self.players:
                         if player.name == player_name:
                             player.withdrawn = True
                             player.withdrawal_round = self.current_round
                             break
 
-        # Apply half-bye requests if enabled
+        # Apply half-bye requests
         if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
             for player_name, var in self.halfbye_vars.items():
                 if var.get():
-                    # Find player and mark for half-bye
                     for player in self.players:
                         if player.name == player_name:
                             player.requested_half_bye = True
                             break
 
+    def next_tournament_round_with_settings(self, system):
+        """Process half-bye and withdrawal requests, then continue to next round"""
+        self._flush_pending_round_requests()
         self.next_tournament_round()
 
     def apply_tiebreak(self, players):

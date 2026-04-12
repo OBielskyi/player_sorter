@@ -5,3 +5,5 @@ pyproject.toml
 PlayerSorter-*
 # Build and dist folders
 source.*
+# json files
+*.json
