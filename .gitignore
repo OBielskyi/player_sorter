@@ -1,3 +1,7 @@
 *.toml
 uv.lock
 pyproject.toml
+# Executable binaries
+PlayerSorter-*
+# Build and dist folders
+source.*
