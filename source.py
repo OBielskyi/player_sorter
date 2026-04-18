@@ -132,6 +132,22 @@ THEMES = {
 }
 
 
+# ── Display / scaling constants ───────────────────────────────────────────────
+# Supported UI scale percentages
+SCALE_OPTIONS = [25, 50, 75, 100, 125, 150, 175, 200]
+
+# Baseline Tcl/Tk scaling factor that corresponds to 100 %.
+# Tk internally works in points; 96 DPI ÷ 72 pt/inch = 1.3333… px/pt,
+# which is the universally accepted "standard" desktop DPI.  Anchoring our
+# 100 % here makes the slider independent of the OS-level scaling setting,
+# which is exactly what we want: the user can dial in an absolute size.
+_BASE_SCALING = 96.0 / 72.0  # ≈ 1.3333
+
+# JSON file that persists the chosen scale between sessions
+_DISPLAY_SETTINGS_FILE = "player_sorter_display_settings.json"
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 class Player:
     """Represents a player with their stats"""
 
@@ -272,6 +288,14 @@ class PlayerSorterApp:
         # Load theme preference
         self.current_theme = self.load_theme_preference()
 
+        # Load scale preference early so the very first window render already
+        # uses the correct scale.  We capture the system's default tk scaling
+        # value here (before we change anything) so we could restore it later
+        # if ever needed, but we immediately override it with the saved pct.
+        self._default_tk_scaling = float(self.root.tk.call("tk", "scaling"))
+        self._current_scale_pct = self._load_scale_preference()
+        self._apply_scale(self._current_scale_pct)
+
         # Maximize window - cross-platform approach
         try:
             # Try Windows/Linux method first
@@ -345,6 +369,158 @@ class PlayerSorterApp:
         except (OSError, TypeError):
             pass
 
+    # ── Scale / display-settings helpers ──────────────────────────────────────
+
+    def _load_scale_preference(self) -> int:
+        """Return the saved scale percentage, or 100 if none / corrupt."""
+        try:
+            if os.path.exists(_DISPLAY_SETTINGS_FILE):
+                with open(_DISPLAY_SETTINGS_FILE, "r") as fh:
+                    data = json.load(fh)
+                scale = int(data.get("scale_pct", 100))
+                if scale in SCALE_OPTIONS:
+                    return scale
+        except (OSError, json.JSONDecodeError, ValueError, TypeError):
+            pass
+        return 100  # Safe default
+
+    def _save_scale_preference(self, scale_pct: int) -> None:
+        """Persist the chosen scale percentage to disk."""
+        try:
+            with open(_DISPLAY_SETTINGS_FILE, "w") as fh:
+                json.dump({"scale_pct": scale_pct}, fh)
+        except (OSError, TypeError):
+            pass  # Non-fatal — just skip saving
+
+    def _apply_scale(self, scale_pct: int) -> None:
+        """Apply the requested UI scale percentage.
+        
+        On Linux/Wayland, tk's native 'scaling' command is unreliable for fonts,
+        so we store a multiplier and manually scale all font sizes via helper.
+        """
+        self._current_scale_pct = scale_pct
+        self._scale_multiplier = scale_pct / 100.0
+        
+        # Still call tk scaling for geometry/canvas (helps on Windows, no-op on Linux)
+        new_scaling = _BASE_SCALING * self._scale_multiplier
+        self.root.tk.call("tk", "scaling", new_scaling)
+    
+    def _sf(self, base_size: int, weight: str = "") -> tuple:
+        """Scale Font helper: returns (family, scaled_size, *weight) tuple.
+        
+        Usage: font=self._sf(12) or font=self._sf(14, "bold")
+        """
+        scaled = int(base_size * getattr(self, '_scale_multiplier', 1.0))
+        if weight:
+            return ("Arial", scaled, weight)
+        return ("Arial", scaled)
+    
+    def _sp(self, base_value: int) -> str:
+        """Scale Padding helper: returns scaled padding as string.
+        
+        Usage: padding=self._sp(20)
+        """
+        scaled = int(base_value * getattr(self, '_scale_multiplier', 1.0))
+        return str(scaled)
+
+    def show_display_settings(self) -> None:
+        """Open a small modal dialog for changing the UI scale."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Display Settings")
+        dialog.transient(self.root)   # Keep it on top of the main window
+        dialog.grab_set()             # Make it modal
+        dialog.resizable(False, False)
+
+        # Apply the current colour scheme so the dialog matches the rest of
+        # the app instead of looking like a plain grey system dialog.
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+        dialog.configure(bg=theme["bg"])
+
+        frame = ttk.Frame(dialog, padding=self._sp(40))
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # ── Title ──────────────────────────────────────────────────────────
+        ttk.Label(
+            frame, text="Display Settings", font=self._sf(16, "bold")
+        ).pack(pady=(0, 20))
+
+        # ── Scale row ──────────────────────────────────────────────────────
+        scale_row = ttk.Frame(frame)
+        scale_row.pack(fill=tk.X, pady=10)
+
+        ttk.Label(scale_row, text="UI Scale:", font=self._sf(12)).pack(
+            side=tk.LEFT, padx=(0, 15)
+        )
+
+        # Pre-select the currently active percentage in the drop-down.
+        scale_var = tk.StringVar(value=f"{self._current_scale_pct}%")
+        scale_combo = ttk.Combobox(
+            scale_row,
+            textvariable=scale_var,
+            values=[f"{s}%" for s in SCALE_OPTIONS],
+            state="readonly",
+            width=10,
+            font=self._sf(12),
+        )
+        scale_combo.pack(side=tk.LEFT)
+
+        # ── Explanatory note ───────────────────────────────────────────────
+        ttk.Label(
+            frame,
+            text=(
+                "100 % = standard 96 DPI (ignores OS scaling).\n"
+                "The change takes effect immediately."
+            ),
+            font=self._sf(10, "italic"),
+            justify=tk.CENTER,
+        ).pack(pady=(15, 20))
+
+        # ── Buttons ────────────────────────────────────────────────────────
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(pady=(0, 10))
+
+        def _on_apply() -> None:
+            val_str = scale_var.get().replace("%", "").strip()
+            try:
+                chosen_pct = int(val_str)
+            except ValueError:
+                return
+            if chosen_pct not in SCALE_OPTIONS:
+                return  # Shouldn't happen via the combo, but be defensive
+
+            self._apply_scale(chosen_pct)
+            self._save_scale_preference(chosen_pct)
+            # Reapply the current theme so ttk.Style fonts update with new scale
+            self.apply_theme(self.current_theme)
+            dialog.destroy()
+            # Refresh the theme-selection screen so the user immediately sees
+            # the new scale on all widgets (clear_window + full rebuild).
+            self.show_theme_selection()
+
+        ttk.Button(btn_row, text="Apply", command=_on_apply, width=12).pack(
+            side=tk.LEFT, padx=8
+        )
+        ttk.Button(btn_row, text="Close", command=dialog.destroy, width=12).pack(
+            side=tk.LEFT, padx=8
+        )
+
+        # ── Position dialog near top-right of main window ──────────────────
+        # Let the dialog calculate its natural size based on content (which
+        # automatically scales with the current tk scaling), then just position
+        # it without forcing dimensions.
+        dialog.update_idletasks()
+        d_w = dialog.winfo_reqwidth()
+        d_h = dialog.winfo_reqheight()
+        r_x = self.root.winfo_x()
+        r_y = self.root.winfo_y()
+        r_w = self.root.winfo_width()
+        # Place it 30 px from the right edge, 80 px from the top
+        x = r_x + r_w - d_w - 30
+        y = r_y + 80
+        dialog.geometry(f"+{x}+{y}")
+
+    # ── End scale / display-settings helpers ──────────────────────────────────
+
     def apply_theme(self, theme_name):
         """Apply the selected theme to the entire application"""
         if theme_name not in THEMES:
@@ -388,7 +564,7 @@ class PlayerSorterApp:
         # Buttons with vibrant colors
         style.configure(
             "TButton",
-            font=("Arial", 12),
+            font=self._sf(12),
             padding=10,
             background=theme["button_bg"],
             foreground=theme["button_fg"],
@@ -406,7 +582,7 @@ class PlayerSorterApp:
         # Large button style with accent colors
         style.configure(
             "Large.TButton",
-            font=("Arial", 14, "bold"),
+            font=self._sf(14, "bold"),
             padding=15,
             background=theme["accent_button_bg"],
             foreground=theme["accent_button_fg"],
@@ -432,7 +608,7 @@ class PlayerSorterApp:
         style.configure("TRadiobutton", background=theme["bg"], foreground=theme["fg"])
         style.configure(
             "Large.TRadiobutton",
-            font=("Arial", 11),
+            font=self._sf(11),
             padding=5,
             background=theme["bg"],
             foreground=theme["fg"],
@@ -462,7 +638,7 @@ class PlayerSorterApp:
                 background=theme["button_bg"],
                 foreground=theme["button_fg"],
                 bordercolor=theme["border"],
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             )
         else:
             # Simple themes keep subdued headings
@@ -471,7 +647,7 @@ class PlayerSorterApp:
                 background=theme["button_bg"],
                 foreground=theme.get("button_fg", theme["fg"]),
                 bordercolor=theme["border"],
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             )
 
         style.map(
@@ -479,7 +655,7 @@ class PlayerSorterApp:
             background=[("selected", theme["select_bg"])],
             foreground=[("selected", theme["select_fg"])],
         )
-        style.configure("Treeview", font=("Arial", 10), rowheight=25)
+        style.configure("Treeview", font=self._sf(10), rowheight=25)
 
         # Scrollbars
         style.configure(
@@ -494,14 +670,28 @@ class PlayerSorterApp:
         """Show theme selection screen at startup"""
         self.clear_window()
 
-        frame = ttk.Frame(self.root, padding="60")
+        # ── Top bar: houses the "Display Settings" button flush to the right.
+        # It is packed first (before the main content frame) so the geometry
+        # manager places it at the very top of the window regardless of how
+        # the content frame is sized below it.
+        top_bar = ttk.Frame(self.root)
+        top_bar.pack(side=tk.TOP, fill=tk.X, padx=14, pady=(10, 0))
+
+        ttk.Button(
+            top_bar,
+            text="⚙ Display Settings",
+            command=self.show_display_settings,
+        ).pack(side=tk.RIGHT)
+
+        # ── Main content (theme selection) ─────────────────────────────────
+        frame = ttk.Frame(self.root, padding=self._sp(60))
         frame.pack(expand=True, fill=tk.BOTH)
 
         # Title
-        title = ttk.Label(frame, text="Player Sorter", font=("Arial", 32, "bold"))
+        title = ttk.Label(frame, text="Player Sorter", font=self._sf(32, "bold"))
         title.pack(pady=30)
 
-        subtitle = ttk.Label(frame, text="Select Theme", font=("Arial", 18))
+        subtitle = ttk.Label(frame, text="Select Theme", font=self._sf(18))
         subtitle.pack(pady=20)
 
         # Theme buttons
@@ -520,7 +710,7 @@ class PlayerSorterApp:
             # Highlight current theme
             if theme_name == self.current_theme:
                 ttk.Label(
-                    theme_frame, text="✓ Current", font=("Arial", 9, "italic")
+                    theme_frame, text="✓ Current", font=self._sf(9, "italic")
                 ).pack()
 
         # Continue button
@@ -543,15 +733,15 @@ class PlayerSorterApp:
         """Show initial game type and mode selection"""
         self.clear_window()
 
-        frame = ttk.Frame(self.root, padding="60")
+        frame = ttk.Frame(self.root, padding=self._sp(60))
         frame.pack(expand=True, fill=tk.BOTH)
 
         # Title with larger font
-        title = ttk.Label(frame, text="Player Sorter", font=("Arial", 32, "bold"))
+        title = ttk.Label(frame, text="Player Sorter", font=self._sf(32, "bold"))
         title.pack(pady=50)
 
         # Game Type Selection
-        ttk.Label(frame, text="Select Game Type:", font=("Arial", 16)).pack(pady=20)
+        ttk.Label(frame, text="Select Game Type:", font=self._sf(16)).pack(pady=20)
 
         game_frame = ttk.Frame(frame)
         game_frame.pack(pady=20)
