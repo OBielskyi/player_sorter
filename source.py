@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Oleksandr Bielskyi
 """
 Player Sorter - A simple GUI application for creating and sorting player tables
 Supports Chess (ELO) and E-sports (Trophies) with three modes:
