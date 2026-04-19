@@ -393,18 +393,9 @@ class PlayerSorterApp:
             pass  # Non-fatal — just skip saving
 
     def _get_base_scaling(self) -> float:
-        """Get the baseline scaling factor for this platform.
-
-        On most systems, tk.scaling() starts at:
-        - Windows: ~1.33 (96 DPI / 72 points)
-        - Linux/X11: varies by DPI (often 1.0)
-        - Linux/Wayland: logical pixels (varies)
-        - macOS: ~1.33 (96 DPI / 72 points)
-
-        We query the current system scaling and use it as baseline,
-        so user 100% = current system state.
-        """
-        return float(self.root.tk.call("tk", "scaling"))
+        """Get the baseline scaling factor for this platform."""
+        # Use the saved original system scaling, not the current (possibly modified) value
+        return self._default_tk_scaling
 
     def _apply_scale(self, scale_pct: int) -> None:
         """Apply the requested UI scale percentage."""
