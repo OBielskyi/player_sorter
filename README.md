@@ -1,6 +1,7 @@
 # Player Sorter - Tournament Management System
 
-**A professional, feature-rich tournament management application for chess and e-sports competitions.**
+**A professional, feature-rich tournament management application for chess and e-sports competitions.**\
+***Download link: https://github.com/OBielskyi/player_sorter/releases/latest/***
 
 ![Screenshot 1](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/1.png)
 ![Screenshot 2](https://github.com/OBielskyi/player_sorter/blob/main/screenshots/2.png)
