@@ -392,28 +392,35 @@ class PlayerSorterApp:
         except (OSError, TypeError):
             pass  # Non-fatal — just skip saving
 
-    def _apply_scale(self, scale_pct: int) -> None:
-        """Apply the requested UI scale percentage.
-        
-        On Linux/Wayland, tk's native 'scaling' command is unreliable for fonts,
-        so we store a multiplier and manually scale all font sizes via helper.
+    def _get_base_scaling(self) -> float:
+        """Get the baseline scaling factor for this platform.
+
+        On most systems, tk.scaling() starts at:
+        - Windows: ~1.33 (96 DPI / 72 points)
+        - Linux/X11: varies by DPI (often 1.0)
+        - Linux/Wayland: logical pixels (varies)
+        - macOS: ~1.33 (96 DPI / 72 points)
+
+        We query the current system scaling and use it as baseline,
+        so user 100% = current system state.
         """
+        return float(self.root.tk.call("tk", "scaling"))
+
+    def _apply_scale(self, scale_pct: int) -> None:
+        """Apply the requested UI scale percentage."""
         self._current_scale_pct = scale_pct
         self._scale_multiplier = scale_pct / 100.0
-        
-        # Still call tk scaling for geometry/canvas (helps on Windows, no-op on Linux)
-        new_scaling = _BASE_SCALING * self._scale_multiplier
+
+        # Apply to tk.scaling()
+        base_scaling = self._get_base_scaling()
+        new_scaling = base_scaling * self._scale_multiplier
         self.root.tk.call("tk", "scaling", new_scaling)
     
     def _sf(self, base_size: int, weight: str = "") -> tuple:
-        """Scale Font helper: returns (family, scaled_size, *weight) tuple.
-        
-        Usage: font=self._sf(12) or font=self._sf(14, "bold")
-        """
+        """Scale Font helper: returns (family, scaled_size, weight) tuple."""
         scaled = int(base_size * getattr(self, '_scale_multiplier', 1.0))
-        if weight:
-            return ("Arial", scaled, weight)
-        return ("Arial", scaled)
+        weight_value = weight if weight else "normal"
+        return ("Arial", scaled, weight_value)
     
     def _sp(self, base_value: int) -> str:
         """Scale Padding helper: returns scaled padding as string.
@@ -468,7 +475,6 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text=(
-                "100 % = standard 96 DPI (ignores OS scaling).\n"
                 "The change takes effect immediately."
             ),
             font=self._sf(10, "italic"),
@@ -515,8 +521,27 @@ class PlayerSorterApp:
         r_y = self.root.winfo_y()
         r_w = self.root.winfo_width()
         # Place it 30 px from the right edge, 80 px from the top
+        # ── Position dialog near top-right of main window ──────────────────
+        dialog.update_idletasks()
+        d_w = dialog.winfo_reqwidth()
+        d_h = dialog.winfo_reqheight()
+        r_x = self.root.winfo_x()
+        r_y = self.root.winfo_y()
+        r_w = self.root.winfo_width()
+        r_h = self.root.winfo_height()
+
+        # Screen dimensions (approximate)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        # Calculate position, with bounds checking
         x = r_x + r_w - d_w - 30
         y = r_y + 80
+
+        # Clamp to screen
+        x = max(0, min(x, screen_w - d_w - 10))
+        y = max(0, min(y, screen_h - d_h - 10))
+
         dialog.geometry(f"+{x}+{y}")
 
     # ── End scale / display-settings helpers ──────────────────────────────────
