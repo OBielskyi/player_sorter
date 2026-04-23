@@ -10,9 +10,12 @@ Supports Chess (ELO) and E-sports (Trophies) with three modes:
 """
 
 import datetime
+import filecmp
 import json
 import os
+import pathlib
 import random
+import shutil
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import List, Tuple
@@ -147,6 +150,117 @@ _BASE_SCALING = 96.0 / 72.0  # ≈ 1.3333
 
 # JSON file that persists the chosen scale between sessions
 _DISPLAY_SETTINGS_FILE = "player_sorter_display_settings.json"
+
+# Name of the dedicated folder for saved tournament files
+_TOURNAMENTS_DIR_NAME = "Tournaments"
+
+
+def _tournaments_candidates() -> list[pathlib.Path]:
+    """Return the ordered list of candidate paths for the Tournaments directory.
+    No directories are created or modified; callers decide what to do with them.
+
+    Fallback chain:
+      1. <user's Documents folder>/Tournaments
+      2. <user's home directory>/Tournaments
+      3. <app's current working directory>/Tournaments
+    """
+    home = pathlib.Path.home()
+    candidates: list[pathlib.Path] = []
+    docs = home / "Documents"
+    if docs.is_dir():
+        candidates.append(docs / _TOURNAMENTS_DIR_NAME)
+    candidates.append(home / _TOURNAMENTS_DIR_NAME)
+    candidates.append(pathlib.Path.cwd() / _TOURNAMENTS_DIR_NAME)
+    return candidates
+
+
+def _get_tournaments_dir() -> pathlib.Path:
+    """Return the Tournaments save directory, creating it on demand.
+
+    Walks the fallback chain from _tournaments_candidates() and returns the
+    first location that can be created and written to.
+
+    Raises RuntimeError (with a user-readable message) if every candidate
+    fails — callers are expected to catch this and show it via messagebox.
+    """
+    for candidate in _tournaments_candidates():
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            probe = candidate / ".write_probe"
+            probe.touch()
+            probe.unlink()
+            return candidate
+        except OSError:
+            continue
+
+    attempted = "\n".join(f"  • {p}" for p in _tournaments_candidates())
+    raise RuntimeError(
+        "Could not create a writable Tournaments folder in any of the "
+        "following locations:\n\n"
+        f"{attempted}\n\n"
+        "Check your filesystem permissions and try again."
+    )
+
+
+def _find_existing_tournaments_dir() -> pathlib.Path | None:
+    """Return the first candidate Tournaments directory that already exists,
+    without creating anything.  Returns None if none of the candidates exist.
+    Used by the load screen so it never creates a folder just by being opened.
+    """
+    for candidate in _tournaments_candidates():
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _migrate_cwd_tournaments() -> None:
+    """Move any tournament JSON files sitting in the app's CWD into the
+    dedicated Tournaments directory.
+
+    Conflict resolution when a file with the same name already exists in the
+    destination:
+      - Identical content  → remove the CWD copy (it's a true duplicate).
+      - Different content  → rename the CWD copy to discarded_<name> and move
+                             it to the Tournaments directory so nothing is lost,
+                             but the load screen won't pick it up automatically.
+
+    Only called after confirming CWD files exist, so the Tournaments directory
+    is never created needlessly on startup.
+    """
+    cwd = pathlib.Path.cwd()
+    old_files = list(cwd.glob("tournament_*_*.json"))
+    if not old_files:
+        return  # Nothing to migrate — Tournaments dir is never touched.
+
+    try:
+        dest_dir = _get_tournaments_dir()
+    except RuntimeError as exc:
+        from tkinter import messagebox as _mb
+        _mb.showerror(
+            "Migration Error",
+            f"Found tournament files in the app folder that need to be "
+            f"moved, but no writable Tournaments folder could be created:\n\n"
+            f"{exc}\n\n"
+            f"The files have been left in place.",
+        )
+        return
+
+    for src in old_files:
+        try:
+            dest = dest_dir / src.name
+            if dest.exists():
+                if filecmp.cmp(str(src), str(dest), shallow=False):
+                    # True duplicate — just remove the CWD copy.
+                    src.unlink()
+                else:
+                    # Different content — preserve it under a renamed path so
+                    # the user can inspect it, but keep it out of normal loading.
+                    renamed = dest_dir / f"discarded_{src.name}"
+                    shutil.move(str(src), str(renamed))
+            else:
+                shutil.move(str(src), str(dest))
+        except OSError:
+            pass  # Skip any individual file that cannot be moved.
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -340,6 +454,10 @@ class PlayerSorterApp:
 
         # Apply theme before showing UI
         self.apply_theme(self.current_theme)
+
+        # Migrate any tournament files left in the app's CWD to the dedicated
+        # Tournaments directory (one-time, silent, happens before first render).
+        _migrate_cwd_tournaments()
 
         self.show_theme_selection()
 
@@ -793,18 +911,20 @@ class PlayerSorterApp:
         ).pack(pady=20)
 
     def show_load_tournament_screen(self):
-        """Scan the current directory for saved tournament files and let the user
-        pick one to view (finished) or resume (unfinished)."""
-        import glob
+        """Scan the Tournaments directory for saved tournament files and let the
+        user pick one to view (finished) or resume (unfinished)."""
 
-        # Find all tournament save files
-        pattern = "tournament_*_*.json"
-        files = glob.glob(pattern)
+        # Scan for an already-existing Tournaments directory without creating
+        # one — opening the load screen should never create a folder.
+        t_dir = _find_existing_tournaments_dir()
+        files = [] if t_dir is None else [
+            str(p) for p in sorted(t_dir.glob("tournament_*_*.json"))
+        ]
 
         if not files:
             messagebox.showinfo(
                 "No Tournaments Found",
-                "No saved tournament files were found in the program's directory.",
+                "No saved tournament files were found in the Tournaments folder.",
             )
             return
 
@@ -2649,7 +2769,14 @@ class PlayerSorterApp:
         system_label = getattr(self, "tournament_system", "tournament")
         status_label = "finished" if finished else "unfinished"
 
-        filename = f"tournament_{timestamp}_{system_label}_{status_label}.json"
+        try:
+            t_dir = _get_tournaments_dir()
+        except RuntimeError as exc:
+            messagebox.showerror("Save Error", f"Could not save tournament:\n\n{exc}")
+            return None
+        filename = str(
+            t_dir / f"tournament_{timestamp}_{system_label}_{status_label}.json"
+        )
 
         # Build serialisable player list (full state, not just to_dict())
         players_data = []
