@@ -68,6 +68,17 @@ Download and run the executable[^2] for your OS.
 1. Make sure Python is installed and properly configured.
 2. Simply run `python player_sorter.py` and select your theme to begin organizing professional tournaments in minutes!
 
+### Building
+
+#### For *Windows*
+
+The command used for building the Windows executables is as follows: 
+`python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --windows-company-name="Oleksandr Bielskyi" --windows-product-name="Player Sorter" --windows-product-version=X.X.X --windows-file-version=X.X.X --windows-file-description="Professional tournament management software" --enable-plugin=tk-inter --windows-console-mode=disable --windows-icon-from-ico=logo.ico --output-filename="PlayerSorter-vX.X.X-Windows" source.py`
+
+#### For *Linux*
+
+`python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --onefile --enable-plugin=tk-inter --linux-icon=logo.png --output-filename="PlayerSorter-vX-X-X-Linux" source.py`
+
 [^1]: "Free" as in speech. See [LICENSE](https://github.com/OBielskyi/player_sorter/blob/main/LICENSE)
 [^2]: The executables before version 1.2.0 are generated with *Pyinstaller* (V1.2.0 introduced faster and smaller *Nuitka*-compiled executables). If you don't like the binaries or something doesn't work, you can run the Python file directly or create the executable binaries yourself.
 [^3]: It's also possible (and not too difficult) to create your own executable binary for your OS. [Good first read](https://github.com/oop7/Py-to-EXE-Guide)
