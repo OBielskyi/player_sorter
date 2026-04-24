@@ -70,6 +70,7 @@ Download and run the executable[^2] for your OS.
 
 ### Building
 
+*[Nuitka](https://nuitka.net/)* is used for the generation of binary executables.
 #### For *Windows*
 
 The command used for building the Windows executables is as follows: 
