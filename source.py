@@ -222,16 +222,26 @@ def _get_tournaments_dir() -> pathlib.Path:
 
 
 def _find_existing_tournaments_dir() -> pathlib.Path | None:
-    """Return the first candidate Tournaments directory that already exists,
-    without creating anything.  Returns None if none of the candidates exist.
-    Used by the load screen so it never creates a folder just by being opened.
+    """Return the first candidate Tournaments directory that already exists
+    AND is writable, without creating anything new.  Returns None if no
+    suitable directory is found.  Used by the load screen so it never creates
+    a folder just by being opened.
 
-    Uses the same candidate priority as _get_tournaments_dir(), so both
-    functions always agree on which directory is authoritative.
+    The writability check mirrors _get_tournaments_dir() Pass 1 exactly,
+    guaranteeing that both functions always agree on which directory is
+    authoritative — including the edge case where an existing Tournaments
+    directory is read-only (in which case both functions skip it and look
+    at the next candidate).
     """
     for candidate in _tournaments_candidates():
         if candidate.is_dir():
-            return candidate
+            try:
+                probe = candidate / ".write_probe"
+                probe.touch()
+                probe.unlink()
+                return candidate
+            except OSError:
+                continue  # Exists but not writable — skip, same as _get_tournaments_dir.
     return None
 
 
