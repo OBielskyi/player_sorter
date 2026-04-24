@@ -73,12 +73,16 @@ Download and run the executable[^2] for your OS.
 *[Nuitka](https://nuitka.net/)* is used for the generation of binary executables.
 #### For *Windows*
 
-The command used for building the Windows executables is as follows: 
+The command used for building the Windows executables from the *[source code](https://github.com/OBielskyi/player_sorter/blob/main/source.py)* is as follows: 
 `python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --windows-company-name="Oleksandr Bielskyi" --windows-product-name="Player Sorter" --windows-product-version=X.X.X --windows-file-version=X.X.X --windows-file-description="Professional tournament management software" --enable-plugin=tk-inter --windows-console-mode=disable --windows-icon-from-ico=logo.ico --output-filename="PlayerSorter-vX.X.X-Windows" source.py`
 
 #### For *Linux*
 
 `python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --onefile --enable-plugin=tk-inter --linux-icon=logo.png --output-filename="PlayerSorter-vX-X-X-Linux" source.py`
+
+### Contributing
+
+See *[CONTRIBUTING.md](https://github.com/OBielskyi/player_sorter/blob/main/CONTRIBUTING.md)*.
 
 [^1]: "Free" as in speech. See [LICENSE](https://github.com/OBielskyi/player_sorter/blob/main/LICENSE)
 [^2]: The executables before version 1.2.0 are generated with *Pyinstaller* (V1.2.0 introduced faster and smaller *Nuitka*-compiled executables). If you don't like the binaries or something doesn't work, you can run the Python file directly or create the executable binaries yourself.
