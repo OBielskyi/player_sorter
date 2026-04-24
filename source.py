@@ -177,13 +177,32 @@ def _tournaments_candidates() -> list[pathlib.Path]:
 def _get_tournaments_dir() -> pathlib.Path:
     """Return the Tournaments save directory, creating it on demand.
 
-    Walks the fallback chain from _tournaments_candidates() and returns the
-    first location that can be created and written to.
+    Selection logic:
+      1. If any candidate already exists and is writable, use the first such
+         directory.  This keeps the chosen location stable across launches and
+         ensures _get_tournaments_dir() always agrees with
+         _find_existing_tournaments_dir().
+      2. If no candidate exists yet, create (and write-probe) the first one
+         in the fallback chain that the OS will allow.
 
     Raises RuntimeError (with a user-readable message) if every candidate
     fails — callers are expected to catch this and show it via messagebox.
     """
-    for candidate in _tournaments_candidates():
+    candidates = _tournaments_candidates()
+
+    # Pass 1 — prefer an already-existing directory.
+    for candidate in candidates:
+        if candidate.is_dir():
+            try:
+                probe = candidate / ".write_probe"
+                probe.touch()
+                probe.unlink()
+                return candidate
+            except OSError:
+                continue  # Exists but not writable; try the next one.
+
+    # Pass 2 — nothing exists yet; create the first writable location.
+    for candidate in candidates:
         try:
             candidate.mkdir(parents=True, exist_ok=True)
             probe = candidate / ".write_probe"
@@ -193,7 +212,7 @@ def _get_tournaments_dir() -> pathlib.Path:
         except OSError:
             continue
 
-    attempted = "\n".join(f"  • {p}" for p in _tournaments_candidates())
+    attempted = "\n".join(f"  • {p}" for p in candidates)
     raise RuntimeError(
         "Could not create a writable Tournaments folder in any of the "
         "following locations:\n\n"
@@ -206,11 +225,30 @@ def _find_existing_tournaments_dir() -> pathlib.Path | None:
     """Return the first candidate Tournaments directory that already exists,
     without creating anything.  Returns None if none of the candidates exist.
     Used by the load screen so it never creates a folder just by being opened.
+
+    Uses the same candidate priority as _get_tournaments_dir(), so both
+    functions always agree on which directory is authoritative.
     """
     for candidate in _tournaments_candidates():
         if candidate.is_dir():
             return candidate
     return None
+
+
+def _unique_discarded_path(dest_dir: pathlib.Path, original_name: str) -> pathlib.Path:
+    """Return a path of the form <dest_dir>/discarded_<original_name> that does
+    not yet exist, appending a numeric suffix (_1, _2, …) if necessary to
+    avoid silently overwriting a previously discarded file.
+    """
+    candidate = dest_dir / f"discarded_{original_name}"
+    if not candidate.exists():
+        return candidate
+    counter = 1
+    while True:
+        candidate = dest_dir / f"discarded_{counter}_{original_name}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
 def _migrate_cwd_tournaments() -> None:
@@ -220,9 +258,12 @@ def _migrate_cwd_tournaments() -> None:
     Conflict resolution when a file with the same name already exists in the
     destination:
       - Identical content  → remove the CWD copy (it's a true duplicate).
-      - Different content  → rename the CWD copy to discarded_<name> and move
-                             it to the Tournaments directory so nothing is lost,
-                             but the load screen won't pick it up automatically.
+      - Different content  → move the CWD copy to the Tournaments directory
+                             under a unique name of the form
+                             discarded_<original_name> (or
+                             discarded_<n>_<original_name> if that name is
+                             already taken), so nothing is lost but the load
+                             screen won't pick it up automatically.
 
     Only called after confirming CWD files exist, so the Tournaments directory
     is never created needlessly on startup.
@@ -235,13 +276,12 @@ def _migrate_cwd_tournaments() -> None:
     try:
         dest_dir = _get_tournaments_dir()
     except RuntimeError as exc:
-        from tkinter import messagebox as _mb
-        _mb.showerror(
+        messagebox.showerror(
             "Migration Error",
-            f"Found tournament files in the app folder that need to be "
-            f"moved, but no writable Tournaments folder could be created:\n\n"
+            "Found tournament files in the app folder that need to be "
+            "moved, but no writable Tournaments folder could be created:\n\n"
             f"{exc}\n\n"
-            f"The files have been left in place.",
+            "The files have been left in place.",
         )
         return
 
@@ -255,7 +295,7 @@ def _migrate_cwd_tournaments() -> None:
                 else:
                     # Different content — preserve it under a renamed path so
                     # the user can inspect it, but keep it out of normal loading.
-                    renamed = dest_dir / f"discarded_{src.name}"
+                    renamed = _unique_discarded_path(dest_dir, src.name)
                     shutil.move(str(src), str(renamed))
             else:
                 shutil.move(str(src), str(dest))
