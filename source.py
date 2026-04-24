@@ -2856,7 +2856,6 @@ class PlayerSorterApp:
         schev_team_b_names = [p.name for p in getattr(self, "schev_team_b", [])]
 
         data = {
-            "version": "2.0.1",
             "finished": finished,
             "tournament_system": getattr(self, "tournament_system", None),
             "tiebreak_method": getattr(self, "tiebreak_method", None),
