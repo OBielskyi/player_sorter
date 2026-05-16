@@ -9,6 +9,7 @@ Supports Chess (ELO) and E-sports (Trophies) with three modes:
 - Teams: Create balanced teams
 """
 
+import csv
 import datetime
 import filecmp
 import json
@@ -17,7 +18,7 @@ import pathlib
 import random
 import shutil
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import List, Tuple
 
 # Theme definitions
@@ -672,17 +673,6 @@ class PlayerSorterApp:
         )
 
         # ── Position dialog near top-right of main window ──────────────────
-        # Let the dialog calculate its natural size based on content (which
-        # automatically scales with the current tk scaling), then just position
-        # it without forcing dimensions.
-        dialog.update_idletasks()
-        d_w = dialog.winfo_reqwidth()
-        d_h = dialog.winfo_reqheight()
-        r_x = self.root.winfo_x()
-        r_y = self.root.winfo_y()
-        r_w = self.root.winfo_width()
-        # Place it 30 px from the right edge, 80 px from the top
-        # ── Position dialog near top-right of main window ──────────────────
         dialog.update_idletasks()
         d_w = dialog.winfo_reqwidth()
         d_h = dialog.winfo_reqheight()
@@ -1094,6 +1084,16 @@ class PlayerSorterApp:
             entry = next(e for e in file_entries if e["filepath"] == filepath)
             self._open_tournament_entry(entry)
 
+        def on_export():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to export."
+                )
+                return
+            filepath = selected[0]
+            self._export_csv_from_filepath(filepath)
+
         def on_delete():
             selected = tree.selection()
             if not selected:
@@ -1134,6 +1134,11 @@ class PlayerSorterApp:
             btn_frame,
             text="Delete Selected",
             command=on_delete,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="📄 Export as CSV",
+            command=on_export,
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
@@ -2492,9 +2497,14 @@ class PlayerSorterApp:
             messagebox.showwarning("Selection Error", "Please select a player to edit")
             return
 
-        index = self.tree.index(selected[0])
-        self.editing_player_index = index  # Remember which player we're editing
-        player = self.players[index]
+        # The tree only shows non-eliminated players, so map the tree row index
+        # to the real index inside self.players to avoid editing the wrong player.
+        tree_row = self.tree.index(selected[0])
+        visible_players = [p for p in self.players if not p.eliminated]
+        if tree_row >= len(visible_players):
+            return
+        player = visible_players[tree_row]
+        self.editing_player_index = self.players.index(player)
 
         # Load player data into entry fields
         self.first_name_entry.delete(0, tk.END)
@@ -2648,7 +2658,12 @@ class PlayerSorterApp:
             )
             return
 
-        index = self.tree.index(selected[0])
+        tree_row = self.tree.index(selected[0])
+        visible_players = [p for p in self.players if not p.eliminated]
+        if tree_row >= len(visible_players):
+            return
+        player = visible_players[tree_row]
+        index = self.players.index(player)
         del self.players[index]
         self.editing_player_index = None  # Cancel any pending edit
         self.add_update_btn.config(text="Add Player")
@@ -4464,9 +4479,7 @@ class PlayerSorterApp:
             return
 
         # Determine which sub-mode to use based on rating_mode
-        elo_mode = "otb"  # default
-        if hasattr(self, "elo_submode"):
-            elo_mode = self.elo_submode
+        elo_mode = getattr(self, "elo_submode", None) or "otb"
 
         elo_changes = {}  # Track changes for each player
 
@@ -4655,11 +4668,6 @@ class PlayerSorterApp:
         for player in self.players:
             player.opponents = []
             player.colors = []
-
-        self.tournament_history = []
-        self.tournament_start_time = datetime.datetime.now().strftime(
-            "%Y-%m-%d_%H-%M-%S"
-        )
 
         if self.tournament_system == "swiss":
             self.show_swiss_round()
@@ -5448,7 +5456,9 @@ class PlayerSorterApp:
         """Process tournament round results"""
         # Check all matches have results
         for pairing, result_var in self.tournament_results:
-            if result_var.get() == "" and result_var.get() not in ["bye", "half_bye"]:
+            if result_var.get() == "" or result_var.get() not in [
+                "p1_win", "p2_win", "draw", "bye", "half_bye"
+            ]:
                 messagebox.showwarning(
                     "Incomplete", "Please set results for all matches"
                 )
@@ -5763,6 +5773,9 @@ class PlayerSorterApp:
         so that requests made on the standings screen are not lost.
         Safe to call even when the checkboxes were never shown (no-ops).
         """
+        # Use the correct round counter — Scheveningen tracks its own round.
+        current_rnd = getattr(self, "schev_round", None) or self.current_round
+
         # Apply withdrawal requests
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
             for player_name, var in self.withdrawal_vars.items():
@@ -5770,7 +5783,7 @@ class PlayerSorterApp:
                     for player in self.players:
                         if player.name == player_name:
                             player.withdrawn = True
-                            player.withdrawal_round = self.current_round
+                            player.withdrawal_round = current_rnd
                             break
 
         # Apply half-bye requests
@@ -6059,6 +6072,238 @@ class PlayerSorterApp:
             command=self.show_tournament_final_standings,
         ).pack(side=tk.LEFT, padx=5)
 
+    # ============ CSV EXPORT ============
+
+    def export_tournament_to_csv(self, history: list, meta: dict = None) -> None:
+        """Export tournament history to a user-chosen CSV file.
+
+        The file is written with a UTF-8 BOM so that Excel opens it correctly
+        without any import-wizard steps.  Sections are separated by blank rows
+        so the file is still human-readable in a plain text editor.
+
+        Parameters
+        ----------
+        history : list
+            List of round dicts (same structure as ``tournament_history``).
+        meta : dict, optional
+            Extra metadata fields.  Expected keys (all optional):
+            ``tournament_system``, ``tournament_start_time``, ``finished``,
+            ``tiebreak_method``, ``current_round``.
+        """
+        if not history:
+            messagebox.showinfo("No Data", "No round history available to export.")
+            return
+
+        if meta is None:
+            meta = {}
+
+        # Build a sensible default filename ─────────────────────────────────
+        system = meta.get("tournament_system") or "tournament"
+        timestamp = (meta.get("tournament_start_time") or "").replace(":", "-").replace(" ", "_")
+        hint = (
+            f"tournament_{timestamp}_{system}_export"
+            if timestamp
+            else f"tournament_{system}_export"
+        )
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=hint,
+            title="Export Tournament as CSV",
+        )
+        if not save_path:
+            return  # User cancelled
+
+        # Display-friendly labels ────────────────────────────────────────────
+        system_display = {
+            "swiss": "Swiss System",
+            "round_robin": "Round-Robin",
+            "knockout": "Knockout",
+            "scheveningen": "Scheveningen",
+        }.get(system, system.replace("_", " ").title())
+
+        tiebreak_raw = meta.get("tiebreak_method") or ""
+        tiebreak_display = {
+            "buchholz": "Buchholz",
+            "sonneborn_berger": "Sonneborn-Berger",
+            "direct_encounter": "Direct Encounter",
+            "rating": "Rating",
+        }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
+
+        result_map = {
+            "p1_win": "1 – 0",
+            "p2_win": "0 – 1",
+            "draw": "½ – ½",
+            "bye": "BYE (+1 pt)",
+            "half_bye": "HALF-BYE (+0.5 pt)",
+        }
+
+        is_schev = (system == "scheveningen")
+
+        try:
+            # utf-8-sig writes a BOM, which tells Excel the file is UTF-8.
+            with open(save_path, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+
+                # ── Section 1: Tournament metadata ───────────────────────────
+                w.writerow(["TOURNAMENT INFO"])
+                w.writerow(["System", system_display])
+                start_raw = meta.get("tournament_start_time") or ""
+                w.writerow(["Start Time", start_raw.replace("_", " ")])
+                w.writerow(
+                    ["Status", "Finished" if meta.get("finished", True) else "Unfinished"]
+                )
+                w.writerow(["Tiebreak Method", tiebreak_display])
+                w.writerow(
+                    ["Total Rounds Played", meta.get("current_round", len(history))]
+                )
+
+                # ── Section 2: Final standings ────────────────────────────────
+                w.writerow([])
+                w.writerow(["FINAL STANDINGS"])
+                last_round = history[-1]
+                standings = last_round.get("standings_after_round", [])
+
+                if is_schev:
+                    w.writerow(
+                        ["Rank", "Team", "Name", "ELO", "Points",
+                         "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                         "Tiebreak", "Status"]
+                    )
+                    for s in standings:
+                        w.writerow([
+                            s["rank"],
+                            s.get("team") or "—",
+                            s["name"],
+                            s["rating"],
+                            s["points"],
+                            s["wins"],
+                            s["losses"],
+                            s["draws"],
+                            s["byes"],
+                            s["half_byes"],
+                            s["tiebreak"] if s["tiebreak"] is not None else "—",
+                            s["status"],
+                        ])
+                else:
+                    w.writerow(
+                        ["Rank", "Name", "ELO", "Points",
+                         "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                         "Tiebreak", "Status"]
+                    )
+                    for s in standings:
+                        w.writerow([
+                            s["rank"],
+                            s["name"],
+                            s["rating"],
+                            s["points"],
+                            s["wins"],
+                            s["losses"],
+                            s["draws"],
+                            s["byes"],
+                            s["half_byes"],
+                            s["tiebreak"] if s["tiebreak"] is not None else "—",
+                            s["status"],
+                        ])
+
+                # ── Section 3+: Per-round details ─────────────────────────────
+                for rnd in history:
+                    rnum = rnd["round_number"]
+
+                    w.writerow([])
+                    w.writerow([f"ROUND {rnum} – PAIRINGS"])
+                    w.writerow(["Board", "Player 1 (White)", "Result", "Player 2 (Black)"])
+                    for p in rnd.get("pairings", []):
+                        p2_disp = p["player2"] if p["player2"] else "—"
+                        res_disp = result_map.get(p["result"], p["result"])
+                        w.writerow([p["board"], p["player1"], res_disp, p2_disp])
+
+                    w.writerow([])
+                    w.writerow([f"ROUND {rnum} – STANDINGS AFTER ROUND"])
+                    round_standings = rnd.get("standings_after_round", [])
+
+                    if is_schev:
+                        w.writerow(
+                            ["Rank", "Team", "Name", "Points",
+                             "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                             "Tiebreak", "Status"]
+                        )
+                        for s in round_standings:
+                            w.writerow([
+                                s["rank"],
+                                s.get("team") or "—",
+                                s["name"],
+                                s["points"],
+                                s["wins"],
+                                s["losses"],
+                                s["draws"],
+                                s["byes"],
+                                s["half_byes"],
+                                s["tiebreak"] if s["tiebreak"] is not None else "—",
+                                s["status"],
+                            ])
+                    else:
+                        w.writerow(
+                            ["Rank", "Name", "Points",
+                             "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                             "Tiebreak", "Status"]
+                        )
+                        for s in round_standings:
+                            w.writerow([
+                                s["rank"],
+                                s["name"],
+                                s["points"],
+                                s["wins"],
+                                s["losses"],
+                                s["draws"],
+                                s["byes"],
+                                s["half_byes"],
+                                s["tiebreak"] if s["tiebreak"] is not None else "—",
+                                s["status"],
+                            ])
+
+            messagebox.showinfo(
+                "Export Successful", f"Tournament exported to:\n{save_path}"
+            )
+
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not write CSV file:\n{exc}")
+
+    def _export_csv_from_filepath(self, filepath: str) -> None:
+        """Load a saved tournament JSON file and export its history to CSV.
+
+        Used by the Load Tournament screen so the user can export a tournament
+        without having to open it first.
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read tournament file:\n{exc}")
+            return
+
+        history = data.get("tournament_history", [])
+        if not history:
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+
+        meta = {
+            "tournament_system": data.get("tournament_system"),
+            "tournament_start_time": data.get("tournament_start_time", ""),
+            "finished": data.get("finished", False),
+            "tiebreak_method": data.get("tiebreak_method", ""),
+            "current_round": data.get("current_round", len(history)),
+        }
+        self.export_tournament_to_csv(history, meta)
+
+    # ============ END CSV EXPORT ============
+
     def show_round_by_round_viewer(self, history: list, readonly: bool = True):
         """Display a round-by-round viewer.
         history: list of round dicts (from tournament_history or loaded file).
@@ -6212,6 +6457,22 @@ class PlayerSorterApp:
         ttk.Button(btn_frame, text="← Back", command=self.show_initial_selection).pack(
             side=tk.LEFT, padx=5
         )
+        ttk.Button(
+            btn_frame,
+            text="📄 Export as CSV",
+            command=lambda: self.export_tournament_to_csv(
+                history,
+                {
+                    "tournament_system": getattr(self, "tournament_system", None),
+                    "tournament_start_time": getattr(
+                        self, "tournament_start_time", ""
+                    ),
+                    "finished": True,
+                    "tiebreak_method": getattr(self, "tiebreak_method", None),
+                    "current_round": getattr(self, "current_round", len(history)),
+                },
+            ),
+        ).pack(side=tk.LEFT, padx=5)
 
     # ============ END TOURNAMENT MODE ============
 
