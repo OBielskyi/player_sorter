@@ -3161,6 +3161,7 @@ class PlayerSorterApp:
                 messagebox.showwarning(
                     "Not Enough Players", "Need at least 2 players for dual mode"
                 )
+                self.in_game = False  # Roll back — no game was actually started
                 return
             self.show_dual_game()
         elif self.sort_mode == "battle_royale":
@@ -3168,6 +3169,7 @@ class PlayerSorterApp:
                 messagebox.showwarning(
                     "Not Enough Players", "Need at least 4 players for battle royale"
                 )
+                self.in_game = False  # Roll back — no game was actually started
                 return
             self.show_battle_royale_game()
         elif self.sort_mode == "teams":
@@ -4618,10 +4620,13 @@ class PlayerSorterApp:
                     new_rating_str = self.rating_entries[player.name].get().strip()
                     if new_rating_str:
                         new_rating = int(new_rating_str)
-                        if new_rating < 0:
+                        # Enforce the same floor used everywhere else:
+                        # chess = 100, e-sports = 0 (trophies can be 0).
+                        min_rating = 100 if self.game_type == "chess" else 0
+                        if new_rating < min_rating:
                             messagebox.showwarning(
                                 "Invalid Input",
-                                f"Rating for {player.name} cannot be negative",
+                                f"Rating for {player.name} cannot be below {min_rating}",
                             )
                             return
                         player.rating = new_rating
@@ -4664,10 +4669,23 @@ class PlayerSorterApp:
         )
         self.current_round = 1
 
-        # Clear previous tournament data
+        # Reset all per-tournament state on every Player object.
+        # wins/losses/draws/byes/half_byes accumulate from the player-roster
+        # save file across sessions; without this reset, a second tournament
+        # would start with leftover points from the first, corrupting every
+        # standing and tiebreak calculation from round 1 onward.
         for player in self.players:
+            player.wins = 0
+            player.losses = 0
+            player.draws = 0
+            player.byes = 0
+            player.half_byes = 0
+            player.eliminated = False
+            player.withdrawn = False
+            player.withdrawal_round = None
             player.opponents = []
             player.colors = []
+            player.requested_half_bye = False
 
         if self.tournament_system == "swiss":
             self.show_swiss_round()
@@ -5057,7 +5075,7 @@ class PlayerSorterApp:
                     player.draws,
                     player.byes,
                     player.half_byes,
-                    f"{tb_score:.1f}" if tb_score else "-",
+                    f"{tb_score:.1f}" if tb_score is not None else "-",
                 ),
             )
 
@@ -5631,7 +5649,7 @@ class PlayerSorterApp:
                     player.draws,
                     player.byes,
                     player.half_byes,
-                    f"{tb_score:.1f}" if tb_score else "-",
+                    f"{tb_score:.1f}" if tb_score is not None else "-",
                 ),
             )
 
@@ -5987,7 +6005,7 @@ class PlayerSorterApp:
                     player.points,
                     record,
                     status,
-                    f"{tb_score:.1f}" if tb_score else "-",
+                    f"{tb_score:.1f}" if tb_score is not None else "-",
                 ),
             )
 
