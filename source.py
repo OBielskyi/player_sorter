@@ -142,13 +142,6 @@ THEMES = {
 # Supported UI scale percentages
 SCALE_OPTIONS = [25, 50, 75, 100, 125, 150, 175, 200]
 
-# Baseline Tcl/Tk scaling factor that corresponds to 100 %.
-# Tk internally works in points; 96 DPI ÷ 72 pt/inch = 1.3333… px/pt,
-# which is the universally accepted "standard" desktop DPI.  Anchoring our
-# 100 % here makes the slider independent of the OS-level scaling setting,
-# which is exactly what we want: the user can dial in an absolute size.
-_BASE_SCALING = 96.0 / 72.0  # ≈ 1.3333
-
 # JSON file that persists the chosen scale between sessions
 _DISPLAY_SETTINGS_FILE = "player_sorter_display_settings.json"
 
@@ -2886,6 +2879,7 @@ class PlayerSorterApp:
             "schev_round": getattr(self, "schev_round", None),
             "schev_total_rounds": getattr(self, "schev_total_rounds", None),
             "scheveningen_team_size": getattr(self, "scheveningen_team_size", None),
+            "round_robin_total_rounds": getattr(self, "round_robin_total_rounds", 0),
             "schev_team_a_names": schev_team_a_names,
             "schev_team_b_names": schev_team_b_names,
             "players": players_data,
@@ -2917,10 +2911,44 @@ class PlayerSorterApp:
             self.show_initial_selection()
 
     def _save_finished_tournament(self):
-        """Save a completed tournament to file."""
+        """Save a completed tournament to file.
+
+        After writing the finished copy, check whether a corresponding
+        _unfinished save still exists (left over from a previous
+        'Save & Exit').  If it does, ask the director whether to delete it —
+        keeping it would let the unfinished copy appear on the Load screen
+        alongside the finished one, which is confusing.
+        """
         filename = self.save_tournament_to_file(finished=True)
-        if filename:
-            messagebox.showinfo("Saved", f"Tournament saved to:\n{filename}")
+        if not filename:
+            return
+
+        # The finished filename ends with _finished.json; the unfinished
+        # counterpart (if it exists) has the same prefix with _unfinished.json.
+        unfinished_path = pathlib.Path(
+            filename.replace("_finished.json", "_unfinished.json")
+        )
+        if unfinished_path.exists():
+            keep_both = messagebox.askyesno(
+                "Unfinished Copy Exists",
+                f"An unfinished save of this tournament still exists:\n\n"
+                f"  {unfinished_path.name}\n\n"
+                "Would you like to keep both files?\n\n"
+                "• Yes — keep both (the unfinished copy will still appear "
+                "on the Load screen)\n"
+                "• No  — delete the unfinished copy (recommended)",
+            )
+            if not keep_both:
+                try:
+                    unfinished_path.unlink()
+                except OSError as exc:
+                    messagebox.showwarning(
+                        "Cleanup Failed",
+                        f"Could not delete the unfinished copy:\n{exc}\n\n"
+                        "You can delete it manually from the Load screen.",
+                    )
+
+        messagebox.showinfo("Saved", f"Tournament saved to:\n{filename}")
 
     def load_tournament_from_file(self, filepath: str) -> bool:
         """Load a saved tournament file and restore all state.
@@ -2953,6 +2981,9 @@ class PlayerSorterApp:
         self.schev_round = data.get("schev_round") or 0
         self.schev_total_rounds = data.get("schev_total_rounds") or 0
         self.scheveningen_team_size = data.get("scheveningen_team_size") or 0
+
+        # Restore round-robin stable round count (0 means "not set / old save")
+        self.round_robin_total_rounds = data.get("round_robin_total_rounds") or 0
 
         # Restore players
         self.players = []
@@ -3925,84 +3956,6 @@ class PlayerSorterApp:
         """Generate balanced teams"""
         self.show_team_configuration()
 
-    def show_dual_results(
-        self, pairs: List[Tuple[Player, Player]], leftover: Player = None
-    ):
-        """Display dual pairing results"""
-        self.clear_window()
-
-        frame = ttk.Frame(self.root, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Title
-        title = ttk.Label(frame, text="Dual Pairings", font=("Arial", 18, "bold"))
-        title.pack(pady=10)
-
-        # Results frame with scrollbar
-        results_frame = ttk.Frame(frame)
-        results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(results_frame, bg=theme["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(
-            results_frame, orient="vertical", command=canvas.yview
-        )
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
-
-        for i, (p1, p2) in enumerate(pairs, 1):
-            pair_frame = ttk.LabelFrame(
-                scrollable_frame, text=f"Match {i}", padding="10"
-            )
-            pair_frame.pack(fill=tk.X, padx=5, pady=5)
-
-            ttk.Label(
-                pair_frame,
-                text=f"{p1.name} ({rating_name}: {p1.rating})",
-                font=("Arial", 11),
-            ).pack(anchor=tk.W)
-            ttk.Label(pair_frame, text="vs", font=("Arial", 10, "italic")).pack(
-                anchor=tk.W, padx=20
-            )
-            ttk.Label(
-                pair_frame,
-                text=f"{p2.name} ({rating_name}: {p2.rating})",
-                font=("Arial", 11),
-            ).pack(anchor=tk.W)
-
-        if leftover:
-            leftover_frame = ttk.LabelFrame(
-                scrollable_frame, text="No Match", padding="10"
-            )
-            leftover_frame.pack(fill=tk.X, padx=5, pady=5)
-            ttk.Label(
-                leftover_frame,
-                text=f"{leftover.name} ({rating_name}: {leftover.rating})",
-                font=("Arial", 11),
-            ).pack(anchor=tk.W)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=10)
-
-        ttk.Button(
-            btn_frame, text="← Back to Input", command=self.show_player_input
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Regenerate", command=self.generate_results).pack(
-            side=tk.LEFT, padx=5
-        )
-
     def show_battle_royale_results(self, sorted_players: List[Player]):
         """Display battle royale results"""
         self.clear_window()
@@ -4690,6 +4643,15 @@ class PlayerSorterApp:
         if self.tournament_system == "swiss":
             self.show_swiss_round()
         elif self.tournament_system == "round_robin":
+            # Record the stable round count from the initial player pool.
+            # Half-byes temporarily shrink playing_players mid-tournament, so
+            # recomputing total_rounds from that list each round causes premature
+            # termination.  Capturing it once here (before any half-byes or
+            # withdrawals) keeps it correct for the whole tournament.
+            n_start = len(self.players)
+            self.round_robin_total_rounds = (
+                n_start - 1 if n_start % 2 == 0 else n_start
+            )
             self.show_round_robin_round()
         elif self.tournament_system == "knockout":
             self.show_knockout_round()
@@ -4820,8 +4782,19 @@ class PlayerSorterApp:
 
         n = len(playing_players)
 
-        # Calculate total rounds needed
-        total_rounds = n - 1 if n % 2 == 0 else n
+        # Use the stable total recorded at tournament start rather than
+        # recomputing from playing_players.  A player taking a half-bye
+        # temporarily reduces playing_players, which would make the naive
+        # formula undercount total_rounds and end the tournament too early.
+        total_rounds = getattr(self, "round_robin_total_rounds", 0)
+        if not total_rounds:
+            # Fallback for saves that predate this field: derive from all
+            # non-withdrawn players (still better than using playing_players).
+            n_all = len(
+                [p for p in self.players if not p.eliminated and not p.withdrawn]
+            )
+            total_rounds = n_all - 1 if n_all % 2 == 0 else n_all
+            self.round_robin_total_rounds = total_rounds  # cache for next rounds
 
         if self.current_round > total_rounds:
             return []  # Tournament complete
@@ -4869,14 +4842,21 @@ class PlayerSorterApp:
 
         pairings = self.generate_knockout_pairings()
 
-        round_names = {
-            1: "Round 1",
-            2: "Round 2",
-            3: "Quarterfinals",
-            4: "Semifinals",
-            5: "Finals",
-        }
-        round_name = round_names.get(self.current_round, f"Round {self.current_round}")
+        # Derive the round label from how many players are still active, so
+        # "Semifinals" appears when 4 remain regardless of how many started.
+        num_active = len(active)
+        if num_active <= 2:
+            round_name = "Final"
+        elif num_active <= 4:
+            round_name = "Semifinals"
+        elif num_active <= 8:
+            round_name = "Quarterfinals"
+        elif num_active <= 16:
+            round_name = "Round of 16"
+        elif num_active <= 32:
+            round_name = "Round of 32"
+        else:
+            round_name = f"Round {self.current_round}"
 
         title = ttk.Label(
             frame, text=f"Knockout - {round_name}", font=("Arial", 16, "bold")
@@ -5749,9 +5729,12 @@ class PlayerSorterApp:
                 should_auto_finish = True
 
         elif system == "round_robin":
-            # Round-robin: check max rounds if set, otherwise natural end
-            n = len([p for p in self.players if not p.withdrawn])
-            natural_total_rounds = n - 1 if n % 2 == 0 else n
+            # Use the stable total set at tournament start; fall back to
+            # computing from non-withdrawn players only for old saves.
+            natural_total_rounds = getattr(self, "round_robin_total_rounds", 0)
+            if not natural_total_rounds:
+                n = len([p for p in self.players if not p.withdrawn])
+                natural_total_rounds = n - 1 if n % 2 == 0 else n
 
             if self.max_rounds:
                 # Max rounds set - use it
