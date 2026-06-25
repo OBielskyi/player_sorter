@@ -5489,17 +5489,43 @@ class PlayerSorterApp:
 
         # Handle elimination for knockout
         if system == "knockout":
+            # Standard rule: a draw eliminates BOTH players, since neither
+            # has earned the right to advance over the other.
+            #
+            # Exception: if eliminating every drawn pair this round would
+            # leave the bracket with zero active players, that's not a
+            # valid outcome (the tournament needs a winner) - so none of
+            # this round's drawn players are eliminated, and they simply
+            # get re-paired next round (generate_knockout_pairings already
+            # re-pairs anyone still active) to play it out again. This
+            # covers the common case of a drawn final, and the rarer case
+            # of a round where every single pairing ends in a draw.
+            active_before = [p for p in self.players if not p.eliminated]
+            decisive_losers = set()
+            drawn_players = set()
             for pairing, result_var in self.tournament_results:
                 p1, p2, _ = pairing
                 result = result_var.get()
-
                 if result == "p1_win" and p2:
-                    p2.eliminated = True
+                    decisive_losers.add(p2)
                 elif result == "p2_win" and p1:
-                    p1.eliminated = True
-                # In knockout, draws might need resolution - for now treat as p1 win
+                    decisive_losers.add(p1)
                 elif result == "draw" and p2:
-                    p2.eliminated = True
+                    drawn_players.add(p1)
+                    drawn_players.add(p2)
+
+            would_remain = [
+                p
+                for p in active_before
+                if p not in decisive_losers and p not in drawn_players
+            ]
+            draws_must_replay = bool(drawn_players) and not would_remain
+
+            for player in decisive_losers:
+                player.eliminated = True
+            if not draws_must_replay:
+                for player in drawn_players:
+                    player.eliminated = True
 
         self._record_round_to_history(system)
 
@@ -5974,7 +6000,7 @@ class PlayerSorterApp:
 
             # Status column
             if player.withdrawn:
-                status = f"Withdrew R{player.withdrawal_round}"
+                status = f"Withdrew after R{player.withdrawal_round}"
             else:
                 status = "Completed"
 
