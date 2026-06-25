@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import random
+import re
 import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -306,6 +307,31 @@ def _migrate_cwd_tournaments() -> None:
         except OSError:
             pass  # Skip any individual file that cannot be moved.
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+def _normalize_name_casing(name: str) -> str:
+    """Convert a first/last name to standard title-case formatting,
+    regardless of how the user typed it ("mcdonald", "MCDONALD",
+    "mcDonald" all become "McDonald"). Collapses repeated internal
+    whitespace too. Only intended for first_name/last_name - nicknames
+    are left exactly as typed, since stylized capitalization is often
+    intentional there.
+    """
+    name = " ".join(name.split())
+    if not name:
+        return name
+    name = name.title()
+    # str.title() lowercases the letter right after "Mc", e.g.
+    # "mcdonald" -> "Mcdonald". Fix that common case specifically,
+    # since guessing at other prefixes (e.g. "Mac") risks getting
+    # unrelated names (Macy, Macon) wrong.
+    name = re.sub(r"\bMc([a-z])", lambda m: "Mc" + m.group(1).upper(), name)
+    return name
+
+
+def _player_display_name_key(player: "Player") -> str:
+    """Case-insensitive key for comparing two players' display names."""
+    return player.name.strip().casefold()
 
 
 class Player:
@@ -2518,8 +2544,8 @@ class PlayerSorterApp:
 
     def add_or_update_player(self):
         """Add a new player or update existing one with name validation"""
-        first_name = self.first_name_entry.get().strip()
-        last_name = self.last_name_entry.get().strip()
+        first_name = _normalize_name_casing(self.first_name_entry.get().strip())
+        last_name = _normalize_name_casing(self.last_name_entry.get().strip())
         nickname = self.nickname_entry.get().strip()
         rating_str = self.rating_entry.get().strip()
 
@@ -2588,8 +2614,34 @@ class PlayerSorterApp:
                     )
                     return
 
+        # Build the candidate name's display form the same way the real
+        # Player object would, so the duplicate check below can never
+        # drift out of sync with how names actually render in the UI.
+        candidate = Player(
+            first_name=first_name, last_name=last_name, nickname=nickname
+        )
+        candidate_key = _player_display_name_key(candidate)
+
         # Check if we are updating an existing player (edit mode)
         if self.editing_player_index is not None:
+            # Look for a collision against every OTHER player (case-
+            # insensitive on the full display name) before committing the
+            # rename. Compare by index, not by object/name, so renaming a
+            # player back to their own unchanged name never false-positives.
+            for i, p in enumerate(self.players):
+                if i == self.editing_player_index:
+                    continue
+                if _player_display_name_key(p) == candidate_key:
+                    messagebox.showwarning(
+                        "Duplicate Player",
+                        (
+                            f'A player named "{candidate.name}" already exists. '
+                            "Please use a different name, or add a nickname to "
+                            "tell them apart."
+                        ),
+                    )
+                    return
+
             # Update the player at the remembered index — works even if
             # the user changed name fields, which is exactly what caused
             # the "mitosis" bug when matching by name.
@@ -2601,27 +2653,39 @@ class PlayerSorterApp:
             self.editing_player_index = None  # Clear edit mode
             self.add_update_btn.config(text="Add Player")
         else:
-            # No edit in progress — check for exact-name duplicate first
+            # No edit in progress — check for a display-name collision
+            # against every existing player (case-insensitive), since two
+            # different first/last/nickname combinations can still render
+            # identically (e.g. "Jo Ann" vs "Joann").
             existing_player = None
             for p in self.players:
-                if (
-                    p.first_name == first_name
-                    and p.last_name == last_name
-                    and p.nickname == nickname
-                ):
+                if _player_display_name_key(p) == candidate_key:
                     existing_player = p
                     break
             if existing_player:
-                # Exact duplicate typed in manually — just update rating
-                existing_player.rating = rating
+                if (
+                    existing_player.first_name == first_name
+                    and existing_player.last_name == last_name
+                    and existing_player.nickname == nickname
+                ):
+                    # Exact duplicate typed in manually - treat it as
+                    # "update this player's rating" rather than an error,
+                    # to preserve the previous convenience behavior.
+                    existing_player.rating = rating
+                else:
+                    messagebox.showwarning(
+                        "Duplicate Player",
+                        (
+                            f'A player named "{candidate.name}" already exists. '
+                            "Please use a different name, or add a nickname to "
+                            "tell them apart."
+                        ),
+                    )
+                    return
             else:
                 # Genuinely new player
-                player = Player(
-                    first_name=first_name,
-                    last_name=last_name,
-                    nickname=nickname,
-                    rating=rating,
-                )
+                player = candidate
+                player.rating = rating
                 self.players.append(player)
 
         # Clear entries
@@ -2987,7 +3051,12 @@ class PlayerSorterApp:
 
         # Restore players
         self.players = []
-        player_map = {}  # name -> Player object for team reconstruction
+        # name -> list of Player objects with that name, in save order. A
+        # list (not a single Player) because older or hand-edited save
+        # files might contain duplicate names; keeping all candidates lets
+        # the team-reconstruction step below consume them one at a time
+        # instead of one duplicate silently overwriting another.
+        player_map = {}
 
         for pd in data.get("players", []):
             player = Player(
@@ -3008,21 +3077,30 @@ class PlayerSorterApp:
             player.colors = pd.get("colors", [])
             player.requested_half_bye = pd.get("requested_half_bye", False)
             self.players.append(player)
-            player_map[player.name] = player
+            player_map.setdefault(player.name, []).append(player)
 
-        # Restore scheveningen teams (by matching saved names to Player objects)
-        # Always initialise both lists so schev screens never hit AttributeError.
+        # Restore scheveningen teams (by matching saved names to Player
+        # objects). Always initialise both lists so schev screens never
+        # hit AttributeError.
+        #
+        # Each name is popped from its candidates list as it's used, so a
+        # save file with duplicate player names can't make the same
+        # Player object end up on both teams (or silently drop one of the
+        # duplicates) - each saved name slot resolves to a distinct
+        # player, in the order they were originally saved.
         schev_a_names = data.get("schev_team_a_names", [])
         schev_b_names = data.get("schev_team_b_names", [])
         self.schev_team_a = []
         self.schev_team_b = []
         if schev_a_names:
-            self.schev_team_a = [
-                player_map[n] for n in schev_a_names if n in player_map
-            ]
-            self.schev_team_b = [
-                player_map[n] for n in schev_b_names if n in player_map
-            ]
+            for n in schev_a_names:
+                candidates = player_map.get(n)
+                if candidates:
+                    self.schev_team_a.append(candidates.pop(0))
+            for n in schev_b_names:
+                candidates = player_map.get(n)
+                if candidates:
+                    self.schev_team_b.append(candidates.pop(0))
 
         return True
 
