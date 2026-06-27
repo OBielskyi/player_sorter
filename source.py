@@ -20,7 +20,7 @@ import re
 import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Tuple
+from typing import List
 
 # Theme definitions
 THEMES = {
@@ -362,7 +362,15 @@ class Player:
         self.withdrawn = False  # Track if player has withdrawn
         self.withdrawal_round = None  # Round when player withdrew
         self.opponents = []  # Track who they've played against
-        self.colors = []  # Track colors played (for Swiss: 'W' or 'B')
+        # Per-opponent result for each entry in `opponents`, kept in the
+        # same order/length: "win", "loss", or "draw". Needed for
+        # Sonneborn-Berger and Direct Encounter, which (unlike Buchholz)
+        # depend on the OUTCOME of each game, not just who was played.
+        # Always the same length as `opponents`; old save files won't
+        # have this, so it defaults to [] and tiebreaks that need it
+        # degrade gracefully (treat unknown results as contributing 0)
+        # rather than raising.
+        self.results_vs_opponents = []
         self.requested_half_bye = False  # For current round
 
     @property
@@ -381,17 +389,6 @@ class Player:
         else:
             # Only real name
             return f"{self.first_name} {self.last_name}".strip()
-
-    @property
-    def full_name(self):
-        """Get full real name (first + last)"""
-        return f"{self.first_name} {self.last_name}".strip()
-
-    @property
-    def display_name(self):
-        """Get name for display
-        (prioritize nickname for e-sports, full name for chess)"""
-        return self.name
 
     @property
     def total_games(self):
@@ -422,48 +419,6 @@ class Player:
     def games_played(self):
         """Games actually played (excluding byes and half-byes)"""
         return self.wins + self.losses + self.draws
-
-    @property
-    def performance_score(self):
-        """Performance score for ranking withdrawn players"""
-        # Favors players with more rounds played, but balanced
-        # Formula: points + (games_played * 0.01) to break ties
-        return self.points + (self.games_played * 0.01)
-
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "rating": self.rating,
-            "wins": self.wins,
-            "losses": self.losses,
-            "draws": self.draws,
-            "byes": self.byes,
-            "half_byes": self.half_byes,
-            "eliminated": self.eliminated,
-            "withdrawn": self.withdrawn,
-            "withdrawal_round": self.withdrawal_round,
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        # Support legacy saves that stored a single "name" field
-        name_str = data.get("name", "")
-        name_parts = name_str.split(" ", 1)
-        player = cls(
-            first_name=name_parts[0] if len(name_parts) > 0 else "",
-            last_name=name_parts[1] if len(name_parts) > 1 else "",
-            nickname="",
-            rating=data.get("rating", 0),
-            wins=data.get("wins", 0),
-            losses=data.get("losses", 0),
-            draws=data.get("draws", 0),
-            byes=data.get("byes", 0),
-            half_byes=data.get("half_byes", 0),
-        )
-        player.eliminated = data.get("eliminated", False)
-        player.withdrawn = data.get("withdrawn", False)
-        player.withdrawal_round = data.get("withdrawal_round", None)
-        return player
 
 
 class PlayerSorterApp:
@@ -698,7 +653,6 @@ class PlayerSorterApp:
         r_x = self.root.winfo_x()
         r_y = self.root.winfo_y()
         r_w = self.root.winfo_width()
-        r_h = self.root.winfo_height()
 
         # Screen dimensions (approximate)
         screen_w = self.root.winfo_screenwidth()
@@ -2918,7 +2872,7 @@ class PlayerSorterApp:
                     "withdrawn": player.withdrawn,
                     "withdrawal_round": player.withdrawal_round,
                     "opponents": player.opponents,
-                    "colors": player.colors,
+                    "results_vs_opponents": player.results_vs_opponents,
                     "requested_half_bye": player.requested_half_bye,
                 }
             )
@@ -3074,7 +3028,17 @@ class PlayerSorterApp:
             player.withdrawn = pd.get("withdrawn", False)
             player.withdrawal_round = pd.get("withdrawal_round")
             player.opponents = pd.get("opponents", [])
-            player.colors = pd.get("colors", [])
+            # Old saves won't have this field. If it's missing or shorter
+            # than `opponents` (e.g. partially-written old data), pad with
+            # "" so the two lists stay the same length - apply_tiebreak
+            # treats an empty/unknown result as contributing 0, rather
+            # than crashing on a zip() length mismatch.
+            results_vs_opponents = pd.get("results_vs_opponents", [])
+            if len(results_vs_opponents) < len(player.opponents):
+                results_vs_opponents = results_vs_opponents + [""] * (
+                    len(player.opponents) - len(results_vs_opponents)
+                )
+            player.results_vs_opponents = results_vs_opponents
             player.requested_half_bye = pd.get("requested_half_bye", False)
             self.players.append(player)
             player_map.setdefault(player.name, []).append(player)
@@ -3450,16 +3414,22 @@ class PlayerSorterApp:
                 pair[1].losses += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("win")
+                pair[1].results_vs_opponents.append("loss")
             elif result == "p2_win":
                 pair[1].wins += 1
                 pair[0].losses += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("loss")
+                pair[1].results_vs_opponents.append("win")
             elif result == "draw":
                 pair[0].draws += 1
                 pair[1].draws += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("draw")
+                pair[1].results_vs_opponents.append("draw")
 
         # Apply rating changes based on mode
         if self.rating_mode == "automatic" and self.game_type == "chess":
@@ -4030,65 +4000,6 @@ class PlayerSorterApp:
             pady=10
         )
 
-    def generate_team_results(self):
-        """Generate balanced teams"""
-        self.show_team_configuration()
-
-    def show_battle_royale_results(self, sorted_players: List[Player]):
-        """Display battle royale results"""
-        self.clear_window()
-
-        frame = ttk.Frame(self.root, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Title
-        title = ttk.Label(
-            frame, text="Battle Royale Rankings", font=("Arial", 18, "bold")
-        )
-        title.pack(pady=10)
-
-        # Results
-        results_frame = ttk.Frame(frame)
-        results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        tree = ttk.Treeview(
-            results_frame,
-            columns=["rank", "name", "rating", "winrate"],
-            show="headings",
-            height=15,
-        )
-
-        tree.heading("rank", text="Rank")
-        tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO" if self.game_type == "chess" else "Trophies")
-        tree.heading("winrate", text="Win Rate %")
-
-        tree.column("rank", width=60)
-        tree.column("name", width=200)
-        tree.column("rating", width=100)
-        tree.column("winrate", width=100)
-
-        for i, player in enumerate(sorted_players, 1):
-            tree.insert(
-                "",
-                tk.END,
-                values=(i, player.name, player.rating, f"{player.win_rate:.1f}%"),
-            )
-
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscroll=scrollbar.set)
-
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=10)
-
-        ttk.Button(
-            btn_frame, text="← Back to Input", command=self.show_player_input
-        ).pack(side=tk.LEFT, padx=5)
-
     def show_team_configuration(self):
         """Show team configuration dialog"""
         if len(self.players) < 2:
@@ -4177,9 +4088,6 @@ class PlayerSorterApp:
         canvas.configure(yscrollcommand=scrollbar.set)
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
-
-        # Store player widgets for interaction
-        self.team_player_buttons = []
 
         for i, team in enumerate(self.teams, 1):
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
@@ -4715,7 +4623,7 @@ class PlayerSorterApp:
             player.withdrawn = False
             player.withdrawal_round = None
             player.opponents = []
-            player.colors = []
+            player.results_vs_opponents = []
             player.requested_half_bye = False
 
         if self.tournament_system == "swiss":
@@ -5554,16 +5462,22 @@ class PlayerSorterApp:
                 p2.losses += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("win")
+                p2.results_vs_opponents.append("loss")
             elif result == "p2_win":
                 p2.wins += 1
                 p1.losses += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("loss")
+                p2.results_vs_opponents.append("win")
             elif result == "draw":
                 p1.draws += 1
                 p2.draws += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("draw")
+                p2.results_vs_opponents.append("draw")
 
         # Handle elimination for knockout
         if system == "knockout":
@@ -5917,6 +5831,17 @@ class PlayerSorterApp:
         for player in active_players:
             tb_score = None
 
+            # opponents/results_vs_opponents are parallel lists - pair them
+            # up safely even if an old save has a length mismatch (results
+            # missing or shorter), treating any unmatched entry as unknown.
+            opponent_results = list(
+                zip(player.opponents, player.results_vs_opponents)
+            )
+            if len(player.opponents) > len(opponent_results):
+                opponent_results += [
+                    (n, "") for n in player.opponents[len(opponent_results) :]
+                ]
+
             if self.tiebreak_method == "buchholz":
                 # Sum of opponents' scores
                 tb_score = 0
@@ -5926,17 +5851,49 @@ class PlayerSorterApp:
                             tb_score += p.points
                             break
             elif self.tiebreak_method == "sonneborn_berger":
-                # Weighted opponents' scores (win=full score, draw=half score)
+                # Sum of each opponent's own score, weighted by how the
+                # player did against THEM specifically: full credit for a
+                # win, half for a draw, nothing for a loss. This is the
+                # standard FIDE definition - it depends on the outcome of
+                # each individual game, not just who was played.
                 tb_score = 0
-                for p in players:
-                    if p.name in player.opponents:
-                        # Find result against this opponent
-                        # Simplified: assume we can determine result from records
-                        tb_score += p.points * 0.5  # Approximate
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name:
+                            if outcome == "win":
+                                tb_score += p.points
+                            elif outcome == "draw":
+                                tb_score += p.points * 0.5
+                            # "loss" (or unknown, from an old save)
+                            # contributes 0.
+                            break
             elif self.tiebreak_method == "rating":
                 tb_score = player.rating
             elif self.tiebreak_method == "direct_encounter":
-                tb_score = player.rating  # Fallback to rating for now
+                # Result of the head-to-head game(s) against opponents who
+                # are tied with this player on points - the standard
+                # Direct Encounter definition. Restricting to opponents
+                # with the SAME points total is what makes this a
+                # standalone numeric score rather than a special grouping
+                # pass: a player's score only reflects games that are
+                # actually relevant to resolving their current tie.
+                #
+                # If the tied players never played each other (common in
+                # Swiss events, since pairings aren't guaranteed to cover
+                # every tied pair), this naturally comes out to 0 for
+                # everyone involved - an honest "unresolved" result,
+                # rather than a guess. There's no secondary tiebreak
+                # configured in this app to fall back to in that case.
+                tb_score = 0
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name and p.points == player.points:
+                            if outcome == "win":
+                                tb_score += 1.0
+                            elif outcome == "draw":
+                                tb_score += 0.5
+                            # "loss" contributes 0.
+                            break
 
             result.append((player, tb_score))
 
