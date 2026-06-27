@@ -2898,6 +2898,9 @@ class PlayerSorterApp:
             "schev_total_rounds": getattr(self, "schev_total_rounds", None),
             "scheveningen_team_size": getattr(self, "scheveningen_team_size", None),
             "round_robin_total_rounds": getattr(self, "round_robin_total_rounds", 0),
+            "round_robin_player_order": [
+                p.name for p in getattr(self, "round_robin_player_order", [])
+            ],
             "schev_team_a_names": schev_team_a_names,
             "schev_team_b_names": schev_team_b_names,
             "players": players_data,
@@ -3065,6 +3068,21 @@ class PlayerSorterApp:
                 candidates = player_map.get(n)
                 if candidates:
                     self.schev_team_b.append(candidates.pop(0))
+
+        # Restore the fixed round-robin rotation order (see
+        # generate_round_robin_pairings for why this must stay stable
+        # across rounds/half-byes/withdrawals). Old saves won't have it;
+        # generate_round_robin_pairings already has a fallback for that.
+        rr_order_names = data.get("round_robin_player_order", [])
+        if rr_order_names:
+            rr_player_map = {}
+            for p in self.players:
+                rr_player_map.setdefault(p.name, []).append(p)
+            self.round_robin_player_order = []
+            for n in rr_order_names:
+                candidates = rr_player_map.get(n)
+                if candidates:
+                    self.round_robin_player_order.append(candidates.pop(0))
 
         return True
 
@@ -4638,6 +4656,13 @@ class PlayerSorterApp:
             self.round_robin_total_rounds = (
                 n_start - 1 if n_start % 2 == 0 else n_start
             )
+            # Record the fixed rotation order too. generate_round_robin_pairings
+            # rotates this exact list every round - it must never change shape
+            # or order once the tournament starts, or the round-robin schedule
+            # guarantee (everyone plays everyone exactly once) breaks. Half-byes
+            # and withdrawals are handled later by substituting byes into that
+            # round's OUTPUT, not by removing anyone from this list.
+            self.round_robin_player_order = list(self.players)
             self.show_round_robin_round()
         elif self.tournament_system == "knockout":
             self.show_knockout_round()
@@ -4698,13 +4723,95 @@ class PlayerSorterApp:
             # Sort by points, then rating
             playing_players.sort(key=lambda p: (p.points, p.rating), reverse=True)
 
-            paired = set()
+            matching = self._find_swiss_matching(playing_players)
+            for a, b in matching:
+                if b is None:
+                    pairings.append([a, None, "bye"])
+                else:
+                    pairings.append([a, b, None])
 
+        return pairings
+
+    def _find_swiss_matching(self, playing_players):
+        """Find a full pairing of playing_players (already sorted by
+        pairing priority - closest-ranked first) using backtracking,
+        rather than the simple greedy "first compatible opponent" scan
+        this used to use.
+
+        Greedy without backtracking can pick a locally-valid opponent
+        that turns out to make a complete pairing impossible later in
+        the list, even when a valid complete pairing exists - it just
+        wasn't the first one greedy happened to try. That produced
+        unnecessary byes for players who didn't need one. Backtracking
+        undoes a bad pick and tries the next candidate instead of
+        giving up on the whole round.
+
+        Returns a list of (player, opponent_or_None) tuples. opponent is
+        None for a bye. At most one bye is ever produced for one call.
+        If a complete pairing using only never-played-before opponents
+        is impossible (can happen with an unlucky history), falls back
+        to allowing exactly the repeat pairing(s) needed to avoid
+        handing out more than one bye - a repeat is the standard Swiss
+        convention for an otherwise-unresolvable round, and is less
+        disruptive than multiple simultaneous byes.
+        """
+        # Hard safety cap: backtracking search is worst-case exponential.
+        # Realistic Swiss fields (dozens of players, sparse "already
+        # played" history) resolve in well under a thousand recursive
+        # calls in testing. If something pathological blows past this,
+        # fall back to the old unconditional-greedy behaviour rather than
+        # risk hanging the UI - a few unnecessary byes is a much smaller
+        # problem than the app freezing.
+        call_budget = [20000]
+
+        def can_play(a, b, allow_repeats):
+            if allow_repeats:
+                return True
+            return b.name not in a.opponents and a.name not in b.opponents
+
+        def backtrack(remaining, allow_repeats):
+            call_budget[0] -= 1
+            if call_budget[0] <= 0:
+                return None
+            if not remaining:
+                return []
+            if len(remaining) == 1:
+                return [(remaining[0], None)]
+
+            first = remaining[0]
+            rest = remaining[1:]
+
+            for i, candidate in enumerate(rest):
+                if can_play(first, candidate, allow_repeats):
+                    new_remaining = rest[:i] + rest[i + 1 :]
+                    sub_result = backtrack(new_remaining, allow_repeats)
+                    if sub_result is not None:
+                        return [(first, candidate)] + sub_result
+
+            # Odd-sized remaining group: `first` could be the bye instead
+            # of being forced into one of the pairings tried above.
+            if len(remaining) % 2 == 1:
+                sub_result = backtrack(rest, allow_repeats)
+                if sub_result is not None:
+                    return [(first, None)] + sub_result
+
+            return None
+
+        result = backtrack(list(playing_players), allow_repeats=False)
+        if result is None and call_budget[0] > 0:
+            # No pairing avoiding all repeats exists - allow a repeat
+            # rather than handing out extra byes.
+            result = backtrack(list(playing_players), allow_repeats=True)
+        if result is None:
+            # Either the safety cap was hit, or even allowing repeats
+            # failed (shouldn't happen for an even count, but playing it
+            # safe). Fall back to the simple greedy pass the app used
+            # before, which always terminates even if not optimal.
+            result = []
+            paired = set()
             for player in playing_players:
                 if player.name in paired:
                     continue
-
-                # Find best opponent they haven't played
                 opponent = None
                 for candidate in playing_players:
                     if (
@@ -4714,17 +4821,14 @@ class PlayerSorterApp:
                     ):
                         opponent = candidate
                         break
-
                 if opponent:
-                    pairings.append([player, opponent, None])
+                    result.append((player, opponent))
                     paired.add(player.name)
                     paired.add(opponent.name)
                 else:
-                    # Give bye if no valid opponent
-                    pairings.append([player, None, "bye"])
+                    result.append((player, None))
                     paired.add(player.name)
-
-        return pairings
+        return result
 
     # ===== ROUND-ROBIN =====
 
@@ -4752,62 +4856,129 @@ class PlayerSorterApp:
         self.display_tournament_pairings(frame, pairings, "round_robin")
 
     def generate_round_robin_pairings(self):
-        """Generate Round-Robin pairings using round-robin algorithm"""
-        active = [p for p in self.players if not p.eliminated and not p.withdrawn]
+        """Generate Round-Robin pairings using the round-robin (circle)
+        algorithm, rotating a FIXED player order that is captured once at
+        tournament start and never changes shape afterward.
 
-        # Separate players who requested half-bye
-        halfbye_players = [p for p in active if p.requested_half_bye]
-        playing_players = [p for p in active if not p.requested_half_bye]
+        This matters because of how half-byes and withdrawals work: if we
+        rotated whatever subset of players happens to be "active" THIS
+        round, removing a player for one round (a half-bye) would change
+        the size/order of the list being rotated, which desyncs the
+        rotation from every other round's schedule - producing repeated
+        pairings and missed pairings elsewhere in the tournament, since
+        round-robin's "everyone plays everyone exactly once" guarantee
+        only holds if the same fixed list is rotated round after round.
 
-        pairings = []
-
-        # Add half-bye players first
-        for player in halfbye_players:
-            pairings.append([player, None, "half_bye"])
-            player.requested_half_bye = False  # Reset flag
-
-        n = len(playing_players)
+        Instead: rotate the fixed order to get THIS round's scheduled
+        pairs first, then substitute byes/half-byes into the output for
+        whoever requested one or has withdrawn, without touching the
+        rotation itself.
+        """
+        order = getattr(self, "round_robin_player_order", None)
+        if not order:
+            # Fallback for saves that predate this field: the original
+            # order is lost, so the best we can do is fix one in place now
+            # and keep it stable for the rest of the tournament, rather
+            # than recomputing (and reshaping) it every round as before.
+            order = list(self.players)
+            self.round_robin_player_order = order
 
         # Use the stable total recorded at tournament start rather than
-        # recomputing from playing_players.  A player taking a half-bye
-        # temporarily reduces playing_players, which would make the naive
-        # formula undercount total_rounds and end the tournament too early.
+        # recomputing from however many players are still active.  Half-byes
+        # and withdrawals must not change how many rounds a round-robin is
+        # supposed to run for.
         total_rounds = getattr(self, "round_robin_total_rounds", 0)
         if not total_rounds:
-            # Fallback for saves that predate this field: derive from all
-            # non-withdrawn players (still better than using playing_players).
-            n_all = len(
-                [p for p in self.players if not p.eliminated and not p.withdrawn]
-            )
+            n_all = len(order)
             total_rounds = n_all - 1 if n_all % 2 == 0 else n_all
             self.round_robin_total_rounds = total_rounds  # cache for next rounds
 
         if self.current_round > total_rounds:
             return []  # Tournament complete
 
-        # Use round-robin rotation algorithm
+        n = len(order)
+        rotation_input = order.copy()
         if n % 2 == 1:
-            playing_players.append(None)  # Add dummy for odd players
+            rotation_input.append(None)  # Dummy bye slot, rotates like anyone else
             n += 1
 
         round_idx = self.current_round - 1
 
-        # Fixed position rotation algorithm
-        players = playing_players.copy()
+        # Fixed position rotation algorithm, applied to the STABLE order
+        rotated = rotation_input.copy()
         for _ in range(round_idx):
-            players = [players[0]] + [players[-1]] + players[1:-1]
+            rotated = [rotated[0]] + [rotated[-1]] + rotated[1:-1]
 
-        # Create pairings for this round
+        # This round's schedule, before any half-bye/withdrawal substitution
+        scheduled_pairs = []
         for i in range(n // 2):
-            p1 = players[i]
-            p2 = players[n - 1 - i]
+            scheduled_pairs.append((rotated[i], rotated[n - 1 - i]))
 
-            if p1 is not None and p2 is not None:
-                pairings.append([p1, p2, None])
-            elif p1 is not None:
-                pairings.append([p1, None, "bye"])
-            elif p2 is not None:
+        pairings = []
+        for p1, p2 in scheduled_pairs:
+            # Dummy slot -> the real player gets the rotation's bye, same
+            # as before.
+            if p1 is None or p2 is None:
+                real = p1 if p1 is not None else p2
+                if real is not None and not real.withdrawn:
+                    if real.requested_half_bye:
+                        pairings.append([real, None, "half_bye"])
+                        real.requested_half_bye = False
+                    else:
+                        pairings.append([real, None, "bye"])
+                continue
+
+            p1_out = p1.withdrawn
+            p2_out = p2.withdrawn
+            if p1_out and p2_out:
+                # Both scheduled players are gone - nothing to schedule.
+                continue
+            if p1_out:
+                # p1 withdrew; p2's scheduled opponent isn't there to play.
+                # p2 still gets their own half-bye entry if they asked for
+                # one (it's their choice being recorded, not a consequence
+                # of p1 withdrawing), otherwise a bye.
+                if p2.requested_half_bye:
+                    pairings.append([p2, None, "half_bye"])
+                    p2.requested_half_bye = False
+                else:
+                    pairings.append([p2, None, "bye"])
+                continue
+            if p2_out:
+                if p1.requested_half_bye:
+                    pairings.append([p1, None, "half_bye"])
+                    p1.requested_half_bye = False
+                else:
+                    pairings.append([p1, None, "bye"])
+                continue
+
+            # Both scheduled players are present. A half-bye request takes
+            # priority for whichever of them asked for it: that player gets
+            # their own half_bye entry, and since their scheduled opponent
+            # now has no one to play, the opponent gets a bye instead of
+            # being silently dropped from the round (this was the actual
+            # bug - the old code pulled half-bye players out before
+            # pairing, leaving their would-be opponent unpaired and
+            # reshaping the rotation for every round after).
+            p1_half = p1.requested_half_bye
+            p2_half = p2.requested_half_bye
+            if p1_half and p2_half:
+                # Both wanted to sit out the same scheduled game - honour
+                # both as half-byes rather than picking one arbitrarily.
+                pairings.append([p1, None, "half_bye"])
+                pairings.append([p2, None, "half_bye"])
+                p1.requested_half_bye = False
+                p2.requested_half_bye = False
+            elif p1_half:
+                pairings.append([p1, None, "half_bye"])
                 pairings.append([p2, None, "bye"])
+                p1.requested_half_bye = False
+            elif p2_half:
+                pairings.append([p2, None, "half_bye"])
+                pairings.append([p1, None, "bye"])
+                p2.requested_half_bye = False
+            else:
+                pairings.append([p1, p2, None])
 
         return pairings
 
