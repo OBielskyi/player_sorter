@@ -2263,8 +2263,20 @@ class PlayerSorterApp:
 
         self.show_player_input()
 
-    def show_player_input(self):
-        """Show player input interface"""
+    def show_player_input(self, auto_load: bool = True):
+        """Show player input interface.
+
+        auto_load: if True (the default, used by every "starting fresh"
+        entry point), automatically loads the saved roster from disk for
+        convenience. Pass False when returning here with live, valuable
+        in-memory player state that must not be overwritten — e.g.
+        back_to_setup() returning from a mid-tournament screen, where
+        self.players already holds real progress (scores, opponents
+        played, etc.) that the saved roster file on disk knows nothing
+        about. Loading over it there would silently destroy that
+        progress, contradicting the "Current game progress will be kept"
+        promise shown in that confirmation dialog.
+        """
         self.editing_player_index = None  # Cancel any edit in progress
         self.clear_window()
 
@@ -2453,8 +2465,10 @@ class PlayerSorterApp:
         else:
             self.first_name_entry.focus()  # Non-tournament chess: start with first name
 
-        # Auto-load players from save file (if exists)
-        self.auto_load_players()
+        # Auto-load players from save file (if exists) - skipped when the
+        # caller has live in-memory progress to preserve (see docstring).
+        if auto_load:
+            self.auto_load_players()
 
         # Refresh player list
         self.refresh_player_list()
@@ -5092,42 +5106,111 @@ class PlayerSorterApp:
         )
         title.pack(pady=10)
 
-        # Get active players (not withdrawn)
-        active_team_a = [p for p in self.schev_team_a if not p.withdrawn]
-        active_team_b = [p for p in self.schev_team_b if not p.withdrawn]
-
-        # Separate players who requested half-bye
-        halfbye_team_a = [p for p in active_team_a if p.requested_half_bye]
-        halfbye_team_b = [p for p in active_team_b if p.requested_half_bye]
-        playing_team_a = [p for p in active_team_a if not p.requested_half_bye]
-        playing_team_b = [p for p in active_team_b if not p.requested_half_bye]
-
-        pairings = []
-
-        # Add half-bye players first
-        for player in halfbye_team_a + halfbye_team_b:
-            pairings.append([player, None, "half_bye"])
-            player.requested_half_bye = False  # Reset flag
-
-        # Each playing player from Team A plays one player from Team B per round
-        # Use rotation to ensure everyone plays everyone
-        for i in range(len(playing_team_a)):
-            if i < len(playing_team_b):
-                opponent_idx = (i + self.schev_round - 1) % len(playing_team_b)
-                if opponent_idx < len(playing_team_b):
-                    pairings.append(
-                        [playing_team_a[i], playing_team_b[opponent_idx], None]
-                    )
-
-        # Handle case where teams are unbalanced due to withdrawals
-        if len(playing_team_a) > len(playing_team_b):
-            for i in range(len(playing_team_b), len(playing_team_a)):
-                pairings.append([playing_team_a[i], None, "bye"])
-        elif len(playing_team_b) > len(playing_team_a):
-            for i in range(len(playing_team_a), len(playing_team_b)):
-                pairings.append([playing_team_b[i], None, "bye"])
+        pairings = self._generate_scheveningen_pairings(self.schev_round)
 
         self.display_tournament_pairings(frame, pairings, "scheveningen")
+
+    def _generate_scheveningen_pairings(self, schev_round):
+        """Generate this round's Scheveningen pairings by rotating the
+        FIXED team rosters (self.schev_team_a / self.schev_team_b, which
+        are set once at setup and never resized afterward), then
+        substituting byes/half-byes into the output for whoever has
+        withdrawn or requested one this round.
+
+        This mirrors the round-robin fix for the same underlying problem:
+        the rotation formula `(i + round - 1) % len(team)` only produces a
+        correct "everyone plays everyone" schedule if it's applied to a
+        team of the SAME fixed size every round. The previous
+        implementation computed it directly against the half-bye- and
+        withdrawal-filtered team lists, which shrink on whichever round a
+        player sits out - silently desyncing the rotation from every
+        other round's schedule, producing repeated pairings for some
+        players and missed pairings for others, for the rest of the
+        tournament.
+        """
+        team_a = self.schev_team_a
+        team_b = self.schev_team_b
+        n_a, n_b = len(team_a), len(team_b)
+
+        # This round's schedule against the FULL, fixed rosters - the part
+        # that must stay stable across every round regardless of who sits
+        # out. (Team sizes are equal in every case the current UI allows,
+        # but this also works correctly if they aren't.)
+        scheduled = []
+        for i in range(n_a):
+            if n_b == 0:
+                scheduled.append((team_a[i], None))
+            else:
+                opponent_idx = (i + schev_round - 1) % n_b
+                scheduled.append((team_a[i], team_b[opponent_idx]))
+
+        # Team B players who aren't scheduled against anyone this round
+        # (only possible when Team A is smaller than Team B) still need
+        # their own bye/half-bye entry rather than being silently dropped.
+        scheduled_b_players = {b for _, b in scheduled if b is not None}
+        unscheduled_b = [p for p in team_b if p not in scheduled_b_players]
+
+        pairings = []
+        for a_player, b_player in scheduled:
+            a_out = a_player.withdrawn
+            b_out = b_player.withdrawn if b_player is not None else True
+
+            if a_out and (b_player is None or b_out):
+                continue  # Nobody real scheduled on either side
+
+            if a_out:
+                # Team A's scheduled player is gone; b_player still gets
+                # their own entry - a half-bye if they asked for one
+                # (their choice, not a consequence of a_player withdrawing),
+                # otherwise a bye since their opponent isn't there to play.
+                if b_player.requested_half_bye:
+                    pairings.append([b_player, None, "half_bye"])
+                    b_player.requested_half_bye = False
+                else:
+                    pairings.append([b_player, None, "bye"])
+                continue
+
+            if b_player is None or b_out:
+                if a_player.requested_half_bye:
+                    pairings.append([a_player, None, "half_bye"])
+                    a_player.requested_half_bye = False
+                else:
+                    pairings.append([a_player, None, "bye"])
+                continue
+
+            # Both scheduled players are present. A half-bye request takes
+            # priority: that player gets their own half_bye entry, and
+            # since their scheduled opponent now has no one to play this
+            # round, the opponent gets a bye instead of being silently
+            # left out of the pairings list.
+            a_half = a_player.requested_half_bye
+            b_half = b_player.requested_half_bye
+            if a_half and b_half:
+                pairings.append([a_player, None, "half_bye"])
+                pairings.append([b_player, None, "half_bye"])
+                a_player.requested_half_bye = False
+                b_player.requested_half_bye = False
+            elif a_half:
+                pairings.append([a_player, None, "half_bye"])
+                pairings.append([b_player, None, "bye"])
+                a_player.requested_half_bye = False
+            elif b_half:
+                pairings.append([b_player, None, "half_bye"])
+                pairings.append([a_player, None, "bye"])
+                b_player.requested_half_bye = False
+            else:
+                pairings.append([a_player, b_player, None])
+
+        for b_player in unscheduled_b:
+            if b_player.withdrawn:
+                continue
+            if b_player.requested_half_bye:
+                pairings.append([b_player, None, "half_bye"])
+                b_player.requested_half_bye = False
+            else:
+                pairings.append([b_player, None, "bye"])
+
+        return pairings
 
     def show_scheveningen_standings(self):
         """Show Scheveningen standings after a round"""
@@ -6728,15 +6811,22 @@ class PlayerSorterApp:
         return teams
 
     def back_to_setup(self):
-        """Return to setup screen, keeping player data"""
+        """Return to setup screen, keeping player data.
+
+        Always passes auto_load=False to show_player_input(): whatever is
+        currently in self.players (live tournament progress, or a loaded
+        tournament's roster) must not be silently overwritten by whatever
+        happens to be saved on disk, which is exactly what auto-loading
+        would otherwise do here.
+        """
         if self.in_game:
             if messagebox.askyesno(
                 "Confirm", "Return to setup? Current game progress will be kept."
             ):
                 self.in_game = False
-                self.show_player_input()
+                self.show_player_input(auto_load=False)
         else:
-            self.show_player_input()
+            self.show_player_input(auto_load=False)
 
     def clear_window(self):
         """Clear all widgets from the window"""
