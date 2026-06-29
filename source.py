@@ -20,7 +20,7 @@ import re
 import shutil
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import List, Tuple
+from typing import List
 
 # Theme definitions
 THEMES = {
@@ -362,7 +362,15 @@ class Player:
         self.withdrawn = False  # Track if player has withdrawn
         self.withdrawal_round = None  # Round when player withdrew
         self.opponents = []  # Track who they've played against
-        self.colors = []  # Track colors played (for Swiss: 'W' or 'B')
+        # Per-opponent result for each entry in `opponents`, kept in the
+        # same order/length: "win", "loss", or "draw". Needed for
+        # Sonneborn-Berger and Direct Encounter, which (unlike Buchholz)
+        # depend on the OUTCOME of each game, not just who was played.
+        # Always the same length as `opponents`; old save files won't
+        # have this, so it defaults to [] and tiebreaks that need it
+        # degrade gracefully (treat unknown results as contributing 0)
+        # rather than raising.
+        self.results_vs_opponents = []
         self.requested_half_bye = False  # For current round
 
     @property
@@ -381,17 +389,6 @@ class Player:
         else:
             # Only real name
             return f"{self.first_name} {self.last_name}".strip()
-
-    @property
-    def full_name(self):
-        """Get full real name (first + last)"""
-        return f"{self.first_name} {self.last_name}".strip()
-
-    @property
-    def display_name(self):
-        """Get name for display
-        (prioritize nickname for e-sports, full name for chess)"""
-        return self.name
 
     @property
     def total_games(self):
@@ -422,48 +419,6 @@ class Player:
     def games_played(self):
         """Games actually played (excluding byes and half-byes)"""
         return self.wins + self.losses + self.draws
-
-    @property
-    def performance_score(self):
-        """Performance score for ranking withdrawn players"""
-        # Favors players with more rounds played, but balanced
-        # Formula: points + (games_played * 0.01) to break ties
-        return self.points + (self.games_played * 0.01)
-
-    def to_dict(self):
-        return {
-            "name": self.name,
-            "rating": self.rating,
-            "wins": self.wins,
-            "losses": self.losses,
-            "draws": self.draws,
-            "byes": self.byes,
-            "half_byes": self.half_byes,
-            "eliminated": self.eliminated,
-            "withdrawn": self.withdrawn,
-            "withdrawal_round": self.withdrawal_round,
-        }
-
-    @classmethod
-    def from_dict(cls, data):
-        # Support legacy saves that stored a single "name" field
-        name_str = data.get("name", "")
-        name_parts = name_str.split(" ", 1)
-        player = cls(
-            first_name=name_parts[0] if len(name_parts) > 0 else "",
-            last_name=name_parts[1] if len(name_parts) > 1 else "",
-            nickname="",
-            rating=data.get("rating", 0),
-            wins=data.get("wins", 0),
-            losses=data.get("losses", 0),
-            draws=data.get("draws", 0),
-            byes=data.get("byes", 0),
-            half_byes=data.get("half_byes", 0),
-        )
-        player.eliminated = data.get("eliminated", False)
-        player.withdrawn = data.get("withdrawn", False)
-        player.withdrawal_round = data.get("withdrawal_round", None)
-        return player
 
 
 class PlayerSorterApp:
@@ -698,7 +653,6 @@ class PlayerSorterApp:
         r_x = self.root.winfo_x()
         r_y = self.root.winfo_y()
         r_w = self.root.winfo_width()
-        r_h = self.root.winfo_height()
 
         # Screen dimensions (approximate)
         screen_w = self.root.winfo_screenwidth()
@@ -2309,8 +2263,20 @@ class PlayerSorterApp:
 
         self.show_player_input()
 
-    def show_player_input(self):
-        """Show player input interface"""
+    def show_player_input(self, auto_load: bool = True):
+        """Show player input interface.
+
+        auto_load: if True (the default, used by every "starting fresh"
+        entry point), automatically loads the saved roster from disk for
+        convenience. Pass False when returning here with live, valuable
+        in-memory player state that must not be overwritten — e.g.
+        back_to_setup() returning from a mid-tournament screen, where
+        self.players already holds real progress (scores, opponents
+        played, etc.) that the saved roster file on disk knows nothing
+        about. Loading over it there would silently destroy that
+        progress, contradicting the "Current game progress will be kept"
+        promise shown in that confirmation dialog.
+        """
         self.editing_player_index = None  # Cancel any edit in progress
         self.clear_window()
 
@@ -2499,8 +2465,10 @@ class PlayerSorterApp:
         else:
             self.first_name_entry.focus()  # Non-tournament chess: start with first name
 
-        # Auto-load players from save file (if exists)
-        self.auto_load_players()
+        # Auto-load players from save file (if exists) - skipped when the
+        # caller has live in-memory progress to preserve (see docstring).
+        if auto_load:
+            self.auto_load_players()
 
         # Refresh player list
         self.refresh_player_list()
@@ -2918,7 +2886,7 @@ class PlayerSorterApp:
                     "withdrawn": player.withdrawn,
                     "withdrawal_round": player.withdrawal_round,
                     "opponents": player.opponents,
-                    "colors": player.colors,
+                    "results_vs_opponents": player.results_vs_opponents,
                     "requested_half_bye": player.requested_half_bye,
                 }
             )
@@ -2944,6 +2912,9 @@ class PlayerSorterApp:
             "schev_total_rounds": getattr(self, "schev_total_rounds", None),
             "scheveningen_team_size": getattr(self, "scheveningen_team_size", None),
             "round_robin_total_rounds": getattr(self, "round_robin_total_rounds", 0),
+            "round_robin_player_order": [
+                p.name for p in getattr(self, "round_robin_player_order", [])
+            ],
             "schev_team_a_names": schev_team_a_names,
             "schev_team_b_names": schev_team_b_names,
             "players": players_data,
@@ -3074,7 +3045,17 @@ class PlayerSorterApp:
             player.withdrawn = pd.get("withdrawn", False)
             player.withdrawal_round = pd.get("withdrawal_round")
             player.opponents = pd.get("opponents", [])
-            player.colors = pd.get("colors", [])
+            # Old saves won't have this field. If it's missing or shorter
+            # than `opponents` (e.g. partially-written old data), pad with
+            # "" so the two lists stay the same length - apply_tiebreak
+            # treats an empty/unknown result as contributing 0, rather
+            # than crashing on a zip() length mismatch.
+            results_vs_opponents = pd.get("results_vs_opponents", [])
+            if len(results_vs_opponents) < len(player.opponents):
+                results_vs_opponents = results_vs_opponents + [""] * (
+                    len(player.opponents) - len(results_vs_opponents)
+                )
+            player.results_vs_opponents = results_vs_opponents
             player.requested_half_bye = pd.get("requested_half_bye", False)
             self.players.append(player)
             player_map.setdefault(player.name, []).append(player)
@@ -3101,6 +3082,21 @@ class PlayerSorterApp:
                 candidates = player_map.get(n)
                 if candidates:
                     self.schev_team_b.append(candidates.pop(0))
+
+        # Restore the fixed round-robin rotation order (see
+        # generate_round_robin_pairings for why this must stay stable
+        # across rounds/half-byes/withdrawals). Old saves won't have it;
+        # generate_round_robin_pairings already has a fallback for that.
+        rr_order_names = data.get("round_robin_player_order", [])
+        if rr_order_names:
+            rr_player_map = {}
+            for p in self.players:
+                rr_player_map.setdefault(p.name, []).append(p)
+            self.round_robin_player_order = []
+            for n in rr_order_names:
+                candidates = rr_player_map.get(n)
+                if candidates:
+                    self.round_robin_player_order.append(candidates.pop(0))
 
         return True
 
@@ -3450,16 +3446,22 @@ class PlayerSorterApp:
                 pair[1].losses += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("win")
+                pair[1].results_vs_opponents.append("loss")
             elif result == "p2_win":
                 pair[1].wins += 1
                 pair[0].losses += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("loss")
+                pair[1].results_vs_opponents.append("win")
             elif result == "draw":
                 pair[0].draws += 1
                 pair[1].draws += 1
                 pair[0].opponents.append(pair[1].name)
                 pair[1].opponents.append(pair[0].name)
+                pair[0].results_vs_opponents.append("draw")
+                pair[1].results_vs_opponents.append("draw")
 
         # Apply rating changes based on mode
         if self.rating_mode == "automatic" and self.game_type == "chess":
@@ -3954,6 +3956,27 @@ class PlayerSorterApp:
         # Sort all players by win rate
         sorted_players = sorted(self.players, key=lambda p: p.win_rate, reverse=True)
 
+        # The actual winner is whoever is NOT eliminated - the same check
+        # show_br_winner() uses. This can legitimately differ from "the
+        # player with the single highest win rate": elimination is
+        # relative to each round's active pool, so a player eliminated
+        # early after a couple of good games can end up with a higher
+        # final win rate than the player who actually won the whole
+        # event. Re-deriving "winner" from win-rate sort position here
+        # (as this used to do) could then label the WRONG player as
+        # Winner, disagreeing with the winner screen the player just came
+        # from.
+        not_eliminated = [p for p in self.players if not p.eliminated]
+        if len(not_eliminated) == 1:
+            actual_winner = not_eliminated[0]
+        elif sorted_players:
+            # Degenerate fallback (shouldn't normally happen): mirror
+            # show_br_winner()'s own fallback so the two screens always
+            # agree on who's labelled the winner.
+            actual_winner = sorted_players[0]
+        else:
+            actual_winner = None
+
         results_frame = ttk.Frame(frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
@@ -4000,7 +4023,7 @@ class PlayerSorterApp:
         for i, player in enumerate(sorted_players, 1):
             status = (
                 "🏆 Winner"
-                if i == 1
+                if player is actual_winner
                 else ("❌ Eliminated" if player.eliminated else "Active")
             )
             tree.insert(
@@ -4029,65 +4052,6 @@ class PlayerSorterApp:
         ttk.Button(frame, text="← Back to Setup", command=self.back_to_setup).pack(
             pady=10
         )
-
-    def generate_team_results(self):
-        """Generate balanced teams"""
-        self.show_team_configuration()
-
-    def show_battle_royale_results(self, sorted_players: List[Player]):
-        """Display battle royale results"""
-        self.clear_window()
-
-        frame = ttk.Frame(self.root, padding="20")
-        frame.pack(fill=tk.BOTH, expand=True)
-
-        # Title
-        title = ttk.Label(
-            frame, text="Battle Royale Rankings", font=("Arial", 18, "bold")
-        )
-        title.pack(pady=10)
-
-        # Results
-        results_frame = ttk.Frame(frame)
-        results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        tree = ttk.Treeview(
-            results_frame,
-            columns=["rank", "name", "rating", "winrate"],
-            show="headings",
-            height=15,
-        )
-
-        tree.heading("rank", text="Rank")
-        tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO" if self.game_type == "chess" else "Trophies")
-        tree.heading("winrate", text="Win Rate %")
-
-        tree.column("rank", width=60)
-        tree.column("name", width=200)
-        tree.column("rating", width=100)
-        tree.column("winrate", width=100)
-
-        for i, player in enumerate(sorted_players, 1):
-            tree.insert(
-                "",
-                tk.END,
-                values=(i, player.name, player.rating, f"{player.win_rate:.1f}%"),
-            )
-
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=tree.yview)
-        tree.configure(yscroll=scrollbar.set)
-
-        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Buttons
-        btn_frame = ttk.Frame(frame)
-        btn_frame.pack(pady=10)
-
-        ttk.Button(
-            btn_frame, text="← Back to Input", command=self.show_player_input
-        ).pack(side=tk.LEFT, padx=5)
 
     def show_team_configuration(self):
         """Show team configuration dialog"""
@@ -4178,18 +4142,18 @@ class PlayerSorterApp:
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
 
-        # Store player widgets for interaction
-        self.team_player_buttons = []
-
         for i, team in enumerate(self.teams, 1):
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum - summing percentages
+            # would reward a team purely for having more players, regardless
+            # of whether those extra players are actually any good.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
 
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
                     f"Team {i} (Avg {rating_name}: {avg_rating:.1f}, "
-                    f"Total WR: {total_winrate:.1f}%)"
+                    f"Avg WR: {avg_winrate:.1f}%)"
                 ),
                 padding="10",
             )
@@ -4279,12 +4243,14 @@ class PlayerSorterApp:
         # Calculate team statistics and sort
         team_stats = []
         for i, team in enumerate(self.teams, 1):
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum - see show_team_game
+            # for why summing percentages would unfairly favor larger teams.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
             mvp = max(team, key=lambda p: p.win_rate) if team else None
-            team_stats.append((i, team, total_winrate, avg_rating, mvp))
+            team_stats.append((i, team, avg_winrate, avg_rating, mvp))
 
-        # Sort by total win rate
+        # Sort by average win rate per player
         team_stats.sort(key=lambda x: x[2], reverse=True)
 
         # Display teams
@@ -4307,13 +4273,13 @@ class PlayerSorterApp:
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
 
-        for rank, (team_num, team, total_wr, avg_rating, mvp) in enumerate(
+        for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
-                    f"#{rank} - Team {team_num} (Total WR: {total_wr:.1f}%, "
+                    f"#{rank} - Team {team_num} (Avg WR: {avg_wr:.1f}%, "
                     f"Avg {rating_name}: {avg_rating:.1f})"
                 ),
                 padding="10",
@@ -4393,12 +4359,20 @@ class PlayerSorterApp:
         # Calculate team statistics and sort
         team_stats = []
         for i, team in enumerate(self.teams, 1):
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum. Teams here are
+            # often different sizes (balance_teams balances by total
+            # rating, not headcount), and summing percentages would crown
+            # whichever team happens to have more players as "winning"
+            # even if its players are individually weaker - this is the
+            # actual winner determination for the whole event, so this is
+            # the most consequential of the three Total-WR -> Avg-WR
+            # fixes in this file.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
             mvp = max(team, key=lambda p: p.win_rate) if team else None
-            team_stats.append((i, team, total_winrate, avg_rating, mvp))
+            team_stats.append((i, team, avg_winrate, avg_rating, mvp))
 
-        # Sort by total win rate
+        # Sort by average win rate per player
         team_stats.sort(key=lambda x: x[2], reverse=True)
 
         # Show winner
@@ -4430,14 +4404,14 @@ class PlayerSorterApp:
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
 
-        for rank, (team_num, team, total_wr, avg_rating, mvp) in enumerate(
+        for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
                     f"#{rank} - Team {team_num} "
-                    f"(Total WR: {total_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})"
+                    f"(Avg WR: {avg_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})"
                 ),
                 padding="10",
             )
@@ -4514,7 +4488,10 @@ class PlayerSorterApp:
         # Determine which sub-mode to use based on rating_mode
         elo_mode = getattr(self, "elo_submode", None) or "otb"
 
-        elo_changes = {}  # Track changes for each player
+        elo_changes = {}  # Player object -> accumulated change. Keyed by
+        # object identity (not name) so two players who happen to share a
+        # display name never collide and merge into one combined change
+        # that both would otherwise incorrectly receive.
 
         for pairing, result_var in self.tournament_results:
             p1, p2, pairing_type = pairing
@@ -4543,18 +4520,18 @@ class PlayerSorterApp:
             )
 
             # Store changes
-            if p1.name not in elo_changes:
-                elo_changes[p1.name] = 0
-            if p2.name not in elo_changes:
-                elo_changes[p2.name] = 0
+            if p1 not in elo_changes:
+                elo_changes[p1] = 0
+            if p2 not in elo_changes:
+                elo_changes[p2] = 0
 
-            elo_changes[p1.name] += p1_change
-            elo_changes[p2.name] += p2_change
+            elo_changes[p1] += p1_change
+            elo_changes[p2] += p2_change
 
         # Apply changes to players
         for player in self.players:
-            if player.name in elo_changes:
-                player.rating += elo_changes[player.name]
+            if player in elo_changes:
+                player.rating += elo_changes[player]
                 # Ensure rating doesn't go below 100
                 if player.rating < 100:
                     player.rating = 100
@@ -4594,7 +4571,9 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        # Store rating entry widgets
+        # Store rating entry widgets, keyed by player object (not name) so
+        # two players who happen to share a display name don't collide
+        # and overwrite each other's entry widget.
         self.rating_entries = {}
 
         # Show each player with current rating
@@ -4625,7 +4604,7 @@ class PlayerSorterApp:
             entry.insert(0, str(player.rating))
             entry.pack(side=tk.LEFT, padx=5)
 
-            self.rating_entries[player.name] = entry
+            self.rating_entries[player] = entry
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -4644,28 +4623,45 @@ class PlayerSorterApp:
         ).pack(side=tk.LEFT, padx=5)
 
     def apply_manual_ratings(self, callback):
-        """Apply manual rating changes"""
-        try:
-            for player in self.players:
-                if player.name in self.rating_entries:
-                    new_rating_str = self.rating_entries[player.name].get().strip()
-                    if new_rating_str:
-                        new_rating = int(new_rating_str)
-                        # Enforce the same floor used everywhere else:
-                        # chess = 100, e-sports = 0 (trophies can be 0).
-                        min_rating = 100 if self.game_type == "chess" else 0
-                        if new_rating < min_rating:
-                            messagebox.showwarning(
-                                "Invalid Input",
-                                f"Rating for {player.name} cannot be below {min_rating}",
-                            )
-                            return
-                        player.rating = new_rating
+        """Apply manual rating changes.
 
-            # Proceed to callback
-            callback()
-        except ValueError:
-            messagebox.showwarning("Invalid Input", "All ratings must be valid numbers")
+        Validates every entry first, with zero mutation, before applying
+        anything. Previously, validation and mutation happened in the
+        same pass: if player #5 (in iteration order) had an invalid
+        entry, players #1-4 had already had their ratings permanently
+        changed by the time the warning appeared, with no way to retry
+        cleanly - the warning implied nothing had happened yet, but it
+        had.
+        """
+        min_rating = 100 if self.game_type == "chess" else 0
+        new_ratings = {}  # player -> validated new rating, nothing applied yet
+
+        for player in self.players:
+            if player not in self.rating_entries:
+                continue
+            new_rating_str = self.rating_entries[player].get().strip()
+            if not new_rating_str:
+                continue
+            try:
+                new_rating = int(new_rating_str)
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Input", "All ratings must be valid numbers"
+                )
+                return
+            if new_rating < min_rating:
+                messagebox.showwarning(
+                    "Invalid Input",
+                    f"Rating for {player.name} cannot be below {min_rating}",
+                )
+                return
+            new_ratings[player] = new_rating
+
+        # Every entry validated cleanly - now it's safe to apply them all.
+        for player, new_rating in new_ratings.items():
+            player.rating = new_rating
+
+        callback()
 
     # ============ TOURNAMENT MODE METHODS ============
 
@@ -4715,7 +4711,7 @@ class PlayerSorterApp:
             player.withdrawn = False
             player.withdrawal_round = None
             player.opponents = []
-            player.colors = []
+            player.results_vs_opponents = []
             player.requested_half_bye = False
 
         if self.tournament_system == "swiss":
@@ -4730,6 +4726,13 @@ class PlayerSorterApp:
             self.round_robin_total_rounds = (
                 n_start - 1 if n_start % 2 == 0 else n_start
             )
+            # Record the fixed rotation order too. generate_round_robin_pairings
+            # rotates this exact list every round - it must never change shape
+            # or order once the tournament starts, or the round-robin schedule
+            # guarantee (everyone plays everyone exactly once) breaks. Half-byes
+            # and withdrawals are handled later by substituting byes into that
+            # round's OUTPUT, not by removing anyone from this list.
+            self.round_robin_player_order = list(self.players)
             self.show_round_robin_round()
         elif self.tournament_system == "knockout":
             self.show_knockout_round()
@@ -4790,13 +4793,95 @@ class PlayerSorterApp:
             # Sort by points, then rating
             playing_players.sort(key=lambda p: (p.points, p.rating), reverse=True)
 
-            paired = set()
+            matching = self._find_swiss_matching(playing_players)
+            for a, b in matching:
+                if b is None:
+                    pairings.append([a, None, "bye"])
+                else:
+                    pairings.append([a, b, None])
 
+        return pairings
+
+    def _find_swiss_matching(self, playing_players):
+        """Find a full pairing of playing_players (already sorted by
+        pairing priority - closest-ranked first) using backtracking,
+        rather than the simple greedy "first compatible opponent" scan
+        this used to use.
+
+        Greedy without backtracking can pick a locally-valid opponent
+        that turns out to make a complete pairing impossible later in
+        the list, even when a valid complete pairing exists - it just
+        wasn't the first one greedy happened to try. That produced
+        unnecessary byes for players who didn't need one. Backtracking
+        undoes a bad pick and tries the next candidate instead of
+        giving up on the whole round.
+
+        Returns a list of (player, opponent_or_None) tuples. opponent is
+        None for a bye. At most one bye is ever produced for one call.
+        If a complete pairing using only never-played-before opponents
+        is impossible (can happen with an unlucky history), falls back
+        to allowing exactly the repeat pairing(s) needed to avoid
+        handing out more than one bye - a repeat is the standard Swiss
+        convention for an otherwise-unresolvable round, and is less
+        disruptive than multiple simultaneous byes.
+        """
+        # Hard safety cap: backtracking search is worst-case exponential.
+        # Realistic Swiss fields (dozens of players, sparse "already
+        # played" history) resolve in well under a thousand recursive
+        # calls in testing. If something pathological blows past this,
+        # fall back to the old unconditional-greedy behaviour rather than
+        # risk hanging the UI - a few unnecessary byes is a much smaller
+        # problem than the app freezing.
+        call_budget = [20000]
+
+        def can_play(a, b, allow_repeats):
+            if allow_repeats:
+                return True
+            return b.name not in a.opponents and a.name not in b.opponents
+
+        def backtrack(remaining, allow_repeats):
+            call_budget[0] -= 1
+            if call_budget[0] <= 0:
+                return None
+            if not remaining:
+                return []
+            if len(remaining) == 1:
+                return [(remaining[0], None)]
+
+            first = remaining[0]
+            rest = remaining[1:]
+
+            for i, candidate in enumerate(rest):
+                if can_play(first, candidate, allow_repeats):
+                    new_remaining = rest[:i] + rest[i + 1 :]
+                    sub_result = backtrack(new_remaining, allow_repeats)
+                    if sub_result is not None:
+                        return [(first, candidate)] + sub_result
+
+            # Odd-sized remaining group: `first` could be the bye instead
+            # of being forced into one of the pairings tried above.
+            if len(remaining) % 2 == 1:
+                sub_result = backtrack(rest, allow_repeats)
+                if sub_result is not None:
+                    return [(first, None)] + sub_result
+
+            return None
+
+        result = backtrack(list(playing_players), allow_repeats=False)
+        if result is None and call_budget[0] > 0:
+            # No pairing avoiding all repeats exists - allow a repeat
+            # rather than handing out extra byes.
+            result = backtrack(list(playing_players), allow_repeats=True)
+        if result is None:
+            # Either the safety cap was hit, or even allowing repeats
+            # failed (shouldn't happen for an even count, but playing it
+            # safe). Fall back to the simple greedy pass the app used
+            # before, which always terminates even if not optimal.
+            result = []
+            paired = set()
             for player in playing_players:
                 if player.name in paired:
                     continue
-
-                # Find best opponent they haven't played
                 opponent = None
                 for candidate in playing_players:
                     if (
@@ -4806,17 +4891,14 @@ class PlayerSorterApp:
                     ):
                         opponent = candidate
                         break
-
                 if opponent:
-                    pairings.append([player, opponent, None])
+                    result.append((player, opponent))
                     paired.add(player.name)
                     paired.add(opponent.name)
                 else:
-                    # Give bye if no valid opponent
-                    pairings.append([player, None, "bye"])
+                    result.append((player, None))
                     paired.add(player.name)
-
-        return pairings
+        return result
 
     # ===== ROUND-ROBIN =====
 
@@ -4844,62 +4926,129 @@ class PlayerSorterApp:
         self.display_tournament_pairings(frame, pairings, "round_robin")
 
     def generate_round_robin_pairings(self):
-        """Generate Round-Robin pairings using round-robin algorithm"""
-        active = [p for p in self.players if not p.eliminated and not p.withdrawn]
+        """Generate Round-Robin pairings using the round-robin (circle)
+        algorithm, rotating a FIXED player order that is captured once at
+        tournament start and never changes shape afterward.
 
-        # Separate players who requested half-bye
-        halfbye_players = [p for p in active if p.requested_half_bye]
-        playing_players = [p for p in active if not p.requested_half_bye]
+        This matters because of how half-byes and withdrawals work: if we
+        rotated whatever subset of players happens to be "active" THIS
+        round, removing a player for one round (a half-bye) would change
+        the size/order of the list being rotated, which desyncs the
+        rotation from every other round's schedule - producing repeated
+        pairings and missed pairings elsewhere in the tournament, since
+        round-robin's "everyone plays everyone exactly once" guarantee
+        only holds if the same fixed list is rotated round after round.
 
-        pairings = []
-
-        # Add half-bye players first
-        for player in halfbye_players:
-            pairings.append([player, None, "half_bye"])
-            player.requested_half_bye = False  # Reset flag
-
-        n = len(playing_players)
+        Instead: rotate the fixed order to get THIS round's scheduled
+        pairs first, then substitute byes/half-byes into the output for
+        whoever requested one or has withdrawn, without touching the
+        rotation itself.
+        """
+        order = getattr(self, "round_robin_player_order", None)
+        if not order:
+            # Fallback for saves that predate this field: the original
+            # order is lost, so the best we can do is fix one in place now
+            # and keep it stable for the rest of the tournament, rather
+            # than recomputing (and reshaping) it every round as before.
+            order = list(self.players)
+            self.round_robin_player_order = order
 
         # Use the stable total recorded at tournament start rather than
-        # recomputing from playing_players.  A player taking a half-bye
-        # temporarily reduces playing_players, which would make the naive
-        # formula undercount total_rounds and end the tournament too early.
+        # recomputing from however many players are still active.  Half-byes
+        # and withdrawals must not change how many rounds a round-robin is
+        # supposed to run for.
         total_rounds = getattr(self, "round_robin_total_rounds", 0)
         if not total_rounds:
-            # Fallback for saves that predate this field: derive from all
-            # non-withdrawn players (still better than using playing_players).
-            n_all = len(
-                [p for p in self.players if not p.eliminated and not p.withdrawn]
-            )
+            n_all = len(order)
             total_rounds = n_all - 1 if n_all % 2 == 0 else n_all
             self.round_robin_total_rounds = total_rounds  # cache for next rounds
 
         if self.current_round > total_rounds:
             return []  # Tournament complete
 
-        # Use round-robin rotation algorithm
+        n = len(order)
+        rotation_input = order.copy()
         if n % 2 == 1:
-            playing_players.append(None)  # Add dummy for odd players
+            rotation_input.append(None)  # Dummy bye slot, rotates like anyone else
             n += 1
 
         round_idx = self.current_round - 1
 
-        # Fixed position rotation algorithm
-        players = playing_players.copy()
+        # Fixed position rotation algorithm, applied to the STABLE order
+        rotated = rotation_input.copy()
         for _ in range(round_idx):
-            players = [players[0]] + [players[-1]] + players[1:-1]
+            rotated = [rotated[0]] + [rotated[-1]] + rotated[1:-1]
 
-        # Create pairings for this round
+        # This round's schedule, before any half-bye/withdrawal substitution
+        scheduled_pairs = []
         for i in range(n // 2):
-            p1 = players[i]
-            p2 = players[n - 1 - i]
+            scheduled_pairs.append((rotated[i], rotated[n - 1 - i]))
 
-            if p1 is not None and p2 is not None:
-                pairings.append([p1, p2, None])
-            elif p1 is not None:
-                pairings.append([p1, None, "bye"])
-            elif p2 is not None:
+        pairings = []
+        for p1, p2 in scheduled_pairs:
+            # Dummy slot -> the real player gets the rotation's bye, same
+            # as before.
+            if p1 is None or p2 is None:
+                real = p1 if p1 is not None else p2
+                if real is not None and not real.withdrawn:
+                    if real.requested_half_bye:
+                        pairings.append([real, None, "half_bye"])
+                        real.requested_half_bye = False
+                    else:
+                        pairings.append([real, None, "bye"])
+                continue
+
+            p1_out = p1.withdrawn
+            p2_out = p2.withdrawn
+            if p1_out and p2_out:
+                # Both scheduled players are gone - nothing to schedule.
+                continue
+            if p1_out:
+                # p1 withdrew; p2's scheduled opponent isn't there to play.
+                # p2 still gets their own half-bye entry if they asked for
+                # one (it's their choice being recorded, not a consequence
+                # of p1 withdrawing), otherwise a bye.
+                if p2.requested_half_bye:
+                    pairings.append([p2, None, "half_bye"])
+                    p2.requested_half_bye = False
+                else:
+                    pairings.append([p2, None, "bye"])
+                continue
+            if p2_out:
+                if p1.requested_half_bye:
+                    pairings.append([p1, None, "half_bye"])
+                    p1.requested_half_bye = False
+                else:
+                    pairings.append([p1, None, "bye"])
+                continue
+
+            # Both scheduled players are present. A half-bye request takes
+            # priority for whichever of them asked for it: that player gets
+            # their own half_bye entry, and since their scheduled opponent
+            # now has no one to play, the opponent gets a bye instead of
+            # being silently dropped from the round (this was the actual
+            # bug - the old code pulled half-bye players out before
+            # pairing, leaving their would-be opponent unpaired and
+            # reshaping the rotation for every round after).
+            p1_half = p1.requested_half_bye
+            p2_half = p2.requested_half_bye
+            if p1_half and p2_half:
+                # Both wanted to sit out the same scheduled game - honour
+                # both as half-byes rather than picking one arbitrarily.
+                pairings.append([p1, None, "half_bye"])
+                pairings.append([p2, None, "half_bye"])
+                p1.requested_half_bye = False
+                p2.requested_half_bye = False
+            elif p1_half:
+                pairings.append([p1, None, "half_bye"])
                 pairings.append([p2, None, "bye"])
+                p1.requested_half_bye = False
+            elif p2_half:
+                pairings.append([p2, None, "half_bye"])
+                pairings.append([p1, None, "bye"])
+                p2.requested_half_bye = False
+            else:
+                pairings.append([p1, p2, None])
 
         return pairings
 
@@ -5013,42 +5162,111 @@ class PlayerSorterApp:
         )
         title.pack(pady=10)
 
-        # Get active players (not withdrawn)
-        active_team_a = [p for p in self.schev_team_a if not p.withdrawn]
-        active_team_b = [p for p in self.schev_team_b if not p.withdrawn]
-
-        # Separate players who requested half-bye
-        halfbye_team_a = [p for p in active_team_a if p.requested_half_bye]
-        halfbye_team_b = [p for p in active_team_b if p.requested_half_bye]
-        playing_team_a = [p for p in active_team_a if not p.requested_half_bye]
-        playing_team_b = [p for p in active_team_b if not p.requested_half_bye]
-
-        pairings = []
-
-        # Add half-bye players first
-        for player in halfbye_team_a + halfbye_team_b:
-            pairings.append([player, None, "half_bye"])
-            player.requested_half_bye = False  # Reset flag
-
-        # Each playing player from Team A plays one player from Team B per round
-        # Use rotation to ensure everyone plays everyone
-        for i in range(len(playing_team_a)):
-            if i < len(playing_team_b):
-                opponent_idx = (i + self.schev_round - 1) % len(playing_team_b)
-                if opponent_idx < len(playing_team_b):
-                    pairings.append(
-                        [playing_team_a[i], playing_team_b[opponent_idx], None]
-                    )
-
-        # Handle case where teams are unbalanced due to withdrawals
-        if len(playing_team_a) > len(playing_team_b):
-            for i in range(len(playing_team_b), len(playing_team_a)):
-                pairings.append([playing_team_a[i], None, "bye"])
-        elif len(playing_team_b) > len(playing_team_a):
-            for i in range(len(playing_team_a), len(playing_team_b)):
-                pairings.append([playing_team_b[i], None, "bye"])
+        pairings = self._generate_scheveningen_pairings(self.schev_round)
 
         self.display_tournament_pairings(frame, pairings, "scheveningen")
+
+    def _generate_scheveningen_pairings(self, schev_round):
+        """Generate this round's Scheveningen pairings by rotating the
+        FIXED team rosters (self.schev_team_a / self.schev_team_b, which
+        are set once at setup and never resized afterward), then
+        substituting byes/half-byes into the output for whoever has
+        withdrawn or requested one this round.
+
+        This mirrors the round-robin fix for the same underlying problem:
+        the rotation formula `(i + round - 1) % len(team)` only produces a
+        correct "everyone plays everyone" schedule if it's applied to a
+        team of the SAME fixed size every round. The previous
+        implementation computed it directly against the half-bye- and
+        withdrawal-filtered team lists, which shrink on whichever round a
+        player sits out - silently desyncing the rotation from every
+        other round's schedule, producing repeated pairings for some
+        players and missed pairings for others, for the rest of the
+        tournament.
+        """
+        team_a = self.schev_team_a
+        team_b = self.schev_team_b
+        n_a, n_b = len(team_a), len(team_b)
+
+        # This round's schedule against the FULL, fixed rosters - the part
+        # that must stay stable across every round regardless of who sits
+        # out. (Team sizes are equal in every case the current UI allows,
+        # but this also works correctly if they aren't.)
+        scheduled = []
+        for i in range(n_a):
+            if n_b == 0:
+                scheduled.append((team_a[i], None))
+            else:
+                opponent_idx = (i + schev_round - 1) % n_b
+                scheduled.append((team_a[i], team_b[opponent_idx]))
+
+        # Team B players who aren't scheduled against anyone this round
+        # (only possible when Team A is smaller than Team B) still need
+        # their own bye/half-bye entry rather than being silently dropped.
+        scheduled_b_players = {b for _, b in scheduled if b is not None}
+        unscheduled_b = [p for p in team_b if p not in scheduled_b_players]
+
+        pairings = []
+        for a_player, b_player in scheduled:
+            a_out = a_player.withdrawn
+            b_out = b_player.withdrawn if b_player is not None else True
+
+            if a_out and (b_player is None or b_out):
+                continue  # Nobody real scheduled on either side
+
+            if a_out:
+                # Team A's scheduled player is gone; b_player still gets
+                # their own entry - a half-bye if they asked for one
+                # (their choice, not a consequence of a_player withdrawing),
+                # otherwise a bye since their opponent isn't there to play.
+                if b_player.requested_half_bye:
+                    pairings.append([b_player, None, "half_bye"])
+                    b_player.requested_half_bye = False
+                else:
+                    pairings.append([b_player, None, "bye"])
+                continue
+
+            if b_player is None or b_out:
+                if a_player.requested_half_bye:
+                    pairings.append([a_player, None, "half_bye"])
+                    a_player.requested_half_bye = False
+                else:
+                    pairings.append([a_player, None, "bye"])
+                continue
+
+            # Both scheduled players are present. A half-bye request takes
+            # priority: that player gets their own half_bye entry, and
+            # since their scheduled opponent now has no one to play this
+            # round, the opponent gets a bye instead of being silently
+            # left out of the pairings list.
+            a_half = a_player.requested_half_bye
+            b_half = b_player.requested_half_bye
+            if a_half and b_half:
+                pairings.append([a_player, None, "half_bye"])
+                pairings.append([b_player, None, "half_bye"])
+                a_player.requested_half_bye = False
+                b_player.requested_half_bye = False
+            elif a_half:
+                pairings.append([a_player, None, "half_bye"])
+                pairings.append([b_player, None, "bye"])
+                a_player.requested_half_bye = False
+            elif b_half:
+                pairings.append([b_player, None, "half_bye"])
+                pairings.append([a_player, None, "bye"])
+                b_player.requested_half_bye = False
+            else:
+                pairings.append([a_player, b_player, None])
+
+        for b_player in unscheduled_b:
+            if b_player.withdrawn:
+                continue
+            if b_player.requested_half_bye:
+                pairings.append([b_player, None, "half_bye"])
+                b_player.requested_half_bye = False
+            else:
+                pairings.append([b_player, None, "bye"])
+
+        return pairings
 
     def show_scheveningen_standings(self):
         """Show Scheveningen standings after a round"""
@@ -5159,7 +5377,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.halfbye_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5173,7 +5392,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.halfbye_vars[player.name] = var
+                self.halfbye_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5194,7 +5413,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.withdrawal_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5208,7 +5428,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.withdrawal_vars[player.name] = var
+                self.withdrawal_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5246,27 +5466,7 @@ class PlayerSorterApp:
     def next_scheveningen_round(self):
         """Process half-bye and withdrawal requests,
         then continue to next Scheveningen round"""
-        # Apply withdrawal requests if enabled
-        if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
-            for player_name, var in self.withdrawal_vars.items():
-                if var.get():
-                    # Find player and mark as withdrawn
-                    for player in self.schev_team_a + self.schev_team_b:
-                        if player.name == player_name:
-                            player.withdrawn = True
-                            player.withdrawal_round = self.schev_round
-                            break
-
-        # Apply half-bye requests if enabled
-        if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
-            for player_name, var in self.halfbye_vars.items():
-                if var.get():
-                    # Find player and mark for half-bye
-                    for player in self.schev_team_a + self.schev_team_b:
-                        if player.name == player_name:
-                            player.requested_half_bye = True
-                            break
-
+        self._flush_pending_round_requests()
         self.show_scheveningen_round()
 
     def show_scheveningen_final(self):
@@ -5554,16 +5754,22 @@ class PlayerSorterApp:
                 p2.losses += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("win")
+                p2.results_vs_opponents.append("loss")
             elif result == "p2_win":
                 p2.wins += 1
                 p1.losses += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("loss")
+                p2.results_vs_opponents.append("win")
             elif result == "draw":
                 p1.draws += 1
                 p2.draws += 1
                 p1.opponents.append(p2.name)
                 p2.opponents.append(p1.name)
+                p1.results_vs_opponents.append("draw")
+                p2.results_vs_opponents.append("draw")
 
         # Handle elimination for knockout
         if system == "knockout":
@@ -5759,7 +5965,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each player
+            # Create checkboxes for each player, keyed by player object
+            # (not name) so two same-named players never collide.
             self.halfbye_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5772,7 +5979,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.halfbye_vars[player.name] = var
+                self.halfbye_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5793,7 +6000,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.withdrawal_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5806,7 +6014,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.withdrawal_vars[player.name] = var
+                self.withdrawal_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5877,28 +6085,26 @@ class PlayerSorterApp:
         objects.  Must be called before saving or advancing to the next round
         so that requests made on the standings screen are not lost.
         Safe to call even when the checkboxes were never shown (no-ops).
+
+        Shared by every tournament system (Swiss, Round-Robin, and
+        Scheveningen) - there is no per-system variant of this logic
+        anymore, so a future fix here automatically applies everywhere.
         """
         # Use the correct round counter — Scheveningen tracks its own round.
         current_rnd = getattr(self, "schev_round", None) or self.current_round
 
         # Apply withdrawal requests
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
-            for player_name, var in self.withdrawal_vars.items():
+            for player, var in self.withdrawal_vars.items():
                 if var.get():
-                    for player in self.players:
-                        if player.name == player_name:
-                            player.withdrawn = True
-                            player.withdrawal_round = current_rnd
-                            break
+                    player.withdrawn = True
+                    player.withdrawal_round = current_rnd
 
         # Apply half-bye requests
         if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
-            for player_name, var in self.halfbye_vars.items():
+            for player, var in self.halfbye_vars.items():
                 if var.get():
-                    for player in self.players:
-                        if player.name == player_name:
-                            player.requested_half_bye = True
-                            break
+                    player.requested_half_bye = True
 
     def next_tournament_round_with_settings(self, system):
         """Process half-bye and withdrawal requests, then continue to next round"""
@@ -5917,6 +6123,17 @@ class PlayerSorterApp:
         for player in active_players:
             tb_score = None
 
+            # opponents/results_vs_opponents are parallel lists - pair them
+            # up safely even if an old save has a length mismatch (results
+            # missing or shorter), treating any unmatched entry as unknown.
+            opponent_results = list(
+                zip(player.opponents, player.results_vs_opponents)
+            )
+            if len(player.opponents) > len(opponent_results):
+                opponent_results += [
+                    (n, "") for n in player.opponents[len(opponent_results) :]
+                ]
+
             if self.tiebreak_method == "buchholz":
                 # Sum of opponents' scores
                 tb_score = 0
@@ -5926,17 +6143,49 @@ class PlayerSorterApp:
                             tb_score += p.points
                             break
             elif self.tiebreak_method == "sonneborn_berger":
-                # Weighted opponents' scores (win=full score, draw=half score)
+                # Sum of each opponent's own score, weighted by how the
+                # player did against THEM specifically: full credit for a
+                # win, half for a draw, nothing for a loss. This is the
+                # standard FIDE definition - it depends on the outcome of
+                # each individual game, not just who was played.
                 tb_score = 0
-                for p in players:
-                    if p.name in player.opponents:
-                        # Find result against this opponent
-                        # Simplified: assume we can determine result from records
-                        tb_score += p.points * 0.5  # Approximate
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name:
+                            if outcome == "win":
+                                tb_score += p.points
+                            elif outcome == "draw":
+                                tb_score += p.points * 0.5
+                            # "loss" (or unknown, from an old save)
+                            # contributes 0.
+                            break
             elif self.tiebreak_method == "rating":
                 tb_score = player.rating
             elif self.tiebreak_method == "direct_encounter":
-                tb_score = player.rating  # Fallback to rating for now
+                # Result of the head-to-head game(s) against opponents who
+                # are tied with this player on points - the standard
+                # Direct Encounter definition. Restricting to opponents
+                # with the SAME points total is what makes this a
+                # standalone numeric score rather than a special grouping
+                # pass: a player's score only reflects games that are
+                # actually relevant to resolving their current tie.
+                #
+                # If the tied players never played each other (common in
+                # Swiss events, since pairings aren't guaranteed to cover
+                # every tied pair), this naturally comes out to 0 for
+                # everyone involved - an honest "unresolved" result,
+                # rather than a guess. There's no secondary tiebreak
+                # configured in this app to fall back to in that case.
+                tb_score = 0
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name and p.points == player.points:
+                            if outcome == "win":
+                                tb_score += 1.0
+                            elif outcome == "draw":
+                                tb_score += 0.5
+                            # "loss" contributes 0.
+                            break
 
             result.append((player, tb_score))
 
@@ -6600,15 +6849,22 @@ class PlayerSorterApp:
         return teams
 
     def back_to_setup(self):
-        """Return to setup screen, keeping player data"""
+        """Return to setup screen, keeping player data.
+
+        Always passes auto_load=False to show_player_input(): whatever is
+        currently in self.players (live tournament progress, or a loaded
+        tournament's roster) must not be silently overwritten by whatever
+        happens to be saved on disk, which is exactly what auto-loading
+        would otherwise do here.
+        """
         if self.in_game:
             if messagebox.askyesno(
                 "Confirm", "Return to setup? Current game progress will be kept."
             ):
                 self.in_game = False
-                self.show_player_input()
+                self.show_player_input(auto_load=False)
         else:
-            self.show_player_input()
+            self.show_player_input(auto_load=False)
 
     def clear_window(self):
         """Clear all widgets from the window"""
