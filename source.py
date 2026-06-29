@@ -3956,6 +3956,27 @@ class PlayerSorterApp:
         # Sort all players by win rate
         sorted_players = sorted(self.players, key=lambda p: p.win_rate, reverse=True)
 
+        # The actual winner is whoever is NOT eliminated - the same check
+        # show_br_winner() uses. This can legitimately differ from "the
+        # player with the single highest win rate": elimination is
+        # relative to each round's active pool, so a player eliminated
+        # early after a couple of good games can end up with a higher
+        # final win rate than the player who actually won the whole
+        # event. Re-deriving "winner" from win-rate sort position here
+        # (as this used to do) could then label the WRONG player as
+        # Winner, disagreeing with the winner screen the player just came
+        # from.
+        not_eliminated = [p for p in self.players if not p.eliminated]
+        if len(not_eliminated) == 1:
+            actual_winner = not_eliminated[0]
+        elif sorted_players:
+            # Degenerate fallback (shouldn't normally happen): mirror
+            # show_br_winner()'s own fallback so the two screens always
+            # agree on who's labelled the winner.
+            actual_winner = sorted_players[0]
+        else:
+            actual_winner = None
+
         results_frame = ttk.Frame(frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
@@ -4002,7 +4023,7 @@ class PlayerSorterApp:
         for i, player in enumerate(sorted_players, 1):
             status = (
                 "🏆 Winner"
-                if i == 1
+                if player is actual_winner
                 else ("❌ Eliminated" if player.eliminated else "Active")
             )
             tree.insert(
@@ -4584,28 +4605,45 @@ class PlayerSorterApp:
         ).pack(side=tk.LEFT, padx=5)
 
     def apply_manual_ratings(self, callback):
-        """Apply manual rating changes"""
-        try:
-            for player in self.players:
-                if player.name in self.rating_entries:
-                    new_rating_str = self.rating_entries[player.name].get().strip()
-                    if new_rating_str:
-                        new_rating = int(new_rating_str)
-                        # Enforce the same floor used everywhere else:
-                        # chess = 100, e-sports = 0 (trophies can be 0).
-                        min_rating = 100 if self.game_type == "chess" else 0
-                        if new_rating < min_rating:
-                            messagebox.showwarning(
-                                "Invalid Input",
-                                f"Rating for {player.name} cannot be below {min_rating}",
-                            )
-                            return
-                        player.rating = new_rating
+        """Apply manual rating changes.
 
-            # Proceed to callback
-            callback()
-        except ValueError:
-            messagebox.showwarning("Invalid Input", "All ratings must be valid numbers")
+        Validates every entry first, with zero mutation, before applying
+        anything. Previously, validation and mutation happened in the
+        same pass: if player #5 (in iteration order) had an invalid
+        entry, players #1-4 had already had their ratings permanently
+        changed by the time the warning appeared, with no way to retry
+        cleanly - the warning implied nothing had happened yet, but it
+        had.
+        """
+        min_rating = 100 if self.game_type == "chess" else 0
+        new_ratings = {}  # player -> validated new rating, nothing applied yet
+
+        for player in self.players:
+            if player.name not in self.rating_entries:
+                continue
+            new_rating_str = self.rating_entries[player.name].get().strip()
+            if not new_rating_str:
+                continue
+            try:
+                new_rating = int(new_rating_str)
+            except ValueError:
+                messagebox.showwarning(
+                    "Invalid Input", "All ratings must be valid numbers"
+                )
+                return
+            if new_rating < min_rating:
+                messagebox.showwarning(
+                    "Invalid Input",
+                    f"Rating for {player.name} cannot be below {min_rating}",
+                )
+                return
+            new_ratings[player] = new_rating
+
+        # Every entry validated cleanly - now it's safe to apply them all.
+        for player, new_rating in new_ratings.items():
+            player.rating = new_rating
+
+        callback()
 
     # ============ TOURNAMENT MODE METHODS ============
 
