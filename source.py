@@ -5466,19 +5466,7 @@ class PlayerSorterApp:
     def next_scheveningen_round(self):
         """Process half-bye and withdrawal requests,
         then continue to next Scheveningen round"""
-        # Apply withdrawal requests if enabled
-        if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
-            for player, var in self.withdrawal_vars.items():
-                if var.get():
-                    player.withdrawn = True
-                    player.withdrawal_round = self.schev_round
-
-        # Apply half-bye requests if enabled
-        if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
-            for player, var in self.halfbye_vars.items():
-                if var.get():
-                    player.requested_half_bye = True
-
+        self._flush_pending_round_requests()
         self.show_scheveningen_round()
 
     def show_scheveningen_final(self):
@@ -6097,6 +6085,10 @@ class PlayerSorterApp:
         objects.  Must be called before saving or advancing to the next round
         so that requests made on the standings screen are not lost.
         Safe to call even when the checkboxes were never shown (no-ops).
+
+        Shared by every tournament system (Swiss, Round-Robin, and
+        Scheveningen) - there is no per-system variant of this logic
+        anymore, so a future fix here automatically applies everywhere.
         """
         # Use the correct round counter — Scheveningen tracks its own round.
         current_rnd = getattr(self, "schev_round", None) or self.current_round
