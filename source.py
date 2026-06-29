@@ -4144,13 +4144,16 @@ class PlayerSorterApp:
 
         for i, team in enumerate(self.teams, 1):
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum - summing percentages
+            # would reward a team purely for having more players, regardless
+            # of whether those extra players are actually any good.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
 
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
                     f"Team {i} (Avg {rating_name}: {avg_rating:.1f}, "
-                    f"Total WR: {total_winrate:.1f}%)"
+                    f"Avg WR: {avg_winrate:.1f}%)"
                 ),
                 padding="10",
             )
@@ -4240,12 +4243,14 @@ class PlayerSorterApp:
         # Calculate team statistics and sort
         team_stats = []
         for i, team in enumerate(self.teams, 1):
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum - see show_team_game
+            # for why summing percentages would unfairly favor larger teams.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
             mvp = max(team, key=lambda p: p.win_rate) if team else None
-            team_stats.append((i, team, total_winrate, avg_rating, mvp))
+            team_stats.append((i, team, avg_winrate, avg_rating, mvp))
 
-        # Sort by total win rate
+        # Sort by average win rate per player
         team_stats.sort(key=lambda x: x[2], reverse=True)
 
         # Display teams
@@ -4268,13 +4273,13 @@ class PlayerSorterApp:
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
 
-        for rank, (team_num, team, total_wr, avg_rating, mvp) in enumerate(
+        for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
-                    f"#{rank} - Team {team_num} (Total WR: {total_wr:.1f}%, "
+                    f"#{rank} - Team {team_num} (Avg WR: {avg_wr:.1f}%, "
                     f"Avg {rating_name}: {avg_rating:.1f})"
                 ),
                 padding="10",
@@ -4354,12 +4359,20 @@ class PlayerSorterApp:
         # Calculate team statistics and sort
         team_stats = []
         for i, team in enumerate(self.teams, 1):
-            total_winrate = sum(p.win_rate for p in team)
+            # Average per-player win rate, not the sum. Teams here are
+            # often different sizes (balance_teams balances by total
+            # rating, not headcount), and summing percentages would crown
+            # whichever team happens to have more players as "winning"
+            # even if its players are individually weaker - this is the
+            # actual winner determination for the whole event, so this is
+            # the most consequential of the three Total-WR -> Avg-WR
+            # fixes in this file.
+            avg_winrate = sum(p.win_rate for p in team) / len(team) if team else 0
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
             mvp = max(team, key=lambda p: p.win_rate) if team else None
-            team_stats.append((i, team, total_winrate, avg_rating, mvp))
+            team_stats.append((i, team, avg_winrate, avg_rating, mvp))
 
-        # Sort by total win rate
+        # Sort by average win rate per player
         team_stats.sort(key=lambda x: x[2], reverse=True)
 
         # Show winner
@@ -4391,14 +4404,14 @@ class PlayerSorterApp:
 
         rating_name = "ELO" if self.game_type == "chess" else "Trophies"
 
-        for rank, (team_num, team, total_wr, avg_rating, mvp) in enumerate(
+        for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
         ):
             team_frame = ttk.LabelFrame(
                 scrollable_frame,
                 text=(
                     f"#{rank} - Team {team_num} "
-                    f"(Total WR: {total_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})"
+                    f"(Avg WR: {avg_wr:.1f}%, Avg {rating_name}: {avg_rating:.1f})"
                 ),
                 padding="10",
             )
@@ -4475,7 +4488,10 @@ class PlayerSorterApp:
         # Determine which sub-mode to use based on rating_mode
         elo_mode = getattr(self, "elo_submode", None) or "otb"
 
-        elo_changes = {}  # Track changes for each player
+        elo_changes = {}  # Player object -> accumulated change. Keyed by
+        # object identity (not name) so two players who happen to share a
+        # display name never collide and merge into one combined change
+        # that both would otherwise incorrectly receive.
 
         for pairing, result_var in self.tournament_results:
             p1, p2, pairing_type = pairing
@@ -4504,18 +4520,18 @@ class PlayerSorterApp:
             )
 
             # Store changes
-            if p1.name not in elo_changes:
-                elo_changes[p1.name] = 0
-            if p2.name not in elo_changes:
-                elo_changes[p2.name] = 0
+            if p1 not in elo_changes:
+                elo_changes[p1] = 0
+            if p2 not in elo_changes:
+                elo_changes[p2] = 0
 
-            elo_changes[p1.name] += p1_change
-            elo_changes[p2.name] += p2_change
+            elo_changes[p1] += p1_change
+            elo_changes[p2] += p2_change
 
         # Apply changes to players
         for player in self.players:
-            if player.name in elo_changes:
-                player.rating += elo_changes[player.name]
+            if player in elo_changes:
+                player.rating += elo_changes[player]
                 # Ensure rating doesn't go below 100
                 if player.rating < 100:
                     player.rating = 100
@@ -4555,7 +4571,9 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        # Store rating entry widgets
+        # Store rating entry widgets, keyed by player object (not name) so
+        # two players who happen to share a display name don't collide
+        # and overwrite each other's entry widget.
         self.rating_entries = {}
 
         # Show each player with current rating
@@ -4586,7 +4604,7 @@ class PlayerSorterApp:
             entry.insert(0, str(player.rating))
             entry.pack(side=tk.LEFT, padx=5)
 
-            self.rating_entries[player.name] = entry
+            self.rating_entries[player] = entry
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -4619,9 +4637,9 @@ class PlayerSorterApp:
         new_ratings = {}  # player -> validated new rating, nothing applied yet
 
         for player in self.players:
-            if player.name not in self.rating_entries:
+            if player not in self.rating_entries:
                 continue
-            new_rating_str = self.rating_entries[player.name].get().strip()
+            new_rating_str = self.rating_entries[player].get().strip()
             if not new_rating_str:
                 continue
             try:
@@ -5359,7 +5377,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.halfbye_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5373,7 +5392,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.halfbye_vars[player.name] = var
+                self.halfbye_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5394,7 +5413,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.withdrawal_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5408,7 +5428,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.withdrawal_vars[player.name] = var
+                self.withdrawal_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5448,24 +5468,16 @@ class PlayerSorterApp:
         then continue to next Scheveningen round"""
         # Apply withdrawal requests if enabled
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
-            for player_name, var in self.withdrawal_vars.items():
+            for player, var in self.withdrawal_vars.items():
                 if var.get():
-                    # Find player and mark as withdrawn
-                    for player in self.schev_team_a + self.schev_team_b:
-                        if player.name == player_name:
-                            player.withdrawn = True
-                            player.withdrawal_round = self.schev_round
-                            break
+                    player.withdrawn = True
+                    player.withdrawal_round = self.schev_round
 
         # Apply half-bye requests if enabled
         if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
-            for player_name, var in self.halfbye_vars.items():
+            for player, var in self.halfbye_vars.items():
                 if var.get():
-                    # Find player and mark for half-bye
-                    for player in self.schev_team_a + self.schev_team_b:
-                        if player.name == player_name:
-                            player.requested_half_bye = True
-                            break
+                    player.requested_half_bye = True
 
         self.show_scheveningen_round()
 
@@ -5965,7 +5977,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each player
+            # Create checkboxes for each player, keyed by player object
+            # (not name) so two same-named players never collide.
             self.halfbye_vars = {}
             players_per_row = 3
             row_frame = None
@@ -5978,7 +5991,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.halfbye_vars[player.name] = var
+                self.halfbye_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -5999,7 +6012,8 @@ class PlayerSorterApp:
                 font=("Arial", 9),
             ).pack(pady=5)
 
-            # Create checkboxes for each active player
+            # Create checkboxes for each active player, keyed by player
+            # object (not name) so two same-named players never collide.
             self.withdrawal_vars = {}
             players_per_row = 3
             row_frame = None
@@ -6012,7 +6026,7 @@ class PlayerSorterApp:
                     row_frame.pack(fill=tk.X, pady=2)
 
                 var = tk.BooleanVar(value=False)
-                self.withdrawal_vars[player.name] = var
+                self.withdrawal_vars[player] = var
 
                 cb = ttk.Checkbutton(row_frame, text=player.name, variable=var)
                 cb.pack(side=tk.LEFT, padx=10)
@@ -6089,22 +6103,16 @@ class PlayerSorterApp:
 
         # Apply withdrawal requests
         if self.withdrawal_enabled and hasattr(self, "withdrawal_vars"):
-            for player_name, var in self.withdrawal_vars.items():
+            for player, var in self.withdrawal_vars.items():
                 if var.get():
-                    for player in self.players:
-                        if player.name == player_name:
-                            player.withdrawn = True
-                            player.withdrawal_round = current_rnd
-                            break
+                    player.withdrawn = True
+                    player.withdrawal_round = current_rnd
 
         # Apply half-bye requests
         if self.half_bye_enabled and hasattr(self, "halfbye_vars"):
-            for player_name, var in self.halfbye_vars.items():
+            for player, var in self.halfbye_vars.items():
                 if var.get():
-                    for player in self.players:
-                        if player.name == player_name:
-                            player.requested_half_bye = True
-                            break
+                    player.requested_half_bye = True
 
     def next_tournament_round_with_settings(self, system):
         """Process half-bye and withdrawal requests, then continue to next round"""
