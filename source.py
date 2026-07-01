@@ -979,9 +979,12 @@ class PlayerSorterApp:
         )
         file_entries = unfinished + finished
 
-        # If only one file, load it directly
+        # If only one file, load it directly. clear_window() is deferred to
+        # _open_tournament_entry's success path, so a failed load (corrupt
+        # file, permission error, etc.) leaves this list screen on-screen
+        # behind the error messagebox instead of stranding the user on a
+        # blank window with no way back.
         if len(file_entries) == 1:
-            self.clear_window()
             self._open_tournament_entry(file_entries[0])
             return
 
@@ -1121,11 +1124,19 @@ class PlayerSorterApp:
         ).pack(side=tk.LEFT, padx=5)
 
     def _open_tournament_entry(self, entry: dict):
-        """Load a tournament file and dispatch to viewer or resumption."""
+        """Load a tournament file and dispatch to viewer or resumption.
+
+        clear_window() is called here, AFTER a successful load, rather than
+        by the caller before this runs. That way a failed load (corrupt
+        file, permission error, etc.) leaves whatever screen the user was
+        on (e.g. the Load Tournament list) visible behind the error
+        messagebox, instead of leaving a blank window with no way back.
+        """
         success = self.load_tournament_from_file(entry["filepath"])
         if not success:
             return
 
+        self.clear_window()
         if entry["finished"]:
             # View-only: go straight to round-by-round viewer
             self.show_round_by_round_viewer(self.tournament_history, readonly=True)
@@ -4673,12 +4684,13 @@ class PlayerSorterApp:
 
         if self.tournament_system == "scheveningen":
             required = self.scheveningen_team_size * 2
-            if len(self.players) < required:
+            if len(self.players) != required:
                 messagebox.showwarning(
-                    "Not Enough Players",
+                    "Wrong Number of Players",
                     (
                         f"Need exactly {required} players for Scheveningen "
-                        f"with {self.scheveningen_team_size} per team"
+                        f"with {self.scheveningen_team_size} per team "
+                        f"(you currently have {len(self.players)})."
                     ),
                 )
                 return
