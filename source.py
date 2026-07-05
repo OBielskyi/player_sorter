@@ -2570,7 +2570,7 @@ class PlayerSorterApp:
             messagebox.showwarning("Input Error", "Rating must be a number")
             return
 
-        # Validate rating constraints (Chess only)
+        # Validate rating constraints
         if self.game_type == "chess":
             # Absolute minimum is 100
             if rating < 100:
@@ -2592,6 +2592,17 @@ class PlayerSorterApp:
                         f"ELO ({rating}) is above tournament maximum ({self.max_elo})",
                     )
                     return
+        else:
+            # E-sports: Trophies can never be negative. This mirrors the
+            # floor apply_manual_ratings already enforces during a running
+            # tournament - without it here too, a player could be
+            # registered with a negative Trophy count that manual updates
+            # would then refuse to ever set it back to.
+            if rating < 0:
+                messagebox.showwarning(
+                    "Invalid Rating", "Trophies cannot be below 0"
+                )
+                return
 
         # Build the candidate name's display form the same way the real
         # Player object would, so the duplicate check below can never
