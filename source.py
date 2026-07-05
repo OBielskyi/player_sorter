@@ -3312,6 +3312,12 @@ class PlayerSorterApp:
             self._reset_players_for_new_session()
             self.show_battle_royale_game()
         elif self.sort_mode == "teams":
+            if len(self.players) < 2:
+                messagebox.showwarning(
+                    "Not Enough Players", "Need at least 2 players for team mode"
+                )
+                self.in_game = False  # Roll back — no game was actually started
+                return
             self._reset_players_for_new_session()
             self.show_team_configuration()
 
