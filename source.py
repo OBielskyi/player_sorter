@@ -3920,7 +3920,22 @@ class PlayerSorterApp:
         ).pack(pady=20)
 
     def next_br_round(self):
-        """Start next battle royale round"""
+        """Start next battle royale round.
+
+        finish_br_round's general elimination branch (more than 3 active
+        players at the start of the round) always removes exactly the
+        bottom 3, which can leave exactly 1 player standing whenever the
+        round started with exactly 4. That case was falling through to
+        another game round with a single player and nobody to record a
+        result against - a dead round the user still had to click through
+        before finally reaching the winner screen. Checking here, right
+        before dispatching to the next round, catches it regardless of
+        which elimination branch produced the 1-remaining state.
+        """
+        active_players = [p for p in self.players if not p.eliminated]
+        if len(active_players) <= 1:
+            self.show_br_winner()
+            return
         self.current_round += 1
         self.show_battle_royale_game()
 
