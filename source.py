@@ -3151,18 +3151,28 @@ class PlayerSorterApp:
 
             self.rating_mode_var = tk.StringVar(value="unranked")
 
-            ttk.Radiobutton(
-                rating_frame,
-                text="Automatic - Online/OTB (balanced changes, K=32)",
-                variable=self.rating_mode_var,
-                value="automatic_otb",
-            ).pack(anchor=tk.W, pady=5, padx=20)
-            ttk.Radiobutton(
-                rating_frame,
-                text="Automatic - Daily/Correspondence (harsher changes, K=48)",
-                variable=self.rating_mode_var,
-                value="automatic_correspondence",
-            ).pack(anchor=tk.W, pady=5, padx=20)
+            # Automatic ELO relies on the standard expected-score formula
+            # comparing one player's rating directly against a specific
+            # opponent's - it requires paired win/loss results. Dual mode
+            # has that (each match is p1 vs p2). Battle Royale and Teams
+            # only record raw win/loss/draw counts per player with no
+            # "against whom", so there's no valid opponent rating to plug
+            # into the formula - Automatic is intentionally unavailable
+            # there, not just hidden by omission.
+            if self.sort_mode == "dual":
+                ttk.Radiobutton(
+                    rating_frame,
+                    text="Automatic - Online/OTB (balanced changes, K=32)",
+                    variable=self.rating_mode_var,
+                    value="automatic_otb",
+                ).pack(anchor=tk.W, pady=5, padx=20)
+                ttk.Radiobutton(
+                    rating_frame,
+                    text="Automatic - Daily/Correspondence (harsher changes, K=48)",
+                    variable=self.rating_mode_var,
+                    value="automatic_correspondence",
+                ).pack(anchor=tk.W, pady=5, padx=20)
+
             ttk.Radiobutton(
                 rating_frame,
                 text="Manual - Manually update ELO after each round",
@@ -3279,6 +3289,7 @@ class PlayerSorterApp:
                 )
                 self.in_game = False  # Roll back — no game was actually started
                 return
+            self._reset_players_for_new_session()
             self.show_dual_game()
         elif self.sort_mode == "battle_royale":
             if len(self.players) < 4:
@@ -3287,8 +3298,10 @@ class PlayerSorterApp:
                 )
                 self.in_game = False  # Roll back — no game was actually started
                 return
+            self._reset_players_for_new_session()
             self.show_battle_royale_game()
         elif self.sort_mode == "teams":
+            self._reset_players_for_new_session()
             self.show_team_configuration()
 
     def show_dual_game(self):
@@ -3829,31 +3842,45 @@ class PlayerSorterApp:
 
     def finish_br_round(self):
         """Finish battle royale round and eliminate bottom 3 players"""
-        active_players = [p for p in self.players if not p.eliminated]
 
-        # Check if game should end
-        if len(active_players) <= 1:
-            self.show_br_winner()
-            return
+        def _do_eliminations():
+            active_players = [p for p in self.players if not p.eliminated]
 
-        # Sort by win rate
-        active_players.sort(key=lambda p: p.win_rate, reverse=True)
+            # Check if game should end
+            if len(active_players) <= 1:
+                self.show_br_winner()
+                return
 
-        # Eliminate bottom 3 (or fewer if not enough players)
-        num_to_eliminate = min(3, len(active_players) - 1)
+            # Sort by win rate
+            active_players.sort(key=lambda p: p.win_rate, reverse=True)
 
-        if len(active_players) <= 3:
-            # Final round - eliminate all but winner
-            for player in active_players[1:]:
-                player.eliminated = True
-            self.show_br_winner()
+            # Eliminate bottom 3 (or fewer if not enough players)
+            num_to_eliminate = min(3, len(active_players) - 1)
+
+            if len(active_players) <= 3:
+                # Final round - eliminate all but winner
+                for player in active_players[1:]:
+                    player.eliminated = True
+                self.show_br_winner()
+            else:
+                # Eliminate bottom 3
+                for i in range(num_to_eliminate):
+                    active_players[-(i + 1)].eliminated = True
+
+                # Show elimination results
+                self.show_br_elimination(active_players[-num_to_eliminate:])
+
+        # Manual rating updates (chess "manual" / e-sports "ranked") happen
+        # before eliminations are computed, same ordering as every other
+        # mode's round-finish flow. Automatic ELO never applies here (see
+        # show_simple_rating_mode_selection and apply_automatic_elo_changes)
+        # since Battle Royale has no paired opponent to compute it against.
+        if self.rating_mode == "manual" or (
+            self.rating_mode == "ranked" and self.game_type == "esports"
+        ):
+            self.show_manual_rating_update(_do_eliminations)
         else:
-            # Eliminate bottom 3
-            for i in range(num_to_eliminate):
-                active_players[-(i + 1)].eliminated = True
-
-            # Show elimination results
-            self.show_br_elimination(active_players[-num_to_eliminate:])
+            _do_eliminations()
 
     def show_br_elimination(self, eliminated_players: List[Player]):
         """Show which players were eliminated"""
@@ -4234,7 +4261,15 @@ class PlayerSorterApp:
 
     def finish_team_round(self):
         """Finish team round and show standings with MVPs"""
-        self.show_team_standings()
+        # Manual rating updates (chess "manual" / e-sports "ranked"), same
+        # as every other mode. Automatic ELO never applies here since Teams
+        # has no paired opponent to compute it against.
+        if self.rating_mode == "manual" or (
+            self.rating_mode == "ranked" and self.game_type == "esports"
+        ):
+            self.show_manual_rating_update(self.show_team_standings)
+        else:
+            self.show_team_standings()
 
     def show_team_standings(self):
         """Show team standings with MVPs after a round"""
@@ -4496,6 +4531,13 @@ class PlayerSorterApp:
         if not hasattr(self, "tournament_results"):
             return
 
+        # Hard guard: the ELO expected-score formula is a chess-rating
+        # concept. It must never run for e-sports (Trophies), regardless
+        # of how this method got called - this is enforced here as well
+        # as at every call site, so there's no path that can slip through.
+        if self.game_type != "chess":
+            return
+
         # Determine which sub-mode to use based on rating_mode
         elo_mode = getattr(self, "elo_submode", None) or "otb"
 
@@ -4674,6 +4716,31 @@ class PlayerSorterApp:
 
         callback()
 
+    def _reset_players_for_new_session(self) -> None:
+        """Reset all per-session state on every Player object.
+
+        wins/losses/draws/byes/half_byes/opponents accumulate from the
+        player-roster save file across app launches. Without this reset,
+        starting a new session (Tournament, Dual, Battle Royale, or Teams)
+        would begin with leftover stats from whatever was last played,
+        corrupting every standing, tiebreak, and win-rate calculation from
+        round 1 onward. Shared by start_tournament() and
+        confirm_simple_rating_mode() so Dual/Battle Royale/Teams reset
+        exactly the same way Tournament mode always has.
+        """
+        for player in self.players:
+            player.wins = 0
+            player.losses = 0
+            player.draws = 0
+            player.byes = 0
+            player.half_byes = 0
+            player.eliminated = False
+            player.withdrawn = False
+            player.withdrawal_round = None
+            player.opponents = []
+            player.results_vs_opponents = []
+            player.requested_half_bye = False
+
     # ============ TOURNAMENT MODE METHODS ============
 
     def start_tournament(self):
@@ -4708,23 +4775,9 @@ class PlayerSorterApp:
         )
         self.current_round = 1
 
-        # Reset all per-tournament state on every Player object.
-        # wins/losses/draws/byes/half_byes accumulate from the player-roster
-        # save file across sessions; without this reset, a second tournament
-        # would start with leftover points from the first, corrupting every
-        # standing and tiebreak calculation from round 1 onward.
-        for player in self.players:
-            player.wins = 0
-            player.losses = 0
-            player.draws = 0
-            player.byes = 0
-            player.half_byes = 0
-            player.eliminated = False
-            player.withdrawn = False
-            player.withdrawal_round = None
-            player.opponents = []
-            player.results_vs_opponents = []
-            player.requested_half_bye = False
+        # Reset all per-tournament state on every Player object (see
+        # _reset_players_for_new_session for why this is needed).
+        self._reset_players_for_new_session()
 
         if self.tournament_system == "swiss":
             self.show_swiss_round()
