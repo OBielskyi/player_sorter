@@ -1157,7 +1157,6 @@ class PlayerSorterApp:
             # View-only: go straight to round-by-round viewer
             self.show_round_by_round_viewer(
                 self.tournament_history,
-                readonly=True,
                 return_to=self.show_load_tournament_screen,
             )
         else:
@@ -5653,7 +5652,6 @@ class PlayerSorterApp:
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
                 self.tournament_history,
-                readonly=True,
                 return_to=self.show_scheveningen_final,
             ),
         ).pack(side=tk.LEFT, padx=5)
@@ -6481,7 +6479,6 @@ class PlayerSorterApp:
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
                 self.tournament_history,
-                readonly=True,
                 return_to=self.show_tournament_final_standings,
             ),
         ).pack(side=tk.LEFT, padx=5)
@@ -6534,7 +6531,6 @@ class PlayerSorterApp:
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
                 self.tournament_history,
-                readonly=True,
                 return_to=lambda: self.show_tournament_winner(winner),
             ),
         ).pack(side=tk.LEFT, padx=5)
@@ -7143,12 +7139,9 @@ class PlayerSorterApp:
 
     # ============ END HTML EXPORT ============
 
-    def show_round_by_round_viewer(
-        self, history: list, readonly: bool = True, return_to=None
-    ):
-        """Display a round-by-round viewer.
+    def show_round_by_round_viewer(self, history: list, return_to=None):
+        """Display a round-by-round viewer for a finished tournament.
         history: list of round dicts (from tournament_history or loaded file).
-        readonly: if True, no resume button is shown.
         return_to: optional no-arg callable for the "Back" button to invoke
             instead of jumping to the main menu. Callers should pass the
             screen the viewer was opened from (e.g. the final-standings
