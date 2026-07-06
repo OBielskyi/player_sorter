@@ -12,6 +12,7 @@ Supports Chess (ELO) and E-sports (Trophies) with three modes:
 import csv
 import datetime
 import filecmp
+import html
 import json
 import os
 import pathlib
@@ -1070,6 +1071,16 @@ class PlayerSorterApp:
             filepath = selected[0]
             self._export_csv_from_filepath(filepath)
 
+        def on_export_html():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to export."
+                )
+                return
+            filepath = selected[0]
+            self._export_html_from_filepath(filepath)
+
         def on_delete():
             selected = tree.selection()
             if not selected:
@@ -1115,6 +1126,11 @@ class PlayerSorterApp:
             btn_frame,
             text="📄 Export as CSV",
             command=on_export,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="🌐 Export as HTML",
+            command=on_export_html,
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
@@ -6755,6 +6771,368 @@ class PlayerSorterApp:
 
     # ============ END CSV EXPORT ============
 
+    # ============ HTML EXPORT ============
+
+    def _html_theme_css(self) -> str:
+        """Build a <style> block from the currently selected in-app theme, so
+        exported HTML tournament reports visually match the app itself.
+
+        Uses the same THEMES.get(..., THEMES["Simple Light"]) fallback
+        pattern used everywhere else in the app for consistency.
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+        return f"""
+        :root {{
+            --bg: {theme['bg']};
+            --fg: {theme['fg']};
+            --border: {theme['border']};
+            --title-fg: {theme['title_fg']};
+            --subtitle-fg: {theme['subtitle_fg']};
+            --button-bg: {theme['button_bg']};
+            --button-fg: {theme['button_fg']};
+            --accent-bg: {theme['accent_button_bg']};
+            --select-bg: {theme['select_bg']};
+            --select-fg: {theme['select_fg']};
+        }}
+        * {{ box-sizing: border-box; }}
+        body {{
+            background: var(--bg);
+            color: var(--fg);
+            font-family: "Segoe UI", Arial, sans-serif;
+            margin: 0;
+            padding: 24px 32px 48px;
+            line-height: 1.4;
+        }}
+        h1 {{
+            color: var(--title-fg);
+            font-size: 26px;
+            margin-bottom: 4px;
+        }}
+        h2 {{
+            color: var(--title-fg);
+            border-bottom: 2px solid var(--accent-bg);
+            padding-bottom: 6px;
+            margin-top: 40px;
+        }}
+        h3 {{
+            color: var(--subtitle-fg);
+            margin-top: 24px;
+            margin-bottom: 8px;
+        }}
+        .subtitle {{ color: var(--subtitle-fg); margin-top: 0; }}
+        table.meta-table {{ border-collapse: collapse; margin: 12px 0 28px; }}
+        table.meta-table td {{ padding: 4px 16px 4px 0; }}
+        table.meta-table td.meta-label {{ color: var(--subtitle-fg); font-weight: 600; }}
+        table.data {{
+            border-collapse: collapse;
+            width: 100%;
+            margin-bottom: 12px;
+        }}
+        table.data th, table.data td {{
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            text-align: left;
+            font-size: 14px;
+        }}
+        table.data th {{
+            background: var(--button-bg);
+            color: var(--button-fg);
+        }}
+        table.data tr.rank-1 td {{
+            background: var(--select-bg);
+            color: var(--select-fg);
+            font-weight: 700;
+        }}
+        .status-inactive {{ color: var(--subtitle-fg); font-style: italic; }}
+        details.round-block {{
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 16px;
+            margin-bottom: 16px;
+        }}
+        details.round-block > summary {{
+            cursor: pointer;
+            font-weight: 700;
+            color: var(--title-fg);
+            font-size: 16px;
+        }}
+        footer {{
+            margin-top: 40px;
+            color: var(--subtitle-fg);
+            font-size: 12px;
+        }}
+        """
+
+    def export_tournament_to_html(self, history: list, meta: dict = None) -> None:
+        """Export tournament history to a user-chosen, self-contained HTML file.
+
+        Mirrors export_tournament_to_csv() section-for-section (tournament
+        info, final standings, then per-round pairings/standings) so the two
+        exports always describe the same data. Styled inline (no external
+        CSS/JS/fonts) to match the app's currently selected theme, keeping
+        the file fully offline-viewable in line with the app's own
+        zero-dependency design.
+
+        Like CSV export, this is only wired up for the four Tournament-mode
+        systems (Swiss, Round-Robin, Knockout, Scheveningen) - the only
+        systems that populate tournament_history. Dual, Battle Royale, and
+        Teams modes have no history and are out of scope here, same as CSV.
+
+        Parameters
+        ----------
+        history : list
+            List of round dicts (same structure as ``tournament_history``).
+        meta : dict, optional
+            Extra metadata fields. Expected keys (all optional):
+            ``tournament_system``, ``tournament_start_time``, ``finished``,
+            ``tiebreak_method``, ``current_round``.
+        """
+        if not history:
+            messagebox.showinfo("No Data", "No round history available to export.")
+            return
+
+        if meta is None:
+            meta = {}
+
+        # Build a sensible default filename ─────────────────────────────────
+        system = meta.get("tournament_system") or "tournament"
+        timestamp = (meta.get("tournament_start_time") or "").replace(":", "-").replace(" ", "_")
+        hint = (
+            f"tournament_{timestamp}_{system}_export"
+            if timestamp
+            else f"tournament_{system}_export"
+        )
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+            initialfile=hint,
+            title="Export Tournament as HTML",
+        )
+        if not save_path:
+            return  # User cancelled
+
+        # Display-friendly labels ────────────────────────────────────────────
+        system_display = {
+            "swiss": "Swiss System",
+            "round_robin": "Round-Robin",
+            "knockout": "Knockout",
+            "scheveningen": "Scheveningen",
+        }.get(system, system.replace("_", " ").title())
+
+        tiebreak_raw = meta.get("tiebreak_method") or ""
+        tiebreak_display = {
+            "buchholz": "Buchholz",
+            "sonneborn_berger": "Sonneborn-Berger",
+            "direct_encounter": "Direct Encounter",
+            "rating": "Rating",
+        }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
+
+        result_map = {
+            "p1_win": "1 – 0",
+            "p2_win": "0 – 1",
+            "draw": "½ – ½",
+            "bye": "BYE (+1 pt)",
+            "half_bye": "HALF-BYE (+0.5 pt)",
+        }
+
+        is_schev = (system == "scheveningen")
+        esc = html.escape
+
+        def cell(value) -> str:
+            """Escape a value for safe HTML display. Mirrors the CSV export's
+            "—" fallback for missing/None values, but is careful not to treat
+            a genuine 0 (e.g. 0 wins, 0 points) as "missing"."""
+            if value is None or value == "":
+                return "—"
+            return esc(str(value))
+
+        def standings_table(standings: list, include_rating: bool) -> str:
+            """Render a standings snapshot as an HTML table.
+
+            include_rating controls whether an ELO column is shown - the CSV
+            export only includes it in the FINAL standings section, not in
+            the per-round "standings after round" sections, so this mirrors
+            that exactly rather than showing it everywhere.
+            """
+            headers = ["Rank"]
+            if is_schev:
+                headers.append("Team")
+            headers.append("Name")
+            if include_rating:
+                headers.append("ELO")
+            headers += [
+                "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                "Tiebreak", "Status",
+            ]
+            header_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
+
+            body_rows = []
+            for s in standings:
+                status = s.get("status", "")
+                row_class = ' class="rank-1"' if s.get("rank") == 1 else ""
+
+                values = [s.get("rank")]
+                if is_schev:
+                    values.append(s.get("team"))
+                values.append(s.get("name"))
+                if include_rating:
+                    values.append(s.get("rating"))
+                values += [
+                    s.get("points"), s.get("wins"), s.get("losses"),
+                    s.get("draws"), s.get("byes"), s.get("half_byes"),
+                    s.get("tiebreak"),
+                ]
+
+                tds = "".join(f"<td>{cell(v)}</td>" for v in values)
+                status_class = (
+                    ' class="status-inactive"' if status and status != "Active" else ""
+                )
+                tds += f"<td{status_class}>{cell(status)}</td>"
+
+                body_rows.append(f"<tr{row_class}>{tds}</tr>")
+
+            return (
+                '<table class="data">'
+                f"<thead><tr>{header_html}</tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody>"
+                "</table>"
+            )
+
+        def pairings_table(pairings: list) -> str:
+            header_html = "".join(
+                f"<th>{esc(h)}</th>"
+                for h in ["Board", "Player 1 (White)", "Result", "Player 2 (Black)"]
+            )
+            body_rows = []
+            for p in pairings:
+                p2_disp = p.get("player2") if p.get("player2") else "—"
+                res_disp = result_map.get(p.get("result"), p.get("result"))
+                tds = "".join(
+                    f"<td>{cell(v)}</td>"
+                    for v in [p.get("board"), p.get("player1"), res_disp, p2_disp]
+                )
+                body_rows.append(f"<tr>{tds}</tr>")
+            return (
+                '<table class="data">'
+                f"<thead><tr>{header_html}</tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody>"
+                "</table>"
+            )
+
+        try:
+            parts = [
+                "<!DOCTYPE html>",
+                '<html lang="en">',
+                "<head>",
+                '<meta charset="utf-8">',
+                f"<title>{esc(system_display)} Tournament Export</title>",
+                f"<style>{self._html_theme_css()}</style>",
+                "</head>",
+                "<body>",
+                f"<h1>{esc(system_display)} — Tournament Export</h1>",
+                '<p class="subtitle">Exported from Player Sorter</p>',
+            ]
+
+            # ── Section 1: Tournament metadata ───────────────────────────
+            start_raw = meta.get("tournament_start_time") or ""
+            parts.append("<h2>Tournament Info</h2>")
+            parts.append('<table class="meta-table">')
+            parts.append(
+                f'<tr><td class="meta-label">System</td>'
+                f'<td>{cell(system_display)}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Start Time</td>'
+                f'<td>{cell(start_raw.replace("_", " "))}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Status</td>'
+                f'<td>{cell("Finished" if meta.get("finished", True) else "Unfinished")}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Tiebreak Method</td>'
+                f'<td>{cell(tiebreak_display)}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Total Rounds Played</td>'
+                f'<td>{cell(meta.get("current_round", len(history)))}</td></tr>'
+            )
+            parts.append("</table>")
+
+            # ── Section 2: Final standings ────────────────────────────────
+            parts.append("<h2>Final Standings</h2>")
+            last_round = history[-1]
+            standings = last_round.get("standings_after_round", [])
+            parts.append(standings_table(standings, include_rating=True))
+
+            # ── Section 3+: Per-round details ─────────────────────────────
+            parts.append("<h2>Round-by-Round Details</h2>")
+            for rnd in history:
+                rnum = rnd.get("round_number")
+                parts.append('<details class="round-block" open>')
+                parts.append(f"<summary>Round {esc(str(rnum))}</summary>")
+
+                parts.append(f"<h3>Round {esc(str(rnum))} – Pairings</h3>")
+                parts.append(pairings_table(rnd.get("pairings", [])))
+
+                parts.append(f"<h3>Round {esc(str(rnum))} – Standings After Round</h3>")
+                round_standings = rnd.get("standings_after_round", [])
+                parts.append(standings_table(round_standings, include_rating=False))
+
+                parts.append("</details>")
+
+            parts.append(
+                "<footer>Generated by Player Sorter — "
+                f'{esc(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))}</footer>'
+            )
+            parts.append("</body>")
+            parts.append("</html>")
+
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(parts))
+
+            messagebox.showinfo(
+                "Export Successful", f"Tournament exported to:\n{save_path}"
+            )
+
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not write HTML file:\n{exc}")
+
+    def _export_html_from_filepath(self, filepath: str) -> None:
+        """Load a saved tournament JSON file and export its history to HTML.
+
+        Used by the Load Tournament screen so the user can export a tournament
+        without having to open it first. Mirrors _export_csv_from_filepath().
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read tournament file:\n{exc}")
+            return
+
+        history = data.get("tournament_history", [])
+        if not history:
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+
+        meta = {
+            "tournament_system": data.get("tournament_system"),
+            "tournament_start_time": data.get("tournament_start_time", ""),
+            "finished": data.get("finished", False),
+            "tiebreak_method": data.get("tiebreak_method", ""),
+            "current_round": data.get("current_round", len(history)),
+        }
+        self.export_tournament_to_html(history, meta)
+
+    # ============ END HTML EXPORT ============
+
     def show_round_by_round_viewer(self, history: list, readonly: bool = True):
         """Display a round-by-round viewer.
         history: list of round dicts (from tournament_history or loaded file).
@@ -6912,6 +7290,22 @@ class PlayerSorterApp:
             btn_frame,
             text="📄 Export as CSV",
             command=lambda: self.export_tournament_to_csv(
+                history,
+                {
+                    "tournament_system": getattr(self, "tournament_system", None),
+                    "tournament_start_time": getattr(
+                        self, "tournament_start_time", ""
+                    ),
+                    "finished": True,
+                    "tiebreak_method": getattr(self, "tiebreak_method", None),
+                    "current_round": getattr(self, "current_round", len(history)),
+                },
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="🌐 Export as HTML",
+            command=lambda: self.export_tournament_to_html(
                 history,
                 {
                     "tournament_system": getattr(self, "tournament_system", None),
