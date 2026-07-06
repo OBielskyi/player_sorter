@@ -986,7 +986,9 @@ class PlayerSorterApp:
         # behind the error messagebox instead of stranding the user on a
         # blank window with no way back.
         if len(file_entries) == 1:
-            self._open_tournament_entry(file_entries[0])
+            self._open_tournament_entry(
+                file_entries[0], return_to=self.show_initial_selection
+            )
             return
 
         # Otherwise display list for user to choose from
@@ -1139,7 +1141,7 @@ class PlayerSorterApp:
             command=on_load,
         ).pack(side=tk.LEFT, padx=5)
 
-    def _open_tournament_entry(self, entry: dict):
+    def _open_tournament_entry(self, entry: dict, return_to=None):
         """Load a tournament file and dispatch to viewer or resumption.
 
         clear_window() is called here, AFTER a successful load, rather than
@@ -1147,6 +1149,16 @@ class PlayerSorterApp:
         file, permission error, etc.) leaves whatever screen the user was
         on (e.g. the Load Tournament list) visible behind the error
         messagebox, instead of leaving a blank window with no way back.
+
+        return_to: optional override for the viewer's "Back" target. Callers
+            that bypass the Load Tournament list (e.g. the single-file
+            auto-load shortcut in show_load_tournament_screen) must pass an
+            explicit return_to here — defaulting to show_load_tournament_screen
+            would send "Back" straight into another single-file auto-load,
+            reopening this same viewer in an infinite loop with no way to
+            reach the main menu. Defaults to show_load_tournament_screen,
+            which is correct when the user actually picked this entry from
+            a visible list.
         """
         success = self.load_tournament_from_file(entry["filepath"])
         if not success:
@@ -1157,7 +1169,7 @@ class PlayerSorterApp:
             # View-only: go straight to round-by-round viewer
             self.show_round_by_round_viewer(
                 self.tournament_history,
-                return_to=self.show_load_tournament_screen,
+                return_to=return_to if return_to else self.show_load_tournament_screen,
             )
         else:
             # Resume: advance to the next round
