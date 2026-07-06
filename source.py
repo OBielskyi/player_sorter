@@ -1155,7 +1155,11 @@ class PlayerSorterApp:
         self.clear_window()
         if entry["finished"]:
             # View-only: go straight to round-by-round viewer
-            self.show_round_by_round_viewer(self.tournament_history, readonly=True)
+            self.show_round_by_round_viewer(
+                self.tournament_history,
+                readonly=True,
+                return_to=self.show_load_tournament_screen,
+            )
         else:
             # Resume: advance to the next round
             self._resume_unfinished_tournament()
@@ -5648,7 +5652,9 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                readonly=True,
+                return_to=self.show_scheveningen_final,
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -6474,7 +6480,9 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                readonly=True,
+                return_to=self.show_tournament_final_standings,
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -6525,7 +6533,9 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                readonly=True,
+                return_to=lambda: self.show_tournament_winner(winner),
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -7133,10 +7143,20 @@ class PlayerSorterApp:
 
     # ============ END HTML EXPORT ============
 
-    def show_round_by_round_viewer(self, history: list, readonly: bool = True):
+    def show_round_by_round_viewer(
+        self, history: list, readonly: bool = True, return_to=None
+    ):
         """Display a round-by-round viewer.
         history: list of round dicts (from tournament_history or loaded file).
         readonly: if True, no resume button is shown.
+        return_to: optional no-arg callable for the "Back" button to invoke
+            instead of jumping to the main menu. Callers should pass the
+            screen the viewer was opened from (e.g. the final-standings
+            screen, the winner screen, or the Load Tournament list) so "Back"
+            actually goes back, rather than stranding the user on the main
+            menu with no way to return to (and save) the tournament they
+            were just looking at. Falls back to show_initial_selection() if
+            not given.
         """
         if not history:
             messagebox.showinfo("No Data", "No round history available to display.")
@@ -7283,9 +7303,16 @@ class PlayerSorterApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=10)
 
-        ttk.Button(btn_frame, text="← Back", command=self.show_initial_selection).pack(
-            side=tk.LEFT, padx=5
-        )
+        ttk.Button(
+            btn_frame,
+            text="← Back",
+            command=return_to if return_to else self.show_initial_selection,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
             text="📄 Export as CSV",
