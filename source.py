@@ -19,9 +19,69 @@ import pathlib
 import random
 import re
 import shutil
+import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 from tkinter import filedialog, messagebox, ttk
 from typing import List
+
+# ── Version / update-check constants ──────────────────────────────────────────
+# Bump this on every release. Used solely to compare against the latest GitHub
+# release tag to power the startup "Update available" check below.
+__version__ = "2.4.0"
+
+# owner/repo slug for the GitHub API's "latest release" endpoint. That endpoint
+# already resolves to the newest non-draft, non-prerelease release, so no
+# extra prerelease-filtering logic is needed on our end.
+_GITHUB_REPO = "OBielskyi/player_sorter"
+_GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_GITHUB_LATEST_RELEASE_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest/"
+
+# JSON file that persists the "Don't show this again" update-notification choice
+_UPDATE_SETTINGS_FILE = "player_sorter_update_settings.json"
+
+
+def _parse_version(version_str: str) -> tuple:
+    """Parse a version string like "v2.3.0" or "2.3.0" into a tuple of ints,
+    e.g. (2, 3, 0), for numeric comparison (so "2.10.0" correctly sorts after
+    "2.9.0" instead of being compared as strings).
+
+    Non-numeric/unparseable segments are ignored; an entirely unparseable or
+    empty string returns an empty tuple, which _is_version_newer() treats as
+    "older than everything" - matching the requirement that a missing/unknown
+    current version should be treated as obviously out of date.
+    """
+    if not version_str:
+        return ()
+    cleaned = version_str.strip().lstrip("vV")
+    parts = []
+    for segment in cleaned.split("."):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _is_version_newer(latest_str: str, current_str: str) -> bool:
+    """Return True if latest_str is a newer version than current_str.
+
+    An unparseable/missing current_str is always treated as out of date
+    (returns True, as long as latest_str parses to something at all).
+    """
+    latest = _parse_version(latest_str)
+    current = _parse_version(current_str)
+    if not latest:
+        return False  # Couldn't parse the remote version; don't claim an update exists.
+    if not current:
+        return True  # No usable local version - assume outdated, per design.
+    # Pad the shorter tuple with zeros so (2, 4) vs (2, 4, 0) compares equal.
+    length = max(len(latest), len(current))
+    latest_padded = latest + (0,) * (length - len(latest))
+    current_padded = current + (0,) * (length - len(current))
+    return latest_padded > current_padded
+
 
 # Theme definitions
 THEMES = {
@@ -485,6 +545,9 @@ class PlayerSorterApp:
         # Tournaments directory (one-time, silent, happens before first render).
         _migrate_cwd_tournaments()
 
+        # Non-blocking background check for a newer stable GitHub release.
+        self._check_for_updates()
+
         self.show_theme_selection()
 
     def _toggle_fullscreen(self, event=None):
@@ -537,6 +600,171 @@ class PlayerSorterApp:
                 json.dump({"scale_pct": scale_pct}, fh)
         except (OSError, TypeError):
             pass  # Non-fatal — just skip saving
+
+    # ── Update-check helpers ────────────────────────────────────────────────
+
+    def _load_dismissed_update_version(self):
+        """Return the version string the user last dismissed via "Don't show
+        this again", or None if they've never dismissed one (or the pref
+        file is missing/corrupt). Storing the specific version - rather than
+        a permanent on/off switch - means dismissing v2.5.0 only silences
+        v2.5.0; a future v2.6.0 will still trigger the notification.
+        """
+        try:
+            if os.path.exists(_UPDATE_SETTINGS_FILE):
+                with open(_UPDATE_SETTINGS_FILE, "r") as fh:
+                    data = json.load(fh)
+                dismissed = data.get("dismissed_version")
+                return dismissed if isinstance(dismissed, str) and dismissed else None
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def _save_dismissed_update_version(self, version: str) -> None:
+        """Persist the specific version the user chose to dismiss."""
+        try:
+            with open(_UPDATE_SETTINGS_FILE, "w") as fh:
+                json.dump({"dismissed_version": version}, fh)
+        except (OSError, TypeError):
+            pass  # Non-fatal - just skip saving.
+
+    def _check_for_updates(self) -> None:
+        """Kick off a background check against the GitHub API for a newer
+        stable release. Entirely non-blocking: runs on a daemon thread, and
+        any network failure (no internet, DNS failure, GitHub rate limit,
+        timeout, malformed response, etc.) is swallowed silently - this check
+        should never interrupt startup or show an error to the user.
+
+        Always runs (even if a version was previously dismissed) since the
+        only way to know whether an even-newer version has since shipped is
+        to actually check; the dismissal is only compared against the result
+        once it's back, inside _fetch_latest_release_and_maybe_notify().
+        """
+        threading.Thread(
+            target=self._fetch_latest_release_and_maybe_notify, daemon=True
+        ).start()
+
+    def _fetch_latest_release_and_maybe_notify(self) -> None:
+        """Runs on a background thread. Fetches the latest release tag from
+        GitHub and, if it's newer than __version__ (or __version__ is
+        missing/unparseable) AND isn't the specific version the user already
+        dismissed, schedules the notification dialog back onto the main
+        thread via root.after() - tkinter widgets must only be touched from
+        the main thread.
+        """
+        try:
+            request = urllib.request.Request(
+                _GITHUB_LATEST_RELEASE_API,
+                headers={
+                    # GitHub's API rejects requests with no User-Agent header.
+                    "User-Agent": "PlayerSorter-UpdateCheck",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            latest_tag = data.get("tag_name", "")
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            ValueError,
+            OSError,
+        ):
+            return  # No internet, GitHub unreachable/rate-limited, bad JSON, etc.
+
+        current_version = globals().get("__version__", "")
+        if not _is_version_newer(latest_tag, current_version):
+            return  # Already up to date (or the response was unparseable).
+
+        dismissed = self._load_dismissed_update_version()
+        # Compare parsed version tuples, not raw strings, so "v2.5.0" (from
+        # GitHub) correctly matches a dismissal saved as "2.5.0".
+        if dismissed is not None and _parse_version(latest_tag) == _parse_version(dismissed):
+            return  # User already dismissed exactly this version.
+
+        latest_display = latest_tag.strip().lstrip("vV") or latest_tag
+        self.root.after(0, lambda: self._show_update_notification(latest_display))
+
+    def _show_update_notification(self, latest_version: str) -> None:
+        """Show a popup dialog telling the user a newer stable release is
+        available, with the current/latest version numbers, a copyable link
+        to the GitHub releases page, and a "Don't show this again" checkbox
+        (which silences only this specific version, not future ones).
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Update Available")
+        dialog.configure(bg=theme["bg"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        container = tk.Frame(dialog, bg=theme["bg"], padx=24, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container,
+            text="A new version of Player Sorter is available!",
+            font=("Segoe UI", 13, "bold"),
+            bg=theme["bg"],
+            fg=theme["title_fg"],
+            wraplength=380,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        current_version = globals().get("__version__", "") or "unknown"
+        tk.Label(
+            container,
+            text=f"Current version: {current_version}\nLatest version:  {latest_version}",
+            font=("Segoe UI", 10),
+            bg=theme["bg"],
+            fg=theme["fg"],
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(10, 10))
+
+        tk.Label(
+            container,
+            text="Release link (select and copy):",
+            font=("Segoe UI", 9),
+            bg=theme["bg"],
+            fg=theme["subtitle_fg"],
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        link_entry = tk.Entry(
+            container,
+            font=("Segoe UI", 10),
+            justify=tk.LEFT,
+            width=48,
+        )
+        link_entry.insert(0, _GITHUB_LATEST_RELEASE_URL)
+        link_entry.config(state="readonly")
+        link_entry.pack(anchor=tk.W, pady=(2, 14), fill=tk.X)
+        # Pre-select the link text so the user can copy it with one Ctrl+C.
+        link_entry.selection_range(0, tk.END)
+
+        dont_show_again_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            container,
+            text="Don't show this again",
+            variable=dont_show_again_var,
+        ).pack(anchor=tk.W, pady=(0, 14))
+
+        def on_close():
+            if dont_show_again_var.get():
+                self._save_dismissed_update_version(latest_version)
+            dialog.destroy()
+
+        ttk.Button(container, text="OK", command=on_close).pack(anchor=tk.E)
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        # Center the dialog over the main window.
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def _get_base_scaling(self) -> float:
         """Get the baseline scaling factor for this platform."""
