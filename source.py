@@ -7040,7 +7040,15 @@ class PlayerSorterApp:
             --select-bg: {theme['select_bg']};
             --select-fg: {theme['select_fg']};
         }}
-        * {{ box-sizing: border-box; }}
+        * {{
+            box-sizing: border-box;
+            /* Without this, browsers strip background colors when printing/
+               saving as PDF by default, so themed exports would print as
+               plain white regardless of which theme was selected. */
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+            color-adjust: exact;
+        }}
         body {{
             background: var(--bg);
             color: var(--fg);
@@ -7066,6 +7074,22 @@ class PlayerSorterApp:
             margin-bottom: 8px;
         }}
         .subtitle {{ color: var(--subtitle-fg); margin-top: 0; }}
+        .print-btn {{
+            background: var(--button-bg);
+            color: var(--button-fg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+            margin: 12px 0 8px;
+        }}
+        .print-btn:hover {{ opacity: 0.85; }}
+        @media print {{
+            /* Don't include the on-screen print button in the printed
+               output/PDF itself. */
+            .no-print {{ display: none !important; }}
+        }}
         table.meta-table {{ border-collapse: collapse; margin: 12px 0 28px; }}
         table.meta-table td {{ padding: 4px 16px 4px 0; }}
         table.meta-table td.meta-label {{ color: var(--subtitle-fg); font-weight: 600; }}
@@ -7278,6 +7302,8 @@ class PlayerSorterApp:
                 "<body>",
                 f"<h1>{esc(system_display)} — Tournament Export</h1>",
                 '<p class="subtitle">Exported from Player Sorter</p>',
+                '<button class="print-btn no-print" onclick="window.print()">'
+                "🖨️ Print / Save as PDF</button>",
             ]
 
             # ── Section 1: Tournament metadata ───────────────────────────
