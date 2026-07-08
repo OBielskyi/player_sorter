@@ -432,6 +432,14 @@ class Player:
         # degrade gracefully (treat unknown results as contributing 0)
         # rather than raising.
         self.results_vs_opponents = []
+        # Colour played in each REAL game (never for byes/half-byes, which
+        # FIDE treats as colourless), parallel to `opponents` /
+        # `results_vs_opponents`: "white" or "black" per entry. Used to
+        # compute colour balance/streak for Chess Colour Balancing. Old
+        # saves won't have this - defaults to [] and every consumer below
+        # degrades gracefully (treats a player with no colour history as
+        # having no preference yet) rather than crashing.
+        self.colors = []
         self.requested_half_bye = False  # For current round
 
     @property
@@ -480,6 +488,21 @@ class Player:
     def games_played(self):
         """Games actually played (excluding byes and half-byes)"""
         return self.wins + self.losses + self.draws
+
+    @property
+    def white_games(self):
+        """Number of REAL games played with White (byes are colourless)"""
+        return self.colors.count("white")
+
+    @property
+    def black_games(self):
+        """Number of REAL games played with Black (byes are colourless)"""
+        return self.colors.count("black")
+
+    @property
+    def color_difference(self):
+        """White games minus Black games (FIDE 'colour difference')"""
+        return self.white_games - self.black_games
 
 
 class PlayerSorterApp:
@@ -3177,6 +3200,7 @@ class PlayerSorterApp:
                     "withdrawal_round": player.withdrawal_round,
                     "opponents": player.opponents,
                     "results_vs_opponents": player.results_vs_opponents,
+                    "colors": player.colors,
                     "requested_half_bye": player.requested_half_bye,
                 }
             )
@@ -3207,6 +3231,9 @@ class PlayerSorterApp:
             ],
             "schev_team_a_names": schev_team_a_names,
             "schev_team_b_names": schev_team_b_names,
+            "schev_team_a_white_first": getattr(
+                self, "schev_team_a_white_first", None
+            ),
             "players": players_data,
             "tournament_history": getattr(self, "tournament_history", []),
         }
@@ -3306,9 +3333,14 @@ class PlayerSorterApp:
         self.schev_round = data.get("schev_round") or 0
         self.schev_total_rounds = data.get("schev_total_rounds") or 0
         self.scheveningen_team_size = data.get("scheveningen_team_size") or 0
+        self.schev_team_a_white_first = data.get("schev_team_a_white_first")
 
         # Restore round-robin stable round count (0 means "not set / old save")
         self.round_robin_total_rounds = data.get("round_robin_total_rounds") or 0
+        # The colour plan is deterministic from order + total_rounds, so it's
+        # cheap and safest to just recompute it lazily rather than trust
+        # anything left over in memory from a different tournament.
+        self.round_robin_color_plan = None
 
         # Restore players
         self.players = []
@@ -3346,6 +3378,14 @@ class PlayerSorterApp:
                     len(player.opponents) - len(results_vs_opponents)
                 )
             player.results_vs_opponents = results_vs_opponents
+            # Old saves won't have this either; pad the same way. A
+            # missing/unrecognised entry is treated as "no colour info"
+            # for that game by every consumer (_color_preference etc.),
+            # rather than crashing or silently miscounting.
+            colors = pd.get("colors", [])
+            if len(colors) < len(player.opponents):
+                colors = colors + [None] * (len(player.opponents) - len(colors))
+            player.colors = colors
             player.requested_half_bye = pd.get("requested_half_bye", False)
             self.players.append(player)
             player_map.setdefault(player.name, []).append(player)
@@ -5098,6 +5138,9 @@ class PlayerSorterApp:
             # and withdrawals are handled later by substituting byes into that
             # round's OUTPUT, not by removing anyone from this list.
             self.round_robin_player_order = list(self.players)
+            # New tournament - any cached colour plan from a previous
+            # Round-Robin tournament this session must not carry over.
+            self.round_robin_color_plan = None
             self.show_round_robin_round()
         elif self.tournament_system == "knockout":
             self.show_knockout_round()
@@ -5126,6 +5169,146 @@ class PlayerSorterApp:
         # Display pairings
         self.display_tournament_pairings(frame, pairings, "swiss")
 
+    # ===== COLOUR BALANCING (Chess tournament formats only) =====
+    #
+    # Applied to Swiss, Round-Robin, Knockout and Scheveningen. Modelled
+    # on the FIDE colour-allocation rules (FIDE Handbook C.04.1/C.04.3):
+    #   - A bye/half-bye is colourless: it neither counts towards the
+    #     White/Black balance nor breaks a same-colour streak.
+    #   - A player's "colour preference" for their next REAL game is:
+    #       * ABSOLUTE if their colour difference (white - black) is
+    #         already +/-2 or worse, or if their last two real games
+    #         were the same colour (never allow a 3rd in a row).
+    #       * otherwise a soft preference: the colour that would even
+    #         out the difference, or - if already even - whichever
+    #         colour they didn't just play (alternation).
+    #   - When assigning colours for an already-decided pair: an
+    #     absolute preference always wins; if both have one (shouldn't
+    #     normally happen - see _colors_conflict below), the player with
+    #     the bigger need wins and the other accepts a documented
+    #     exception (mirrors FIDE C.04.1 #6/#7, which allow rare
+    #     exceptions when there's no legal alternative); otherwise ties
+    #     are broken by alternating from these two players' most recent
+    #     meeting, then by rating, then - if truly no information exists
+    #     (e.g. round 1) - by a coin flip ("drawing of lots", the actual
+    #     FIDE round-1 rule).
+    def _color_preference(self, player):
+        """Return (preferred_color, is_absolute, is_streak) for a
+        player's next real game. preferred_color is 'white', 'black', or
+        None (no games played yet, or - defensively - unrecognised
+        data). is_streak marks the specific case where the preference is
+        absolute because they'd otherwise get a 3rd-in-a-row - this is
+        treated as more urgent than merely being at the +/-2 colour
+        difference boundary when resolving a genuine conflict (see
+        _assign_colors), since FIDE's own wording singles out "same
+        colour three times in a row" ("no participant shall receive...")
+        as the one exception-averse case, whereas a +/-2 difference is
+        already explicitly tolerated."""
+        colors = player.colors
+        if not colors:
+            return None, False, False
+        if len(colors) >= 2 and colors[-1] == colors[-2]:
+            # Same colour last two real games -> must switch (absolute)
+            return ("black" if colors[-1] == "white" else "white"), True, True
+        diff = player.color_difference
+        if diff >= 2:
+            return "black", True, False
+        if diff <= -2:
+            return "white", True, False
+        if diff == 1:
+            return "black", False, False
+        if diff == -1:
+            return "white", False, False
+        # Perfectly balanced: alternate from the last real game played
+        return ("black" if colors[-1] == "white" else "white"), False, False
+
+    def _colors_conflict(self, a, b):
+        """True if both players have an ABSOLUTE preference for the same
+        colour, meaning no matter how we assign this pair, one of them
+        must take a documented exception. Used as a secondary (softer
+        than repeat-opponent-avoidance) constraint in Swiss pairing, so
+        the matcher tries to avoid creating such pairs in the first
+        place - matching FIDE C.04.3 [C3]."""
+        pref_a, abs_a, _ = self._color_preference(a)
+        pref_b, abs_b, _ = self._color_preference(b)
+        return abs_a and abs_b and pref_a == pref_b
+
+    def _last_color_vs(self, player, opponent_name):
+        """The colour `player` had the most recent time they played
+        `opponent_name`, or None if they've never met (or data is old)."""
+        for opp, col in zip(reversed(player.opponents), reversed(player.colors)):
+            if opp == opponent_name:
+                return col
+        return None
+
+    def _assign_colors(self, a, b):
+        """Decide who of (a, b) plays White vs Black for a game that has
+        already been decided as a pairing. Returns (white_player,
+        black_player)."""
+        pref_a, abs_a, streak_a = self._color_preference(a)
+        pref_b, abs_b, streak_b = self._color_preference(b)
+
+        # 1) An absolute preference wins over a non-absolute one.
+        if abs_a and not abs_b:
+            return (a, b) if pref_a == "white" else (b, a)
+        if abs_b and not abs_a:
+            return (b, a) if pref_b == "white" else (a, b)
+
+        # 2) Both absolute: if for different colours, trivial; if for
+        # the SAME colour (a genuine conflict - rare, and Swiss pairing
+        # tries hard to avoid ever creating this pair at all; in
+        # Round-Robin/Scheveningen, whose schedules are fixed, it can be
+        # genuinely unavoidable), give it to whoever needs it more:
+        # first, a streak-based need (would otherwise get a 3rd colour
+        # in a row) outranks a difference-based one (already tolerated
+        # up to +/-2 by FIDE); ties within that broken by bigger
+        # |colour difference|, then by rating.
+        if abs_a and abs_b:
+            if pref_a != pref_b:
+                return (a, b) if pref_a == "white" else (b, a)
+            if streak_a != streak_b:
+                winner, loser = (a, b) if streak_a else (b, a)
+            else:
+                need_a = abs(a.color_difference)
+                need_b = abs(b.color_difference)
+                if need_a != need_b:
+                    winner, loser = (a, b) if need_a > need_b else (b, a)
+                else:
+                    # Genuinely tied on every measure that should matter.
+                    # Deliberately NOT using rating here: a fixed,
+                    # deterministic tiebreak (e.g. "higher rated wins")
+                    # would mean the same player (e.g. whoever has the
+                    # single lowest rating in the field) loses every
+                    # future tie too, compounding into a long run of
+                    # forced same-colour exceptions for them specifically
+                    # - exactly what happened in testing. A coin flip
+                    # spreads exceptions around instead.
+                    winner, loser = (a, b) if random.random() < 0.5 else (b, a)
+            winner_pref, _, _ = self._color_preference(winner)
+            return (winner, loser) if winner_pref == "white" else (loser, winner)
+
+        # 3) Neither has an absolute preference. If they have opposite
+        # soft preferences, grant them.
+        if pref_a and pref_b and pref_a != pref_b:
+            return (a, b) if pref_a == "white" else (b, a)
+
+        # 4) Same soft preference (or one/both have none, e.g. round 1,
+        # or a perfectly-tied alternation) - alternate from the last
+        # time these two specific players met, if ever.
+        last = self._last_color_vs(a, b.name)
+        if last:
+            return (b, a) if last == "white" else (a, b)
+
+        # 5) Still nothing to go on - prefer the higher-rated player's
+        # soft preference if there is one...
+        if pref_a and not pref_b:
+            return (a, b) if pref_a == "white" else (b, a)
+        if pref_b and not pref_a:
+            return (b, a) if pref_b == "white" else (a, b)
+
+        # 6) ...otherwise (true round-1-style tie) decide by lot.
+        return (a, b) if random.random() < 0.5 else (b, a)
+
     def generate_swiss_pairings(self):
         """Generate Swiss system pairings"""
         active = [p for p in self.players if not p.eliminated and not p.withdrawn]
@@ -5149,7 +5332,12 @@ class PlayerSorterApp:
             bottom_half = playing_players[mid:]
 
             for i in range(min(len(top_half), len(bottom_half))):
-                pairings.append([top_half[i], bottom_half[i], None])
+                # No colour history exists yet, so who gets White is
+                # decided purely by lot (this is the actual FIDE round-1
+                # rule, not just a simplification).
+                a, b = top_half[i], bottom_half[i]
+                white, black = self._assign_colors(a, b)
+                pairings.append([white, black, None])
 
             # Handle odd number
             if len(playing_players) % 2 == 1:
@@ -5163,7 +5351,8 @@ class PlayerSorterApp:
                 if b is None:
                     pairings.append([a, None, "bye"])
                 else:
-                    pairings.append([a, b, None])
+                    white, black = self._assign_colors(a, b)
+                    pairings.append([white, black, None])
 
         return pairings
 
@@ -5189,6 +5378,16 @@ class PlayerSorterApp:
         handing out more than one bye - a repeat is the standard Swiss
         convention for an otherwise-unresolvable round, and is less
         disruptive than multiple simultaneous byes.
+
+        Colour balancing note: avoiding a repeat opponent still ranks
+        above colour concerns (matches FIDE C1 outranking C3), but right
+        below that we also try to avoid ever pairing two players who
+        BOTH have an absolute colour preference for the same colour
+        (_colors_conflict) - since if we do, one of them is guaranteed a
+        documented colour-rule exception no matter how colours are then
+        assigned. That's tried before we're willing to allow a repeat
+        opponent, and only given up on (in that order) if truly no legal
+        full pairing exists that avoids it.
         """
         # Hard safety cap: backtracking search is worst-case exponential.
         # Realistic Swiss fields (dozens of players, sparse "already
@@ -5199,12 +5398,15 @@ class PlayerSorterApp:
         # problem than the app freezing.
         call_budget = [20000]
 
-        def can_play(a, b, allow_repeats):
-            if allow_repeats:
-                return True
-            return b.name not in a.opponents and a.name not in b.opponents
+        def can_play(a, b, allow_repeats, avoid_color_conflicts):
+            if not allow_repeats:
+                if b.name in a.opponents or a.name in b.opponents:
+                    return False
+            if avoid_color_conflicts and self._colors_conflict(a, b):
+                return False
+            return True
 
-        def backtrack(remaining, allow_repeats):
+        def backtrack(remaining, allow_repeats, avoid_color_conflicts):
             call_budget[0] -= 1
             if call_budget[0] <= 0:
                 return None
@@ -5217,26 +5419,41 @@ class PlayerSorterApp:
             rest = remaining[1:]
 
             for i, candidate in enumerate(rest):
-                if can_play(first, candidate, allow_repeats):
+                if can_play(first, candidate, allow_repeats, avoid_color_conflicts):
                     new_remaining = rest[:i] + rest[i + 1 :]
-                    sub_result = backtrack(new_remaining, allow_repeats)
+                    sub_result = backtrack(
+                        new_remaining, allow_repeats, avoid_color_conflicts
+                    )
                     if sub_result is not None:
                         return [(first, candidate)] + sub_result
 
             # Odd-sized remaining group: `first` could be the bye instead
             # of being forced into one of the pairings tried above.
             if len(remaining) % 2 == 1:
-                sub_result = backtrack(rest, allow_repeats)
+                sub_result = backtrack(rest, allow_repeats, avoid_color_conflicts)
                 if sub_result is not None:
                     return [(first, None)] + sub_result
 
             return None
 
-        result = backtrack(list(playing_players), allow_repeats=False)
-        if result is None and call_budget[0] > 0:
-            # No pairing avoiding all repeats exists - allow a repeat
-            # rather than handing out extra byes.
-            result = backtrack(list(playing_players), allow_repeats=True)
+        result = None
+        # Tiers in descending priority: (no repeats, no colour conflicts)
+        # -> (no repeats, colour conflicts allowed) -> (repeats allowed,
+        # no colour conflicts) -> (repeats allowed, colour conflicts
+        # allowed). Each tier is only tried while budget remains.
+        for allow_repeats, avoid_color_conflicts in (
+            (False, True),
+            (False, False),
+            (True, True),
+            (True, False),
+        ):
+            if call_budget[0] <= 0:
+                break
+            result = backtrack(
+                list(playing_players), allow_repeats, avoid_color_conflicts
+            )
+            if result is not None:
+                break
         if result is None:
             # Either the safety cap was hit, or even allowing repeats
             # failed (shouldn't happen for an even count, but playing it
@@ -5264,6 +5481,116 @@ class PlayerSorterApp:
                     result.append((player, None))
                     paired.add(player.name)
         return result
+
+    def _compute_round_robin_color_plan(self, order, total_rounds):
+        """Precompute a colour assignment for EVERY game of a Round-Robin
+        tournament, assuming full attendance, and return it as a dict
+        {(round_idx_0_based, frozenset({name_a, name_b})): white_name}.
+
+        Why precompute instead of deciding colours round-by-round as they
+        happen (like Swiss does): unlike Swiss, a Round-Robin's entire
+        WHO-PLAYS-WHOM schedule for every round is already fully
+        determined at tournament start - it never depends on results.
+        That means colours can and should be planned for the whole event
+        at once rather than greedily round-by-round, because a greedy
+        per-round choice has no way to see that an easy, arbitrary
+        choice now (e.g. an unconstrained tie) will box a player into an
+        unavoidable same-colour-twice-in-a-row situation several rounds
+        later - and testing confirmed this actually happens occasionally
+        with a purely greedy approach, even with full attendance and an
+        even number of players. A full round-robin colouring that never
+        needs a 3rd-in-a-row exception is mathematically always
+        possible (this is exactly what published Berger tables
+        guarantee), so backtracking - trying the balance-preferred
+        colour first at each game, backing up when a later game turns
+        out to be impossible - is guaranteed to find a clean assignment,
+        and in practice needs little to no backtracking since the
+        balance-first heuristic already mirrors how Berger tables are
+        built.
+
+        Half-byes/withdrawals aren't modelled here (this assumes full
+        attendance) because they're requested round-by-round and can't
+        be known in advance; when an individual player's real history
+        ends up desynced from this plan by a bye, the caller falls back
+        to per-player override logic (see generate_round_robin_pairings)
+        exactly like Scheveningen does for the same reason.
+        """
+        n = len(order)
+        rotation_input = list(order)
+        if n % 2 == 1:
+            rotation_input.append(None)
+            n += 1
+
+        schedule = []  # list of rounds, each a list of (name_a, name_b)
+        rotated = rotation_input.copy()
+        for _ in range(total_rounds):
+            round_pairs = []
+            for i in range(n // 2):
+                pa, pb = rotated[i], rotated[n - 1 - i]
+                if pa is not None and pb is not None:
+                    round_pairs.append((pa.name, pb.name))
+            schedule.append(round_pairs)
+            rotated = [rotated[0]] + [rotated[-1]] + rotated[1:-1]
+
+        flat_games = [
+            (r_idx, a, b)
+            for r_idx, pairs in enumerate(schedule)
+            for (a, b) in pairs
+        ]
+
+        histories = {p.name: [] for p in order}
+
+        def would_violate(name, color):
+            """Mirrors _color_preference's definition of an ABSOLUTE
+            violation exactly (streak of 2, or already at the +/-2
+            colour-difference boundary) - the plan and the per-player
+            override check in generate_round_robin_pairings must always
+            agree on what counts as a violation, or the override ends up
+            fighting a plan that already thought it had this handled."""
+            h = histories[name]
+            if len(h) >= 2 and h[-1] == color and h[-2] == color:
+                return True
+            diff = h.count("white") - h.count("black")
+            new_diff = diff + (1 if color == "white" else -1)
+            return new_diff > 2 or new_diff < -2
+
+        plan = {}
+
+        def backtrack(idx):
+            if idx == len(flat_games):
+                return True
+            r_idx, a, b = flat_games[idx]
+            diff_a = histories[a].count("white") - histories[a].count("black")
+            diff_b = histories[b].count("white") - histories[b].count("black")
+            # Try giving White to whoever currently has fewer Whites
+            # relative to Blacks first - this single heuristic is enough
+            # to make backtracking essentially unnecessary in practice,
+            # since it's the same logic a Berger table encodes directly.
+            order_ab = diff_a <= diff_b
+            for white_is_a in (order_ab, not order_ab):
+                white_name, black_name = (a, b) if white_is_a else (b, a)
+                if would_violate(white_name, "white") or would_violate(
+                    black_name, "black"
+                ):
+                    continue
+                histories[white_name].append("white")
+                histories[black_name].append("black")
+                plan[(r_idx, frozenset((a, b)))] = white_name
+                if backtrack(idx + 1):
+                    return True
+                histories[white_name].pop()
+                histories[black_name].pop()
+                del plan[(r_idx, frozenset((a, b)))]
+            return False
+
+        if not backtrack(0):
+            # Mathematically shouldn't happen for a standard round-robin
+            # schedule, but if it somehow did, an empty plan makes every
+            # lookup miss, and the caller's per-player override logic
+            # (the same one used for bye-desync) becomes the sole
+            # decision-maker instead - degraded, but still safe.
+            return {}
+        return plan
 
     # ===== ROUND-ROBIN =====
 
@@ -5413,7 +5740,53 @@ class PlayerSorterApp:
                 pairings.append([p1, None, "bye"])
                 p2.requested_half_bye = False
             else:
-                pairings.append([p1, p2, None])
+                # Colour Balancing: look up this game's colour in the
+                # precomputed full-attendance plan (see
+                # _compute_round_robin_color_plan for why this is
+                # precomputed rather than decided greedily per round).
+                # Computed once and cached, keyed off the same stable
+                # round_robin_player_order the schedule itself is based
+                # on.
+                if getattr(self, "round_robin_color_plan", None) is None:
+                    self.round_robin_color_plan = self._compute_round_robin_color_plan(
+                        order, total_rounds
+                    )
+                plan_key = (round_idx, frozenset((p1.name, p2.name)))
+                planned_white_name = self.round_robin_color_plan.get(plan_key)
+
+                if planned_white_name == p1.name:
+                    default_white, default_black = p1, p2
+                elif planned_white_name == p2.name:
+                    default_white, default_black = p2, p1
+                else:
+                    # Plan lookup somehow missed (shouldn't normally
+                    # happen) - fall back to the general cascade.
+                    default_white, default_black = self._assign_colors(p1, p2)
+
+                # A half-bye/withdrawal earlier in the tournament can
+                # still desync an individual player's REAL colour
+                # history from what the full-attendance plan assumed for
+                # them. If honouring the plan's default here would force
+                # an absolute violation for either player, don't just
+                # swap the two colours - swapping to fix one player can
+                # just as easily create a brand new violation for the
+                # other (whoever wasn't a problem under the default may
+                # have had their OWN absolute preference for the colour
+                # the default already gave them). Defer entirely to the
+                # general cascade instead, which already correctly
+                # handles every combination of single/double absolute
+                # preference - same mechanism used for the same reason
+                # in Scheveningen.
+                pref_w, abs_w, _ = self._color_preference(default_white)
+                pref_b, abs_b, _ = self._color_preference(default_black)
+                violation_white = abs_w and pref_w != "white"
+                violation_black = abs_b and pref_b != "black"
+                if violation_white or violation_black:
+                    white, black = self._assign_colors(p1, p2)
+                else:
+                    white, black = default_white, default_black
+
+                pairings.append([white, black, None])
 
         return pairings
 
@@ -5472,7 +5845,12 @@ class PlayerSorterApp:
         while len(active) >= 2:
             p1 = active.pop(0)
             p2 = active.pop(0)
-            pairings.append([p1, p2, None])
+            # If these two are meeting again (e.g. a drawn final that has
+            # to be replayed), _assign_colors' step 4 (alternate from
+            # their most recent meeting) takes care of flipping colours
+            # for the rematch automatically.
+            white, black = self._assign_colors(p1, p2)
+            pairings.append([white, black, None])
 
         # Bye for odd player
         if active:
@@ -5505,6 +5883,11 @@ class PlayerSorterApp:
 
         self.schev_round = 0
         self.schev_total_rounds = team_size
+        # Classic Scheveningen colour convention: the whole team plays one
+        # colour for the entire round, and teams swap colours every round.
+        # Which team gets White in round 1 is decided by lot, same as any
+        # other "no history yet" colour decision (FIDE's round-1 rule).
+        self.schev_team_a_white_first = random.random() < 0.5
         self.show_scheveningen_round()
 
     def show_scheveningen_round(self):
@@ -5530,6 +5913,45 @@ class PlayerSorterApp:
         pairings = self._generate_scheveningen_pairings(self.schev_round)
 
         self.display_tournament_pairings(frame, pairings, "scheveningen")
+
+    def _scheveningen_team_a_is_white(self, schev_round):
+        """Whether Team A plays White this round, under the classic
+        Scheveningen convention (whole team plays one colour, alternating
+        every round). Falls back to a fresh lot for saves from before
+        this feature existed, same pattern as other backward-compat
+        fallbacks in this file."""
+        white_first = getattr(self, "schev_team_a_white_first", None)
+        if white_first is None:
+            white_first = random.random() < 0.5
+            self.schev_team_a_white_first = white_first
+        return white_first if (schev_round % 2 == 1) else (not white_first)
+
+    def _scheveningen_assign_colors(self, a_player, b_player, team_a_is_white):
+        """Colour assignment for one Scheveningen pairing: uses the
+        team-wide default, but overrides it for an individual player if
+        the default would force an absolute colour-rule violation for
+        them (possible because half-byes/withdrawals can desync one
+        player's personal streak/balance from their team's round-parity
+        schedule). Falls back to the general cross-format cascade in the
+        rare case both players would be violated by the same default."""
+        default_white, default_black = (
+            (a_player, b_player) if team_a_is_white else (b_player, a_player)
+        )
+
+        pref_w, abs_w, _ = self._color_preference(default_white)
+        pref_b, abs_b, _ = self._color_preference(default_black)
+        violation_white = abs_w and pref_w != "white"
+        violation_black = abs_b and pref_b != "black"
+
+        if not violation_white and not violation_black:
+            return default_white, default_black
+        # Don't just swap to fix a single violation - swapping to fix one
+        # player can just as easily create a brand new violation for the
+        # other, if they had their own absolute preference for the
+        # colour the team default already (correctly) gave them. Defer
+        # to the general cascade, which correctly handles every
+        # combination of single/double absolute preference.
+        return self._assign_colors(a_player, b_player)
 
     def _generate_scheveningen_pairings(self, schev_round):
         """Generate this round's Scheveningen pairings by rotating the
@@ -5620,7 +6042,11 @@ class PlayerSorterApp:
                 pairings.append([a_player, None, "bye"])
                 b_player.requested_half_bye = False
             else:
-                pairings.append([a_player, b_player, None])
+                team_a_is_white = self._scheveningen_team_a_is_white(schev_round)
+                white, black = self._scheveningen_assign_colors(
+                    a_player, b_player, team_a_is_white
+                )
+                pairings.append([white, black, None])
 
         for b_player in unscheduled_b:
             if b_player.withdrawn:
@@ -5926,10 +6352,19 @@ class PlayerSorterApp:
             p1, p2, pairing_type = pairing
             result = result_var.get()
 
+            # Colour Balancing (chess tournament formats): by the time a
+            # pairing reaches this point, p1 is always the White player
+            # and p2 the Black player for a real game - byes are
+            # colourless and get None/None. Recorded explicitly (rather
+            # than leaving it as an implicit positional convention) so
+            # history/exports/older code reading this back stay
+            # unambiguous even if that convention ever changes.
             entry = {
                 "board": board_idx,
                 "player1": p1.name if p1 else None,
                 "player2": p2.name if p2 else None,
+                "player1_color": "white" if p2 else None,
+                "player2_color": "black" if p2 else None,
                 "result": result,  # "p1_win", "p2_win", "draw", "bye", "half_bye"
                 "type": "bye" if p2 is None else "game",
             }
@@ -5974,6 +6409,8 @@ class PlayerSorterApp:
                     "draws": player.draws,
                     "byes": player.byes,
                     "half_byes": player.half_byes,
+                    "white_games": player.white_games,
+                    "black_games": player.black_games,
                     "tiebreak": round(tb_score, 2) if tb_score is not None else None,
                     "status": status,
                     "team": team,
@@ -6038,8 +6475,24 @@ class PlayerSorterApp:
                     result_var = tk.StringVar(value="bye")
                 self.tournament_results.append((pairing, result_var))
             else:
+                # Colour Balancing: p1/p2 arrive here already decided as
+                # White/Black respectively (chess tournament formats
+                # only) - show it so the director can see it, not just
+                # infer it after the fact from exports.
+                show_colors = self.game_type == "chess" and system in (
+                    "swiss",
+                    "round_robin",
+                    "knockout",
+                    "scheveningen",
+                )
+                p1_color_suffix = " (White)" if show_colors else ""
+                p2_color_suffix = " (Black)" if show_colors else ""
+
                 # Player 1
-                p1_label = f"{p1.name} ({rating_name}: {p1.rating}, Pts: {p1.points})"
+                p1_label = (
+                    f"{p1.name}{p1_color_suffix} "
+                    f"({rating_name}: {p1.rating}, Pts: {p1.points})"
+                )
                 ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
                     row=0, column=0, sticky=tk.W, padx=5
                 )
@@ -6050,7 +6503,10 @@ class PlayerSorterApp:
                 )
 
                 # Player 2
-                p2_label = f"{p2.name} ({rating_name}: {p2.rating}, Pts: {p2.points})"
+                p2_label = (
+                    f"{p2.name}{p2_color_suffix} "
+                    f"({rating_name}: {p2.rating}, Pts: {p2.points})"
+                )
                 ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
                     row=0, column=2, sticky=tk.W, padx=5
                 )
@@ -6113,6 +6569,9 @@ class PlayerSorterApp:
 
             if result == "bye":
                 p1.byes += 1
+                # No colour is recorded for a bye - FIDE treats it as
+                # colourless, so it neither counts towards the balance
+                # nor breaks a same-colour streak.
             elif result == "half_bye":
                 p1.half_byes += 1
             elif result == "p1_win":
@@ -6122,6 +6581,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("win")
                 p2.results_vs_opponents.append("loss")
+                p1.colors.append("white")
+                p2.colors.append("black")
             elif result == "p2_win":
                 p2.wins += 1
                 p1.losses += 1
@@ -6129,6 +6590,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("loss")
                 p2.results_vs_opponents.append("win")
+                p1.colors.append("white")
+                p2.colors.append("black")
             elif result == "draw":
                 p1.draws += 1
                 p2.draws += 1
@@ -6136,6 +6599,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("draw")
                 p2.results_vs_opponents.append("draw")
+                p1.colors.append("white")
+                p2.colors.append("black")
 
         # Handle elimination for knockout
         if system == "knockout":
@@ -6263,6 +6728,8 @@ class PlayerSorterApp:
                 "draws",
                 "byes",
                 "hbyes",
+                "white",
+                "black",
                 "tiebreak",
             ],
             show="headings",
@@ -6278,6 +6745,8 @@ class PlayerSorterApp:
         tree.heading("draws", text="D")
         tree.heading("byes", text="Bye")
         tree.heading("hbyes", text="½Bye")
+        tree.heading("white", text="White")
+        tree.heading("black", text="Black")
         tree.heading("tiebreak", text="TB")
 
         tree.column("rank", width=45)
@@ -6289,6 +6758,8 @@ class PlayerSorterApp:
         tree.column("draws", width=35)
         tree.column("byes", width=35)
         tree.column("hbyes", width=40)
+        tree.column("white", width=45)
+        tree.column("black", width=45)
         tree.column("tiebreak", width=60)
 
         for i, (player, tb_score) in enumerate(sorted_players, 1):
@@ -6305,6 +6776,8 @@ class PlayerSorterApp:
                     player.draws,
                     player.byes,
                     player.half_byes,
+                    player.white_games,
+                    player.black_games,
                     f"{tb_score:.1f}" if tb_score is not None else "-",
                 ),
             )
@@ -6891,7 +7364,7 @@ class PlayerSorterApp:
                     w.writerow(
                         ["Rank", "Team", "Name", "ELO", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "Tiebreak", "Status"]
+                         "White", "Black", "Tiebreak", "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -6905,6 +7378,8 @@ class PlayerSorterApp:
                             s["draws"],
                             s["byes"],
                             s["half_byes"],
+                            s.get("white_games", "—"),
+                            s.get("black_games", "—"),
                             s["tiebreak"] if s["tiebreak"] is not None else "—",
                             s["status"],
                         ])
@@ -6912,7 +7387,7 @@ class PlayerSorterApp:
                     w.writerow(
                         ["Rank", "Name", "ELO", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "Tiebreak", "Status"]
+                         "White", "Black", "Tiebreak", "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -6925,6 +7400,8 @@ class PlayerSorterApp:
                             s["draws"],
                             s["byes"],
                             s["half_byes"],
+                            s.get("white_games", "—"),
+                            s.get("black_games", "—"),
                             s["tiebreak"] if s["tiebreak"] is not None else "—",
                             s["status"],
                         ])
@@ -6949,7 +7426,7 @@ class PlayerSorterApp:
                         w.writerow(
                             ["Rank", "Team", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "Tiebreak", "Status"]
+                             "White", "Black", "Tiebreak", "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -6962,6 +7439,8 @@ class PlayerSorterApp:
                                 s["draws"],
                                 s["byes"],
                                 s["half_byes"],
+                                s.get("white_games", "—"),
+                                s.get("black_games", "—"),
                                 s["tiebreak"] if s["tiebreak"] is not None else "—",
                                 s["status"],
                             ])
@@ -6969,7 +7448,7 @@ class PlayerSorterApp:
                         w.writerow(
                             ["Rank", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "Tiebreak", "Status"]
+                             "White", "Black", "Tiebreak", "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -6981,6 +7460,8 @@ class PlayerSorterApp:
                                 s["draws"],
                                 s["byes"],
                                 s["half_byes"],
+                                s.get("white_games", "—"),
+                                s.get("black_games", "—"),
                                 s["tiebreak"] if s["tiebreak"] is not None else "—",
                                 s["status"],
                             ])
@@ -7242,7 +7723,7 @@ class PlayerSorterApp:
                 headers.append("ELO")
             headers += [
                 "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                "Tiebreak", "Status",
+                "White", "Black", "Tiebreak", "Status",
             ]
             header_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
 
@@ -7260,6 +7741,7 @@ class PlayerSorterApp:
                 values += [
                     s.get("points"), s.get("wins"), s.get("losses"),
                     s.get("draws"), s.get("byes"), s.get("half_byes"),
+                    s.get("white_games"), s.get("black_games"),
                     s.get("tiebreak"),
                 ]
 
@@ -7525,7 +8007,7 @@ class PlayerSorterApp:
             )
             right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-            cols = ["rank", "name", "points", "record", "tiebreak", "status"]
+            cols = ["rank", "name", "points", "record", "white", "black", "tiebreak", "status"]
             stand_tree = ttk.Treeview(
                 right_frame, columns=cols, show="headings", height=14
             )
@@ -7533,12 +8015,16 @@ class PlayerSorterApp:
             stand_tree.heading("name", text="Name")
             stand_tree.heading("points", text="Pts")
             stand_tree.heading("record", text="W-L-D")
+            stand_tree.heading("white", text="White")
+            stand_tree.heading("black", text="Black")
             stand_tree.heading("tiebreak", text="TB")
             stand_tree.heading("status", text="Status")
             stand_tree.column("rank", width=30)
             stand_tree.column("name", width=140)
             stand_tree.column("points", width=40)
             stand_tree.column("record", width=80)
+            stand_tree.column("white", width=45)
+            stand_tree.column("black", width=45)
             stand_tree.column("tiebreak", width=55)
             stand_tree.column("status", width=120)
 
@@ -7552,6 +8038,8 @@ class PlayerSorterApp:
                         s["name"],
                         s["points"],
                         record,
+                        s.get("white_games", "—"),
+                        s.get("black_games", "—"),
                         s["tiebreak"] if s["tiebreak"] is not None else "-",
                         s["status"],
                     ),
