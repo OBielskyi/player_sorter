@@ -12,15 +12,76 @@ Supports Chess (ELO) and E-sports (Trophies) with three modes:
 import csv
 import datetime
 import filecmp
+import html
 import json
 import os
 import pathlib
 import random
 import re
 import shutil
+import threading
 import tkinter as tk
+import urllib.error
+import urllib.request
 from tkinter import filedialog, messagebox, ttk
 from typing import List
+
+# ── Version / update-check constants ──────────────────────────────────────────
+# Bump this on every release. Used solely to compare against the latest GitHub
+# release tag to power the startup "Update available" check below.
+__version__ = "2.4.0"
+
+# owner/repo slug for the GitHub API's "latest release" endpoint. That endpoint
+# already resolves to the newest non-draft, non-prerelease release, so no
+# extra prerelease-filtering logic is needed on our end.
+_GITHUB_REPO = "OBielskyi/player_sorter"
+_GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_GITHUB_LATEST_RELEASE_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest/"
+
+# JSON file that persists the "Don't show this again" update-notification choice
+_UPDATE_SETTINGS_FILE = "player_sorter_update_settings.json"
+
+
+def _parse_version(version_str: str) -> tuple:
+    """Parse a version string like "v2.3.0" or "2.3.0" into a tuple of ints,
+    e.g. (2, 3, 0), for numeric comparison (so "2.10.0" correctly sorts after
+    "2.9.0" instead of being compared as strings).
+
+    Non-numeric/unparseable segments are ignored; an entirely unparseable or
+    empty string returns an empty tuple, which _is_version_newer() treats as
+    "older than everything" - matching the requirement that a missing/unknown
+    current version should be treated as obviously out of date.
+    """
+    if not version_str:
+        return ()
+    cleaned = version_str.strip().lstrip("vV")
+    parts = []
+    for segment in cleaned.split("."):
+        digits = "".join(ch for ch in segment if ch.isdigit())
+        if digits == "":
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _is_version_newer(latest_str: str, current_str: str) -> bool:
+    """Return True if latest_str is a newer version than current_str.
+
+    An unparseable/missing current_str is always treated as out of date
+    (returns True, as long as latest_str parses to something at all).
+    """
+    latest = _parse_version(latest_str)
+    current = _parse_version(current_str)
+    if not latest:
+        return False  # Couldn't parse the remote version; don't claim an update exists.
+    if not current:
+        return True  # No usable local version - assume outdated, per design.
+    # Pad the shorter tuple with zeros so (2, 4) vs (2, 4, 0) compares equal.
+    length = max(len(latest), len(current))
+    latest_padded = latest + (0,) * (length - len(latest))
+    current_padded = current + (0,) * (length - len(current))
+    return latest_padded > current_padded
+
 
 # Theme definitions
 THEMES = {
@@ -484,6 +545,9 @@ class PlayerSorterApp:
         # Tournaments directory (one-time, silent, happens before first render).
         _migrate_cwd_tournaments()
 
+        # Non-blocking background check for a newer stable GitHub release.
+        self._check_for_updates()
+
         self.show_theme_selection()
 
     def _toggle_fullscreen(self, event=None):
@@ -536,6 +600,180 @@ class PlayerSorterApp:
                 json.dump({"scale_pct": scale_pct}, fh)
         except (OSError, TypeError):
             pass  # Non-fatal — just skip saving
+
+    # ── Update-check helpers ────────────────────────────────────────────────
+
+    def _load_dismissed_update_version(self):
+        """Return the version string the user last dismissed via "Don't show
+        this again", or None if they've never dismissed one (or the pref
+        file is missing/corrupt). Storing the specific version - rather than
+        a permanent on/off switch - means dismissing v2.5.0 only silences
+        v2.5.0; a future v2.6.0 will still trigger the notification.
+        """
+        try:
+            if os.path.exists(_UPDATE_SETTINGS_FILE):
+                with open(_UPDATE_SETTINGS_FILE, "r") as fh:
+                    data = json.load(fh)
+                dismissed = data.get("dismissed_version")
+                return dismissed if isinstance(dismissed, str) and dismissed else None
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def _save_dismissed_update_version(self, version: str) -> None:
+        """Persist the specific version the user chose to dismiss."""
+        try:
+            with open(_UPDATE_SETTINGS_FILE, "w") as fh:
+                json.dump({"dismissed_version": version}, fh)
+        except (OSError, TypeError):
+            pass  # Non-fatal - just skip saving.
+
+    def _check_for_updates(self) -> None:
+        """Kick off a background check against the GitHub API for a newer
+        stable release. Entirely non-blocking: runs on a daemon thread, and
+        any network failure (no internet, DNS failure, GitHub rate limit,
+        timeout, malformed response, etc.) is swallowed silently - this check
+        should never interrupt startup or show an error to the user.
+
+        Always runs (even if a version was previously dismissed) since the
+        only way to know whether an even-newer version has since shipped is
+        to actually check; the dismissal is only compared against the result
+        once it's back, inside _fetch_latest_release_and_maybe_notify().
+        """
+        threading.Thread(
+            target=self._fetch_latest_release_and_maybe_notify, daemon=True
+        ).start()
+
+    def _fetch_latest_release_and_maybe_notify(self) -> None:
+        """Runs on a background thread. Fetches the latest release tag from
+        GitHub and, if it's newer than __version__ (or __version__ is
+        missing/unparseable) AND isn't the specific version the user already
+        dismissed, schedules the notification dialog back onto the main
+        thread via root.after() - tkinter widgets must only be touched from
+        the main thread.
+        """
+        try:
+            request = urllib.request.Request(
+                _GITHUB_LATEST_RELEASE_API,
+                headers={
+                    # GitHub's API rejects requests with no User-Agent header.
+                    "User-Agent": "PlayerSorter-UpdateCheck",
+                    "Accept": "application/vnd.github+json",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=5) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            latest_tag = data.get("tag_name", "")
+        except (
+            urllib.error.URLError,
+            urllib.error.HTTPError,
+            TimeoutError,
+            ValueError,
+            OSError,
+        ):
+            return  # No internet, GitHub unreachable/rate-limited, bad JSON, etc.
+
+        current_version = globals().get("__version__", "")
+        if not _is_version_newer(latest_tag, current_version):
+            return  # Already up to date (or the response was unparseable).
+
+        dismissed = self._load_dismissed_update_version()
+        # Compare parsed version tuples, not raw strings, so "v2.5.0" (from
+        # GitHub) correctly matches a dismissal saved as "2.5.0".
+        if dismissed is not None and _parse_version(latest_tag) == _parse_version(dismissed):
+            return  # User already dismissed exactly this version.
+
+        latest_display = latest_tag.strip().lstrip("vV") or latest_tag
+        try:
+            # The user may have closed the app while this background check
+            # was still waiting on the network; in that case self.root is
+            # already destroyed and scheduling a callback on it raises
+            # RuntimeError/TclError. That's expected in a race like this, not
+            # a real error, so it's swallowed rather than left to print an
+            # unhandled-exception traceback in the console on every close.
+            self.root.after(0, lambda: self._show_update_notification(latest_display))
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _show_update_notification(self, latest_version: str) -> None:
+        """Show a popup dialog telling the user a newer stable release is
+        available, with the current/latest version numbers, a copyable link
+        to the GitHub releases page, and a "Don't show this again" checkbox
+        (which silences only this specific version, not future ones).
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Update Available")
+        dialog.configure(bg=theme["bg"])
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        container = tk.Frame(dialog, bg=theme["bg"], padx=24, pady=20)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            container,
+            text="A new version of Player Sorter is available!",
+            font=("Segoe UI", 13, "bold"),
+            bg=theme["bg"],
+            fg=theme["title_fg"],
+            wraplength=380,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        current_version = globals().get("__version__", "") or "unknown"
+        tk.Label(
+            container,
+            text=f"Current version: {current_version}\nLatest version:  {latest_version}",
+            font=("Segoe UI", 10),
+            bg=theme["bg"],
+            fg=theme["fg"],
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(10, 10))
+
+        tk.Label(
+            container,
+            text="Release link (select and copy):",
+            font=("Segoe UI", 9),
+            bg=theme["bg"],
+            fg=theme["subtitle_fg"],
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+
+        link_entry = tk.Entry(
+            container,
+            font=("Segoe UI", 10),
+            justify=tk.LEFT,
+            width=48,
+        )
+        link_entry.insert(0, _GITHUB_LATEST_RELEASE_URL)
+        link_entry.config(state="readonly")
+        link_entry.pack(anchor=tk.W, pady=(2, 14), fill=tk.X)
+        # Pre-select the link text so the user can copy it with one Ctrl+C.
+        link_entry.selection_range(0, tk.END)
+
+        dont_show_again_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            container,
+            text="Don't show this again",
+            variable=dont_show_again_var,
+        ).pack(anchor=tk.W, pady=(0, 14))
+
+        def on_close():
+            if dont_show_again_var.get():
+                self._save_dismissed_update_version(latest_version)
+            dialog.destroy()
+
+        ttk.Button(container, text="OK", command=on_close).pack(anchor=tk.E)
+        dialog.protocol("WM_DELETE_WINDOW", on_close)
+
+        # Center the dialog over the main window.
+        dialog.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - dialog.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
 
     def _get_base_scaling(self) -> float:
         """Get the baseline scaling factor for this platform."""
@@ -985,7 +1223,9 @@ class PlayerSorterApp:
         # behind the error messagebox instead of stranding the user on a
         # blank window with no way back.
         if len(file_entries) == 1:
-            self._open_tournament_entry(file_entries[0])
+            self._open_tournament_entry(
+                file_entries[0], return_to=self.show_initial_selection
+            )
             return
 
         # Otherwise display list for user to choose from
@@ -1070,6 +1310,16 @@ class PlayerSorterApp:
             filepath = selected[0]
             self._export_csv_from_filepath(filepath)
 
+        def on_export_html():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to export."
+                )
+                return
+            filepath = selected[0]
+            self._export_html_from_filepath(filepath)
+
         def on_delete():
             selected = tree.selection()
             if not selected:
@@ -1118,12 +1368,17 @@ class PlayerSorterApp:
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
+            text="🌐 Export as HTML",
+            command=on_export_html,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
             text="Load Selected Tournament",
             style="Large.TButton",
             command=on_load,
         ).pack(side=tk.LEFT, padx=5)
 
-    def _open_tournament_entry(self, entry: dict):
+    def _open_tournament_entry(self, entry: dict, return_to=None):
         """Load a tournament file and dispatch to viewer or resumption.
 
         clear_window() is called here, AFTER a successful load, rather than
@@ -1131,6 +1386,16 @@ class PlayerSorterApp:
         file, permission error, etc.) leaves whatever screen the user was
         on (e.g. the Load Tournament list) visible behind the error
         messagebox, instead of leaving a blank window with no way back.
+
+        return_to: optional override for the viewer's "Back" target. Callers
+            that bypass the Load Tournament list (e.g. the single-file
+            auto-load shortcut in show_load_tournament_screen) must pass an
+            explicit return_to here — defaulting to show_load_tournament_screen
+            would send "Back" straight into another single-file auto-load,
+            reopening this same viewer in an infinite loop with no way to
+            reach the main menu. Defaults to show_load_tournament_screen,
+            which is correct when the user actually picked this entry from
+            a visible list.
         """
         success = self.load_tournament_from_file(entry["filepath"])
         if not success:
@@ -1139,7 +1404,10 @@ class PlayerSorterApp:
         self.clear_window()
         if entry["finished"]:
             # View-only: go straight to round-by-round viewer
-            self.show_round_by_round_viewer(self.tournament_history, readonly=True)
+            self.show_round_by_round_viewer(
+                self.tournament_history,
+                return_to=return_to if return_to else self.show_load_tournament_screen,
+            )
         else:
             # Resume: advance to the next round
             self._resume_unfinished_tournament()
@@ -5632,7 +5900,8 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                return_to=self.show_scheveningen_final,
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -6458,7 +6727,8 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                return_to=self.show_tournament_final_standings,
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -6509,7 +6779,8 @@ class PlayerSorterApp:
             btn_frame,
             text="📋 View Round-by-Round Details",
             command=lambda: self.show_round_by_round_viewer(
-                self.tournament_history, readonly=True
+                self.tournament_history,
+                return_to=lambda: self.show_tournament_winner(winner),
             ),
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
@@ -6755,10 +7026,405 @@ class PlayerSorterApp:
 
     # ============ END CSV EXPORT ============
 
-    def show_round_by_round_viewer(self, history: list, readonly: bool = True):
-        """Display a round-by-round viewer.
+    # ============ HTML EXPORT ============
+
+    def _html_theme_css(self) -> str:
+        """Build a <style> block from the currently selected in-app theme, so
+        exported HTML tournament reports visually match the app itself.
+
+        Uses the same THEMES.get(..., THEMES["Simple Light"]) fallback
+        pattern used everywhere else in the app for consistency.
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+        return f"""
+        :root {{
+            --bg: {theme['bg']};
+            --fg: {theme['fg']};
+            --border: {theme['border']};
+            --title-fg: {theme['title_fg']};
+            --subtitle-fg: {theme['subtitle_fg']};
+            --button-bg: {theme['button_bg']};
+            --button-fg: {theme['button_fg']};
+            --accent-bg: {theme['accent_button_bg']};
+            --select-bg: {theme['select_bg']};
+            --select-fg: {theme['select_fg']};
+        }}
+        * {{
+            box-sizing: border-box;
+            /* Without this, browsers strip background colors when printing/
+               saving as PDF by default, so themed exports would print as
+               plain white regardless of which theme was selected. */
+            -webkit-print-color-adjust: exact;
+            print-color-adjust: exact;
+            color-adjust: exact;
+        }}
+        body {{
+            background: var(--bg);
+            color: var(--fg);
+            font-family: "Segoe UI", Arial, sans-serif;
+            margin: 0;
+            padding: 24px 32px 48px;
+            line-height: 1.4;
+        }}
+        h1 {{
+            color: var(--title-fg);
+            font-size: 26px;
+            margin-bottom: 4px;
+        }}
+        h2 {{
+            color: var(--title-fg);
+            border-bottom: 2px solid var(--accent-bg);
+            padding-bottom: 6px;
+            margin-top: 40px;
+        }}
+        h3 {{
+            color: var(--subtitle-fg);
+            margin-top: 24px;
+            margin-bottom: 8px;
+        }}
+        .subtitle {{ color: var(--subtitle-fg); margin-top: 0; }}
+        .print-btn {{
+            background: var(--button-bg);
+            color: var(--button-fg);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 8px 16px;
+            font-size: 14px;
+            cursor: pointer;
+            margin: 12px 0 8px;
+        }}
+        .print-btn:hover {{ opacity: 0.85; }}
+        @media print {{
+            /* Don't include the on-screen print button in the printed
+               output/PDF itself. */
+            .no-print {{ display: none !important; }}
+        }}
+        table.meta-table {{ border-collapse: collapse; margin: 12px 0 28px; }}
+        table.meta-table td {{ padding: 4px 16px 4px 0; }}
+        table.meta-table td.meta-label {{ color: var(--subtitle-fg); font-weight: 600; }}
+        table.data {{
+            border-collapse: collapse;
+            width: 100%;
+            margin-bottom: 12px;
+        }}
+        table.data th, table.data td {{
+            border: 1px solid var(--border);
+            padding: 6px 10px;
+            text-align: left;
+            font-size: 14px;
+        }}
+        table.data th {{
+            background: var(--button-bg);
+            color: var(--button-fg);
+        }}
+        table.data tr.rank-1 td {{
+            background: var(--select-bg);
+            color: var(--select-fg);
+            font-weight: 700;
+        }}
+        .status-inactive {{ color: var(--subtitle-fg); font-style: italic; }}
+        details.round-block {{
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 10px 16px;
+            margin-bottom: 16px;
+        }}
+        details.round-block > summary {{
+            cursor: pointer;
+            font-weight: 700;
+            color: var(--title-fg);
+            font-size: 16px;
+        }}
+        footer {{
+            margin-top: 40px;
+            color: var(--subtitle-fg);
+            font-size: 12px;
+        }}
+        """
+
+    def export_tournament_to_html(self, history: list, meta: dict = None) -> None:
+        """Export tournament history to a user-chosen, self-contained HTML file.
+
+        Mirrors export_tournament_to_csv() section-for-section (tournament
+        info, final standings, then per-round pairings/standings) so the two
+        exports always describe the same data. Styled inline (no external
+        CSS/JS/fonts) to match the app's currently selected theme, keeping
+        the file fully offline-viewable in line with the app's own
+        zero-dependency design.
+
+        Like CSV export, this is only wired up for the four Tournament-mode
+        systems (Swiss, Round-Robin, Knockout, Scheveningen) - the only
+        systems that populate tournament_history. Dual, Battle Royale, and
+        Teams modes have no history and are out of scope here, same as CSV.
+
+        Parameters
+        ----------
+        history : list
+            List of round dicts (same structure as ``tournament_history``).
+        meta : dict, optional
+            Extra metadata fields. Expected keys (all optional):
+            ``tournament_system``, ``tournament_start_time``, ``finished``,
+            ``tiebreak_method``, ``current_round``.
+        """
+        if not history:
+            messagebox.showinfo("No Data", "No round history available to export.")
+            return
+
+        if meta is None:
+            meta = {}
+
+        # Build a sensible default filename ─────────────────────────────────
+        system = meta.get("tournament_system") or "tournament"
+        timestamp = (meta.get("tournament_start_time") or "").replace(":", "-").replace(" ", "_")
+        hint = (
+            f"tournament_{timestamp}_{system}_export"
+            if timestamp
+            else f"tournament_{system}_export"
+        )
+
+        save_path = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+            initialfile=hint,
+            title="Export Tournament as HTML",
+        )
+        if not save_path:
+            return  # User cancelled
+
+        # Display-friendly labels ────────────────────────────────────────────
+        system_display = {
+            "swiss": "Swiss System",
+            "round_robin": "Round-Robin",
+            "knockout": "Knockout",
+            "scheveningen": "Scheveningen",
+        }.get(system, system.replace("_", " ").title())
+
+        tiebreak_raw = meta.get("tiebreak_method") or ""
+        tiebreak_display = {
+            "buchholz": "Buchholz",
+            "sonneborn_berger": "Sonneborn-Berger",
+            "direct_encounter": "Direct Encounter",
+            "rating": "Rating",
+        }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
+
+        result_map = {
+            "p1_win": "1 – 0",
+            "p2_win": "0 – 1",
+            "draw": "½ – ½",
+            "bye": "BYE (+1 pt)",
+            "half_bye": "HALF-BYE (+0.5 pt)",
+        }
+
+        is_schev = (system == "scheveningen")
+        esc = html.escape
+
+        def cell(value) -> str:
+            """Escape a value for safe HTML display. Mirrors the CSV export's
+            "—" fallback for missing/None values, but is careful not to treat
+            a genuine 0 (e.g. 0 wins, 0 points) as "missing"."""
+            if value is None or value == "":
+                return "—"
+            return esc(str(value))
+
+        def standings_table(standings: list, include_rating: bool) -> str:
+            """Render a standings snapshot as an HTML table.
+
+            include_rating controls whether an ELO column is shown - the CSV
+            export only includes it in the FINAL standings section, not in
+            the per-round "standings after round" sections, so this mirrors
+            that exactly rather than showing it everywhere.
+            """
+            headers = ["Rank"]
+            if is_schev:
+                headers.append("Team")
+            headers.append("Name")
+            if include_rating:
+                headers.append("ELO")
+            headers += [
+                "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
+                "Tiebreak", "Status",
+            ]
+            header_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
+
+            body_rows = []
+            for s in standings:
+                status = s.get("status", "")
+                row_class = ' class="rank-1"' if s.get("rank") == 1 else ""
+
+                values = [s.get("rank")]
+                if is_schev:
+                    values.append(s.get("team"))
+                values.append(s.get("name"))
+                if include_rating:
+                    values.append(s.get("rating"))
+                values += [
+                    s.get("points"), s.get("wins"), s.get("losses"),
+                    s.get("draws"), s.get("byes"), s.get("half_byes"),
+                    s.get("tiebreak"),
+                ]
+
+                tds = "".join(f"<td>{cell(v)}</td>" for v in values)
+                status_class = (
+                    ' class="status-inactive"' if status and status != "Active" else ""
+                )
+                tds += f"<td{status_class}>{cell(status)}</td>"
+
+                body_rows.append(f"<tr{row_class}>{tds}</tr>")
+
+            return (
+                '<table class="data">'
+                f"<thead><tr>{header_html}</tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody>"
+                "</table>"
+            )
+
+        def pairings_table(pairings: list) -> str:
+            header_html = "".join(
+                f"<th>{esc(h)}</th>"
+                for h in ["Board", "Player 1 (White)", "Result", "Player 2 (Black)"]
+            )
+            body_rows = []
+            for p in pairings:
+                p2_disp = p.get("player2") if p.get("player2") else "—"
+                res_disp = result_map.get(p.get("result"), p.get("result"))
+                tds = "".join(
+                    f"<td>{cell(v)}</td>"
+                    for v in [p.get("board"), p.get("player1"), res_disp, p2_disp]
+                )
+                body_rows.append(f"<tr>{tds}</tr>")
+            return (
+                '<table class="data">'
+                f"<thead><tr>{header_html}</tr></thead>"
+                f"<tbody>{''.join(body_rows)}</tbody>"
+                "</table>"
+            )
+
+        try:
+            parts = [
+                "<!DOCTYPE html>",
+                '<html lang="en">',
+                "<head>",
+                '<meta charset="utf-8">',
+                f"<title>{esc(system_display)} Tournament Export</title>",
+                f"<style>{self._html_theme_css()}</style>",
+                "</head>",
+                "<body>",
+                f"<h1>{esc(system_display)} — Tournament Export</h1>",
+                '<p class="subtitle">Exported from Player Sorter</p>',
+                '<button class="print-btn no-print" onclick="window.print()">'
+                "🖨️ Print / Save as PDF</button>",
+            ]
+
+            # ── Section 1: Tournament metadata ───────────────────────────
+            start_raw = meta.get("tournament_start_time") or ""
+            parts.append("<h2>Tournament Info</h2>")
+            parts.append('<table class="meta-table">')
+            parts.append(
+                f'<tr><td class="meta-label">System</td>'
+                f'<td>{cell(system_display)}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Start Time</td>'
+                f'<td>{cell(start_raw.replace("_", " "))}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Status</td>'
+                f'<td>{cell("Finished" if meta.get("finished", True) else "Unfinished")}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Tiebreak Method</td>'
+                f'<td>{cell(tiebreak_display)}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Total Rounds Played</td>'
+                f'<td>{cell(meta.get("current_round", len(history)))}</td></tr>'
+            )
+            parts.append("</table>")
+
+            # ── Section 2: Final standings ────────────────────────────────
+            parts.append("<h2>Final Standings</h2>")
+            last_round = history[-1]
+            standings = last_round.get("standings_after_round", [])
+            parts.append(standings_table(standings, include_rating=True))
+
+            # ── Section 3+: Per-round details ─────────────────────────────
+            parts.append("<h2>Round-by-Round Details</h2>")
+            for rnd in history:
+                rnum = rnd.get("round_number")
+                parts.append('<details class="round-block" open>')
+                parts.append(f"<summary>Round {esc(str(rnum))}</summary>")
+
+                parts.append(f"<h3>Round {esc(str(rnum))} – Pairings</h3>")
+                parts.append(pairings_table(rnd.get("pairings", [])))
+
+                parts.append(f"<h3>Round {esc(str(rnum))} – Standings After Round</h3>")
+                round_standings = rnd.get("standings_after_round", [])
+                parts.append(standings_table(round_standings, include_rating=False))
+
+                parts.append("</details>")
+
+            parts.append(
+                "<footer>Generated by Player Sorter — "
+                f'{esc(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))}</footer>'
+            )
+            parts.append("</body>")
+            parts.append("</html>")
+
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(parts))
+
+            messagebox.showinfo(
+                "Export Successful", f"Tournament exported to:\n{save_path}"
+            )
+
+        except Exception as exc:
+            messagebox.showerror("Export Error", f"Could not write HTML file:\n{exc}")
+
+    def _export_html_from_filepath(self, filepath: str) -> None:
+        """Load a saved tournament JSON file and export its history to HTML.
+
+        Used by the Load Tournament screen so the user can export a tournament
+        without having to open it first. Mirrors _export_csv_from_filepath().
+        """
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read tournament file:\n{exc}")
+            return
+
+        history = data.get("tournament_history", [])
+        if not history:
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+
+        meta = {
+            "tournament_system": data.get("tournament_system"),
+            "tournament_start_time": data.get("tournament_start_time", ""),
+            "finished": data.get("finished", False),
+            "tiebreak_method": data.get("tiebreak_method", ""),
+            "current_round": data.get("current_round", len(history)),
+        }
+        self.export_tournament_to_html(history, meta)
+
+    # ============ END HTML EXPORT ============
+
+    def show_round_by_round_viewer(self, history: list, return_to=None):
+        """Display a round-by-round viewer for a finished tournament.
         history: list of round dicts (from tournament_history or loaded file).
-        readonly: if True, no resume button is shown.
+        return_to: optional no-arg callable for the "Back" button to invoke
+            instead of jumping to the main menu. Callers should pass the
+            screen the viewer was opened from (e.g. the final-standings
+            screen, the winner screen, or the Load Tournament list) so "Back"
+            actually goes back, rather than stranding the user on the main
+            menu with no way to return to (and save) the tournament they
+            were just looking at. Falls back to show_initial_selection() if
+            not given.
         """
         if not history:
             messagebox.showinfo("No Data", "No round history available to display.")
@@ -6905,13 +7571,36 @@ class PlayerSorterApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=10)
 
-        ttk.Button(btn_frame, text="← Back", command=self.show_initial_selection).pack(
-            side=tk.LEFT, padx=5
-        )
+        ttk.Button(
+            btn_frame,
+            text="← Back",
+            command=return_to if return_to else self.show_initial_selection,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="💾 Save Tournament",
+            command=self._save_finished_tournament,
+        ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
             text="📄 Export as CSV",
             command=lambda: self.export_tournament_to_csv(
+                history,
+                {
+                    "tournament_system": getattr(self, "tournament_system", None),
+                    "tournament_start_time": getattr(
+                        self, "tournament_start_time", ""
+                    ),
+                    "finished": True,
+                    "tiebreak_method": getattr(self, "tiebreak_method", None),
+                    "current_round": getattr(self, "current_round", len(history)),
+                },
+            ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="🌐 Export as HTML",
+            command=lambda: self.export_tournament_to_html(
                 history,
                 {
                     "tournament_system": getattr(self, "tournament_system", None),
