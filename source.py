@@ -684,7 +684,16 @@ class PlayerSorterApp:
             return  # User already dismissed exactly this version.
 
         latest_display = latest_tag.strip().lstrip("vV") or latest_tag
-        self.root.after(0, lambda: self._show_update_notification(latest_display))
+        try:
+            # The user may have closed the app while this background check
+            # was still waiting on the network; in that case self.root is
+            # already destroyed and scheduling a callback on it raises
+            # RuntimeError/TclError. That's expected in a race like this, not
+            # a real error, so it's swallowed rather than left to print an
+            # unhandled-exception traceback in the console on every close.
+            self.root.after(0, lambda: self._show_update_notification(latest_display))
+        except (RuntimeError, tk.TclError):
+            pass
 
     def _show_update_notification(self, latest_version: str) -> None:
         """Show a popup dialog telling the user a newer stable release is
