@@ -1671,6 +1671,7 @@ class PlayerSorterApp:
             ("Buchholz", "buchholz", "Sum of opponents' scores"),
             ("Sonneborn-Berger", "sonneborn_berger", "Weighted opponents' scores"),
             ("Direct Encounter", "direct_encounter", "Head-to-head result"),
+            ("Schmuljan", "schmuljan", "Opponents' scores, wins add/losses subtract"),
             ("None (Rating)", "rating", "Use rating as tiebreak"),
         ]
 
@@ -2087,6 +2088,7 @@ class PlayerSorterApp:
             ("Buchholz", "buchholz"),
             ("Sonneborn-Berger", "sonneborn_berger"),
             ("Direct Encounter", "direct_encounter"),
+            ("Schmuljan", "schmuljan"),
             ("Rating", "rating"),
         ]
 
@@ -7236,6 +7238,24 @@ class PlayerSorterApp:
                             # "loss" (or unknown, from an old save)
                             # contributes 0.
                             break
+            elif self.tiebreak_method == "schmuljan":
+                # Sum of each opponent's own score, ADDED for a win against
+                # them and SUBTRACTED for a loss to them. Draws contribute
+                # nothing at all (not half, unlike Sonneborn-Berger - draws
+                # are simply excluded from this evaluation). This means the
+                # score can legitimately go negative, e.g. for a player who
+                # beat weak opponents but lost to strong ones.
+                tb_score = 0
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name:
+                            if outcome == "win":
+                                tb_score += p.points
+                            elif outcome == "loss":
+                                tb_score -= p.points
+                            # "draw" (or unknown, from an old save)
+                            # contributes 0.
+                            break
             elif self.tiebreak_method == "rating":
                 tb_score = player.rating
             elif self.tiebreak_method == "direct_encounter":
@@ -7561,6 +7581,7 @@ class PlayerSorterApp:
             "buchholz": "Buchholz",
             "sonneborn_berger": "Sonneborn-Berger",
             "direct_encounter": "Direct Encounter",
+            "schmuljan": "Schmuljan",
             "rating": "Rating",
         }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
 
@@ -8332,6 +8353,7 @@ class PlayerSorterApp:
             "buchholz": "Buchholz",
             "sonneborn_berger": "Sonneborn-Berger",
             "direct_encounter": "Direct Encounter",
+            "schmuljan": "Schmuljan",
             "rating": "Rating",
         }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
 
