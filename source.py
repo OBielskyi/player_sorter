@@ -442,6 +442,26 @@ class Player:
         self.colors = []
         self.requested_half_bye = False  # For current round
 
+        # ===== FIDE / TRF16 fields (all optional, chess-only) =====
+        # None of these are required to use the app - they only matter if
+        # the director wants a TRF16 export usable for actual FIDE rating
+        # submission (as opposed to just pairing/tiebreak interop, which
+        # works fine without them). Old saves won't have any of these;
+        # every consumer treats a missing/None value as "unknown, leave
+        # blank in the export" rather than raising.
+        self.sex = None  # "m" or "w" (FIDE's own two-letter convention)
+        self.title = None  # One of: GM, IM, WGM, FM, WIM, CM, WFM, WCM
+        self.fide_federation = None  # 3-letter FIDE federation code
+        self.fide_id = None  # FIDE ID number, as a string
+        self.birth_date = None  # "YYYY/MM/DD" (partial dates not supported by TRF16)
+        # Snapshot of `rating` at the moment THIS tournament started, used
+        # for TRF starting-rank assignment (by descending rating "at
+        # start") and for the TRF FIDE-Rating column - both of which
+        # should reflect the rating a player entered the event with, not
+        # a rating this app's automatic ELO mode may have since adjusted
+        # mid-event. None until a tournament actually starts.
+        self.initial_rating = None
+
     @property
     def name(self):
         """Get display name based on what's available"""
@@ -1343,6 +1363,16 @@ class PlayerSorterApp:
             filepath = selected[0]
             self._export_html_from_filepath(filepath)
 
+        def on_export_trf():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to export."
+                )
+                return
+            filepath = selected[0]
+            self._export_trf_from_filepath(filepath)
+
         def on_delete():
             selected = tree.selection()
             if not selected:
@@ -1393,6 +1423,11 @@ class PlayerSorterApp:
             btn_frame,
             text="🌐 Export as HTML",
             command=on_export_html,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="♟ Export as TRF16",
+            command=on_export_trf,
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
@@ -2648,6 +2683,61 @@ class PlayerSorterApp:
         )
         self.add_update_btn.grid(row=1, column=4, padx=15, pady=8)
 
+        # Optional FIDE info - only relevant for chess tournaments (Swiss/
+        # Round-Robin/Knockout/Scheveningen), where it can be exported via
+        # TRF16. Left blank, a TRF16 export still works fine for pairing/
+        # tiebreak interop - these only matter for genuine FIDE rating
+        # submission, so nobody is forced to fill them in.
+        self.fide_fields_shown = is_chess and is_tournament
+        if self.fide_fields_shown:
+            fide_frame = ttk.LabelFrame(
+                input_frame, text="FIDE Info (optional)", padding="8"
+            )
+            fide_frame.grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
+
+            ttk.Label(fide_frame, text="Sex:", font=("Arial", 10)).grid(
+                row=0, column=0, sticky=tk.W, padx=6, pady=4
+            )
+            self.sex_combo = ttk.Combobox(
+                fide_frame, width=5, font=("Arial", 10),
+                values=["", "m", "w"], state="readonly",
+            )
+            self.sex_combo.set("")
+            self.sex_combo.grid(row=0, column=1, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Title:", font=("Arial", 10)).grid(
+                row=0, column=2, sticky=tk.W, padx=6, pady=4
+            )
+            self.title_combo = ttk.Combobox(
+                fide_frame, width=6, font=("Arial", 10),
+                values=["", "GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM"],
+                state="readonly",
+            )
+            self.title_combo.set("")
+            self.title_combo.grid(row=0, column=3, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Federation:", font=("Arial", 10)).grid(
+                row=0, column=4, sticky=tk.W, padx=6, pady=4
+            )
+            self.federation_entry = ttk.Entry(
+                fide_frame, width=6, font=("Arial", 10)
+            )
+            self.federation_entry.grid(row=0, column=5, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="FIDE ID:", font=("Arial", 10)).grid(
+                row=1, column=0, sticky=tk.W, padx=6, pady=4
+            )
+            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=("Arial", 10))
+            self.fide_id_entry.grid(row=1, column=1, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=("Arial", 10)).grid(
+                row=1, column=2, columnspan=2, sticky=tk.W, padx=6, pady=4
+            )
+            self.birth_date_entry = ttk.Entry(
+                fide_frame, width=12, font=("Arial", 10)
+            )
+            self.birth_date_entry.grid(row=1, column=4, padx=6, pady=4)
+
         # Requirements label
         req_text = ""
         if is_chess and is_tournament:
@@ -2660,7 +2750,7 @@ class PlayerSorterApp:
         req_label = ttk.Label(
             input_frame, text=req_text, font=("Arial", 9, "italic"), foreground="blue"
         )
-        req_label.grid(row=2, column=0, columnspan=5, pady=5)
+        req_label.grid(row=3, column=0, columnspan=5, pady=5)
 
         # Player list with more height
         list_frame = ttk.LabelFrame(main_frame, text="Players", padding="15")
@@ -2808,9 +2898,66 @@ class PlayerSorterApp:
         self.rating_entry.delete(0, tk.END)
         self.rating_entry.insert(0, str(player.rating))
 
+        if self.fide_fields_shown:
+            self.sex_combo.set(player.sex or "")
+            self.title_combo.set(player.title or "")
+            self.federation_entry.delete(0, tk.END)
+            self.federation_entry.insert(0, player.fide_federation or "")
+            self.fide_id_entry.delete(0, tk.END)
+            self.fide_id_entry.insert(0, player.fide_id or "")
+            self.birth_date_entry.delete(0, tk.END)
+            self.birth_date_entry.insert(0, player.birth_date or "")
+
         # Change button text
         self.add_update_btn.config(text="Update Player")
         self.first_name_entry.focus()
+
+    def _read_fide_fields(self):
+        """Read and loosely validate the optional FIDE Info fields.
+        Returns a dict of {sex, title, fide_federation, fide_id,
+        birth_date} - each None if left blank - or None if something
+        was filled in but doesn't look right (a warning is shown in that
+        case). Every field here is optional, so an all-blank form is
+        always valid."""
+        if not self.fide_fields_shown:
+            return {
+                "sex": None, "title": None, "fide_federation": None,
+                "fide_id": None, "birth_date": None,
+            }
+
+        sex = self.sex_combo.get().strip() or None
+        title = self.title_combo.get().strip() or None
+        federation = self.federation_entry.get().strip().upper() or None
+        fide_id = self.fide_id_entry.get().strip() or None
+        birth_date = self.birth_date_entry.get().strip() or None
+
+        if federation and (len(federation) != 3 or not federation.isalpha()):
+            messagebox.showwarning(
+                "Invalid Federation",
+                "FIDE Federation should be a 3-letter code (e.g. USA, GER), "
+                "or left blank.",
+            )
+            return None
+
+        if fide_id and not fide_id.isdigit():
+            messagebox.showwarning(
+                "Invalid FIDE ID", "FIDE ID should contain digits only, or be left blank."
+            )
+            return None
+
+        if birth_date:
+            if not re.match(r"^\d{4}/\d{2}/\d{2}$", birth_date):
+                messagebox.showwarning(
+                    "Invalid Birth Date",
+                    "Birth date should be in YYYY/MM/DD format (e.g. "
+                    "2005/03/17), or left blank.",
+                )
+                return None
+
+        return {
+            "sex": sex, "title": title, "fide_federation": federation,
+            "fide_id": fide_id, "birth_date": birth_date,
+        }
 
     def add_or_update_player(self):
         """Add a new player or update existing one with name validation"""
@@ -2895,6 +3042,10 @@ class PlayerSorterApp:
                 )
                 return
 
+        fide_fields = self._read_fide_fields()
+        if fide_fields is None:
+            return  # a warning was already shown
+
         # Build the candidate name's display form the same way the real
         # Player object would, so the duplicate check below can never
         # drift out of sync with how names actually render in the UI.
@@ -2931,6 +3082,11 @@ class PlayerSorterApp:
             player.last_name = last_name
             player.nickname = nickname
             player.rating = rating
+            player.sex = fide_fields["sex"]
+            player.title = fide_fields["title"]
+            player.fide_federation = fide_fields["fide_federation"]
+            player.fide_id = fide_fields["fide_id"]
+            player.birth_date = fide_fields["birth_date"]
             self.editing_player_index = None  # Clear edit mode
             self.add_update_btn.config(text="Add Player")
         else:
@@ -2953,6 +3109,11 @@ class PlayerSorterApp:
                     # "update this player's rating" rather than an error,
                     # to preserve the previous convenience behavior.
                     existing_player.rating = rating
+                    existing_player.sex = fide_fields["sex"]
+                    existing_player.title = fide_fields["title"]
+                    existing_player.fide_federation = fide_fields["fide_federation"]
+                    existing_player.fide_id = fide_fields["fide_id"]
+                    existing_player.birth_date = fide_fields["birth_date"]
                 else:
                     messagebox.showwarning(
                         "Duplicate Player",
@@ -2967,6 +3128,11 @@ class PlayerSorterApp:
                 # Genuinely new player
                 player = candidate
                 player.rating = rating
+                player.sex = fide_fields["sex"]
+                player.title = fide_fields["title"]
+                player.fide_federation = fide_fields["fide_federation"]
+                player.fide_id = fide_fields["fide_id"]
+                player.birth_date = fide_fields["birth_date"]
                 self.players.append(player)
 
         # Clear entries
@@ -2974,6 +3140,12 @@ class PlayerSorterApp:
         self.last_name_entry.delete(0, tk.END)
         self.nickname_entry.delete(0, tk.END)
         self.rating_entry.delete(0, tk.END)
+        if self.fide_fields_shown:
+            self.sex_combo.set("")
+            self.title_combo.set("")
+            self.federation_entry.delete(0, tk.END)
+            self.fide_id_entry.delete(0, tk.END)
+            self.birth_date_entry.delete(0, tk.END)
         self.add_update_btn.config(text="Add Player")
 
         # Refresh list
@@ -3064,6 +3236,11 @@ class PlayerSorterApp:
                     "draws": player.draws,
                     "byes": player.byes,
                     "half_byes": player.half_byes,
+                    "sex": player.sex,
+                    "title": player.title,
+                    "fide_federation": player.fide_federation,
+                    "fide_id": player.fide_id,
+                    "birth_date": player.birth_date,
                 }
                 data["players"].append(player_data)
 
@@ -3118,6 +3295,11 @@ class PlayerSorterApp:
                         byes=player_data.get("byes", 0),
                         half_byes=player_data.get("half_byes", 0),
                     )
+                    player.sex = player_data.get("sex")
+                    player.title = player_data.get("title")
+                    player.fide_federation = player_data.get("fide_federation")
+                    player.fide_id = player_data.get("fide_id")
+                    player.birth_date = player_data.get("birth_date")
                 else:
                     # Old format - convert 'name' to first_name + last_name
                     old_name = player_data.get("name", "")
@@ -3202,6 +3384,12 @@ class PlayerSorterApp:
                     "results_vs_opponents": player.results_vs_opponents,
                     "colors": player.colors,
                     "requested_half_bye": player.requested_half_bye,
+                    "sex": player.sex,
+                    "title": player.title,
+                    "fide_federation": player.fide_federation,
+                    "fide_id": player.fide_id,
+                    "birth_date": player.birth_date,
+                    "initial_rating": player.initial_rating,
                 }
             )
 
@@ -3234,6 +3422,11 @@ class PlayerSorterApp:
             "schev_team_a_white_first": getattr(
                 self, "schev_team_a_white_first", None
             ),
+            # TRF16 starting ranks are assigned once, at tournament start,
+            # by descending rating-at-start - never recomputed later, so
+            # they must be saved rather than derived fresh on load (by
+            # then, live ratings may have moved under automatic ELO mode).
+            "trf_starting_rank_names": getattr(self, "trf_starting_rank_names", None),
             "players": players_data,
             "tournament_history": getattr(self, "tournament_history", []),
         }
@@ -3302,6 +3495,58 @@ class PlayerSorterApp:
 
         messagebox.showinfo("Saved", f"Tournament saved to:\n{filename}")
 
+    def _build_players_from_save_data(self, data: dict) -> list:
+        """Reconstruct full Player objects from a tournament save dict's
+        "players" list. Shared by load_tournament_from_file (loading a
+        tournament to keep working on) and the TRF16 exporter (which
+        needs full Player objects too - e.g. for apply_tiebreak - even
+        when exporting straight from a file the user hasn't opened)."""
+        players = []
+        for pd in data.get("players", []):
+            player = Player(
+                first_name=pd.get("first_name", ""),
+                last_name=pd.get("last_name", ""),
+                nickname=pd.get("nickname", ""),
+                rating=pd.get("rating", 0),
+                wins=pd.get("wins", 0),
+                losses=pd.get("losses", 0),
+                draws=pd.get("draws", 0),
+                byes=pd.get("byes", 0),
+                half_byes=pd.get("half_byes", 0),
+            )
+            player.eliminated = pd.get("eliminated", False)
+            player.withdrawn = pd.get("withdrawn", False)
+            player.withdrawal_round = pd.get("withdrawal_round")
+            player.opponents = pd.get("opponents", [])
+            # Old saves won't have this field. If it's missing or shorter
+            # than `opponents` (e.g. partially-written old data), pad with
+            # "" so the two lists stay the same length - apply_tiebreak
+            # treats an empty/unknown result as contributing 0, rather
+            # than crashing on a zip() length mismatch.
+            results_vs_opponents = pd.get("results_vs_opponents", [])
+            if len(results_vs_opponents) < len(player.opponents):
+                results_vs_opponents = results_vs_opponents + [""] * (
+                    len(player.opponents) - len(results_vs_opponents)
+                )
+            player.results_vs_opponents = results_vs_opponents
+            # Old saves won't have this either; pad the same way. A
+            # missing/unrecognised entry is treated as "no colour info"
+            # for that game by every consumer (_color_preference etc.),
+            # rather than crashing or silently miscounting.
+            colors = pd.get("colors", [])
+            if len(colors) < len(player.opponents):
+                colors = colors + [None] * (len(player.opponents) - len(colors))
+            player.colors = colors
+            player.requested_half_bye = pd.get("requested_half_bye", False)
+            player.sex = pd.get("sex")
+            player.title = pd.get("title")
+            player.fide_federation = pd.get("fide_federation")
+            player.fide_id = pd.get("fide_id")
+            player.birth_date = pd.get("birth_date")
+            player.initial_rating = pd.get("initial_rating")
+            players.append(player)
+        return players
+
     def load_tournament_from_file(self, filepath: str) -> bool:
         """Load a saved tournament file and restore all state.
         Returns True on success, False on failure."""
@@ -3342,52 +3587,21 @@ class PlayerSorterApp:
         # anything left over in memory from a different tournament.
         self.round_robin_color_plan = None
 
+        # TRF16 starting ranks, assigned once at tournament start by
+        # descending rating-at-start (see _compute_trf_starting_ranks) -
+        # restored as-is rather than recomputed, since current ratings
+        # may have since moved under automatic ELO mode.
+        self.trf_starting_rank_names = data.get("trf_starting_rank_names")
+
         # Restore players
-        self.players = []
+        self.players = self._build_players_from_save_data(data)
         # name -> list of Player objects with that name, in save order. A
         # list (not a single Player) because older or hand-edited save
         # files might contain duplicate names; keeping all candidates lets
         # the team-reconstruction step below consume them one at a time
         # instead of one duplicate silently overwriting another.
         player_map = {}
-
-        for pd in data.get("players", []):
-            player = Player(
-                first_name=pd.get("first_name", ""),
-                last_name=pd.get("last_name", ""),
-                nickname=pd.get("nickname", ""),
-                rating=pd.get("rating", 0),
-                wins=pd.get("wins", 0),
-                losses=pd.get("losses", 0),
-                draws=pd.get("draws", 0),
-                byes=pd.get("byes", 0),
-                half_byes=pd.get("half_byes", 0),
-            )
-            player.eliminated = pd.get("eliminated", False)
-            player.withdrawn = pd.get("withdrawn", False)
-            player.withdrawal_round = pd.get("withdrawal_round")
-            player.opponents = pd.get("opponents", [])
-            # Old saves won't have this field. If it's missing or shorter
-            # than `opponents` (e.g. partially-written old data), pad with
-            # "" so the two lists stay the same length - apply_tiebreak
-            # treats an empty/unknown result as contributing 0, rather
-            # than crashing on a zip() length mismatch.
-            results_vs_opponents = pd.get("results_vs_opponents", [])
-            if len(results_vs_opponents) < len(player.opponents):
-                results_vs_opponents = results_vs_opponents + [""] * (
-                    len(player.opponents) - len(results_vs_opponents)
-                )
-            player.results_vs_opponents = results_vs_opponents
-            # Old saves won't have this either; pad the same way. A
-            # missing/unrecognised entry is treated as "no colour info"
-            # for that game by every consumer (_color_preference etc.),
-            # rather than crashing or silently miscounting.
-            colors = pd.get("colors", [])
-            if len(colors) < len(player.opponents):
-                colors = colors + [None] * (len(player.opponents) - len(colors))
-            player.colors = colors
-            player.requested_half_bye = pd.get("requested_half_bye", False)
-            self.players.append(player)
+        for player in self.players:
             player_map.setdefault(player.name, []).append(player)
 
         # Restore scheveningen teams (by matching saved names to Player
@@ -5079,7 +5293,19 @@ class PlayerSorterApp:
             player.withdrawal_round = None
             player.opponents = []
             player.results_vs_opponents = []
+            # This was missed when Colour Balancing was first added: without
+            # resetting it here too, colour history from a PREVIOUS
+            # tournament in the same app session would carry over and
+            # corrupt colour-balance decisions (streaks, W/B counts) from
+            # round 1 of a new one.
+            player.colors = []
             player.requested_half_bye = False
+            # Snapshot the rating this player is STARTING this session
+            # with. Used for TRF16 starting-rank assignment and its
+            # FIDE-Rating column - both should reflect the rating a
+            # player entered with, not one automatic ELO mode may since
+            # have adjusted mid-session.
+            player.initial_rating = player.rating
 
     # ============ TOURNAMENT MODE METHODS ============
 
@@ -5118,6 +5344,18 @@ class PlayerSorterApp:
         # Reset all per-tournament state on every Player object (see
         # _reset_players_for_new_session for why this is needed).
         self._reset_players_for_new_session()
+
+        # TRF16 starting ranks: assigned once, here, by descending rating
+        # AT tournament start (ties broken by original entry order, since
+        # Python's sort is stable) - the standard convention, and never
+        # recomputed later even if automatic ELO mode subsequently moves
+        # players' ratings.
+        self.trf_starting_rank_names = [
+            p.name
+            for p in sorted(
+                self.players, key=lambda p: p.initial_rating, reverse=True
+            )
+        ]
 
         if self.tournament_system == "swiss":
             self.show_swiss_round()
@@ -7507,6 +7745,399 @@ class PlayerSorterApp:
 
     # ============ END CSV EXPORT ============
 
+    # ============ TRF16 EXPORT ============
+    #
+    # FIDE's "Tournament Report File" format (C.04 Annex 2, TRF16),
+    # https://www.fide.com/FIDE/handbook/C04Annex2_TRF16.pdf - a fixed-
+    # column-width plain text format used for pairing/tiebreak
+    # verification tools and, when the demographic fields are filled in,
+    # for actual FIDE rating submission. Every column position below is
+    # taken directly from that spec.
+
+    _TRF_TITLES = ("GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM")
+
+    @staticmethod
+    def _trf_set(line: list, col_1indexed: int, text: str, width: int) -> None:
+        """Place `text` (left-justified, space-padded/truncated to
+        `width`) starting at 1-indexed column `col_1indexed` of a
+        mutable list of characters, extending the list with spaces if
+        it isn't long enough yet."""
+        start = col_1indexed - 1
+        text = (text or "")[:width]
+        needed = start + width
+        if len(line) < needed:
+            line.extend([" "] * (needed - len(line)))
+        for i, ch in enumerate(text):
+            line[start + i] = ch
+
+    def _trf_tournament_lines(self, meta: dict) -> list:
+        """Build the Tournament Section lines (012, 022, 032, ...). Every
+        one of these fields is free text after the 3-digit code (per the
+        spec's own "position 1-3 ... from position 5 (free text)"
+        pattern) - there's no numeric code table to get right here,
+        unlike the Player Section."""
+        lines = []
+
+        def add(code, text):
+            if text:
+                lines.append(f"{code} {text}")
+
+        add("012", meta.get("name"))
+        add("022", meta.get("city"))
+        add("032", meta.get("federation"))
+        add("042", meta.get("date_start"))
+        add("052", meta.get("date_end"))
+        add("062", str(meta.get("num_players")) if meta.get("num_players") else None)
+        add("092", meta.get("tournament_type"))
+        add("102", meta.get("chief_arbiter"))
+        add("112", meta.get("deputy_arbiters"))
+        add("122", meta.get("time_control"))
+
+        round_dates = meta.get("round_dates") or []
+        if round_dates:
+            line = list("132")
+            for i, d in enumerate(round_dates):
+                col = 92 + i * 10
+                self._trf_set(line, col, d, 8)
+            lines.append("".join(line).rstrip())
+
+        return lines
+
+    def _trf_result_for_player(self, player_name, rank_by_name, round_entry):
+        """Return (opponent_id_str, colour_char, result_char) for one
+        player in one already-played round, or the "absent" triple if
+        they don't appear in that round's pairings at all (this is how a
+        withdrawn or eliminated player's later rounds show up, since
+        this app simply stops generating pairings for them - see
+        _build_players_from_save_data/withdrawn filtering)."""
+        for pr in round_entry.get("pairings", []):
+            side = None
+            if pr.get("player1") == player_name:
+                side = "p1"
+            elif pr.get("player2") == player_name:
+                side = "p2"
+            if side is None:
+                continue
+
+            if pr.get("player2") is None:
+                # A bye of some kind - never colourless-mandatory Z here,
+                # since the player WAS accounted for this round, just not
+                # paired against anyone.
+                result = pr.get("result")
+                # "half_bye" is this app's voluntary, 0.5-point sit-out -
+                # exactly TRF's "H". Anything else unpaired ("bye") is a
+                # bye the PAIRING SYSTEM assigned (an odd player out, or
+                # the opponent of someone else's half-bye) - TRF's "U".
+                result_char = "H" if result == "half_bye" else "U"
+                return "0000", "-", result_char
+
+            opp_name = pr["player2"] if side == "p1" else pr["player1"]
+            opp_rank = rank_by_name.get(opp_name)
+            opp_id_str = f"{opp_rank:04d}" if opp_rank else "0000"
+
+            color_raw = pr.get("player1_color") if side == "p1" else pr.get(
+                "player2_color"
+            )
+            color_char = {"white": "w", "black": "b"}.get(color_raw, "-")
+
+            result = pr.get("result")
+            if side == "p1":
+                result_char = {"p1_win": "1", "p2_win": "0", "draw": "="}.get(
+                    result, " "
+                )
+            else:
+                result_char = {"p1_win": "0", "p2_win": "1", "draw": "="}.get(
+                    result, " "
+                )
+            return opp_id_str, color_char, result_char
+
+        # Not found in this round at all - known absence (withdrawn or
+        # eliminated before this round; TRF's "Z").
+        return "0000", "-", "Z"
+
+    def _trf_player_line(self, player, rank, rank_by_name, history):
+        line = list("001")
+        self._trf_set(line, 5, str(rank), 4)
+        self._trf_set(line, 10, (player.sex or "").lower(), 1)
+        self._trf_set(line, 11, player.title or "", 3)
+        display_name = f"{player.last_name}, {player.first_name}".strip(", ")
+        if not display_name:
+            display_name = player.name
+        self._trf_set(line, 15, display_name, 33)
+        fide_rating = player.initial_rating if player.initial_rating is not None else player.rating
+        self._trf_set(line, 49, str(fide_rating), 4)
+        self._trf_set(line, 54, player.fide_federation or "", 3)
+        self._trf_set(line, 58, player.fide_id or "", 11)
+        self._trf_set(line, 70, player.birth_date or "", 10)
+        self._trf_set(line, 81, f"{player.points:.1f}", 4)
+        self._trf_set(line, 86, str(rank), 4)
+
+        for round_idx, round_entry in enumerate(history):
+            opp_id, color_char, result_char = self._trf_result_for_player(
+                player.name, rank_by_name, round_entry
+            )
+            base = 92 + round_idx * 10
+            self._trf_set(line, base, opp_id, 4)
+            self._trf_set(line, base + 5, color_char, 1)
+            self._trf_set(line, base + 7, result_char, 1)
+
+        return "".join(line).rstrip()
+
+    def _trf_team_line(self, team_name, member_names, rank_by_name):
+        line = list("013")
+        self._trf_set(line, 5, team_name, 32)
+        for i, name in enumerate(member_names):
+            rank = rank_by_name.get(name)
+            col = 37 + i * 5
+            self._trf_set(line, col, str(rank) if rank else "", 4)
+        return "".join(line).rstrip()
+
+    def build_trf16_content(
+        self, players: list, history: list, starting_rank_names: list, meta: dict,
+        team_a=None, team_b=None, team_a_name="Team A", team_b_name="Team B",
+    ) -> str:
+        """Assemble the full TRF16 text content. `players` must be full
+        Player objects (apply_tiebreak needs opponents/results_vs_opponents).
+        `starting_rank_names` is the tournament's fixed starting-rank
+        order (see _compute at tournament start) - falls back to
+        descending current rating if unavailable (e.g. a very old save)."""
+        if not starting_rank_names:
+            starting_rank_names = [
+                p.name
+                for p in sorted(players, key=lambda p: p.rating, reverse=True)
+            ]
+        rank_by_name = {name: i + 1 for i, name in enumerate(starting_rank_names)}
+        # Any player not in the starting-rank list at all (shouldn't
+        # normally happen) still gets a rank rather than breaking export.
+        next_rank = len(rank_by_name) + 1
+        for p in players:
+            if p.name not in rank_by_name:
+                rank_by_name[p.name] = next_rank
+                next_rank += 1
+
+        meta = dict(meta or {})
+        meta.setdefault("num_players", len(players))
+
+        lines = self._trf_tournament_lines(meta)
+
+        # Standing rank (column 86-89) reflects FINAL tiebreak-resolved
+        # standing, not starting rank - these are two different numbers
+        # in TRF and this app already computes the former via
+        # apply_tiebreak exactly as the standings screens do.
+        sorted_players = self.apply_tiebreak(players)
+        standing_rank = {p.name: i + 1 for i, (p, _tb) in enumerate(sorted_players)}
+
+        for player in sorted(players, key=lambda p: rank_by_name.get(p.name, 1 << 30)):
+            rank = standing_rank.get(player.name, rank_by_name[player.name])
+            lines.append(self._trf_player_line(player, rank, rank_by_name, history))
+
+        if team_a is not None and team_b is not None:
+            lines.append(
+                self._trf_team_line(team_a_name, [p.name for p in team_a], rank_by_name)
+            )
+            lines.append(
+                self._trf_team_line(team_b_name, [p.name for p in team_b], rank_by_name)
+            )
+
+        return "\n".join(lines) + "\n"
+
+    def _show_trf_metadata_dialog(self, default_name: str, on_confirm):
+        """Small modal dialog collecting the Tournament Section fields
+        TRF16 doesn't have anywhere else to pull from (this app has no
+        persistent notion of tournament name/city/arbiter/time control).
+        Every field is optional except Tournament Name - a blank name is
+        allowed too (TRF only warns, doesn't reject), but a real name
+        makes the file far more useful, so it's the one field with a
+        sensible pre-filled default instead of being left empty.
+        Calls on_confirm(meta_dict) if the user clicks Export, or does
+        nothing if they cancel."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("TRF16 Export Details")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="15")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="These details are optional (except leaving Tournament\n"
+            "Name blank is allowed too) - fill in what you have.",
+            font=("Arial", 9, "italic"),
+        ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=tk.W)
+
+        fields = [
+            ("name", "Tournament Name:", default_name),
+            ("city", "City:", ""),
+            ("federation", "Federation (3-letter code):", ""),
+            ("chief_arbiter", "Chief Arbiter:", ""),
+            ("deputy_arbiters", "Deputy Arbiter(s):", ""),
+            ("time_control", "Time Control:", ""),
+            ("date_start", "Start Date (YYYY/MM/DD):", ""),
+            ("date_end", "End Date (YYYY/MM/DD):", ""),
+        ]
+        entries = {}
+        for i, (key, label, default) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label, font=("Arial", 10)).grid(
+                row=i, column=0, sticky=tk.W, padx=5, pady=4
+            )
+            entry = ttk.Entry(frame, width=30, font=("Arial", 10))
+            entry.insert(0, default)
+            entry.grid(row=i, column=1, padx=5, pady=4)
+            entries[key] = entry
+
+        def confirm():
+            result_meta = {k: e.get().strip() or None for k, e in entries.items()}
+            dialog.destroy()
+            on_confirm(result_meta)
+
+        def cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(btn_frame, text="Export", command=confirm).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        dialog.wait_window()
+
+    def _write_trf16(
+        self, players, history, starting_rank_names, tournament_system,
+        default_name, team_a=None, team_b=None, team_a_name="Team A",
+        team_b_name="Team B",
+    ):
+        """Shared tail end of both TRF export entry points: Knockout
+        warning, metadata dialog, save-file dialog, write."""
+        if tournament_system == "knockout":
+            proceed = messagebox.askyesno(
+                "TRF16 and Knockout",
+                "TRF16 assumes every player's score accumulates across "
+                "all rounds of the same event - it's built around Swiss "
+                "and Round-Robin-style tournaments. A Knockout eliminates "
+                "players partway through, which doesn't really fit that "
+                "model (and FIDE wouldn't rate a Knockout using this "
+                "format).\n\n"
+                "A file can still be generated - eliminated players will "
+                "simply show as absent for their remaining rounds - but "
+                "it may not be meaningful for real submission or for "
+                "other software to import.\n\n"
+                "Export anyway?",
+            )
+            if not proceed:
+                return
+
+        def on_confirm(meta):
+            meta["tournament_type"] = {
+                "swiss": "Individual: Swiss System",
+                "round_robin": "Individual: Round-Robin",
+                "knockout": "Individual: Knockout",
+                "scheveningen": "Team-Swiss: Scheveningen System",
+            }.get(tournament_system, "Individual")
+
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".trf",
+                filetypes=[("TRF16 files", "*.trf"), ("All files", "*.*")],
+                title="Export Tournament as TRF16",
+                initialfile="tournament.trf",
+            )
+            if not filename:
+                return
+            try:
+                content = self.build_trf16_content(
+                    players, history, starting_rank_names, meta,
+                    team_a=team_a, team_b=team_b,
+                    team_a_name=team_a_name, team_b_name=team_b_name,
+                )
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(content)
+                messagebox.showinfo("Exported", f"TRF16 file saved to:\n{filename}")
+            except Exception as exc:
+                messagebox.showerror(
+                    "Export Error", f"Could not write TRF16 file:\n{exc}"
+                )
+
+        self._show_trf_metadata_dialog(default_name, on_confirm)
+
+    def export_tournament_to_trf(self) -> None:
+        """Export the CURRENTLY LOADED (live, in-memory) tournament."""
+        if not getattr(self, "tournament_history", None):
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+        team_a = getattr(self, "schev_team_a", None) or None
+        team_b = getattr(self, "schev_team_b", None) or None
+        self._write_trf16(
+            self.players,
+            self.tournament_history,
+            getattr(self, "trf_starting_rank_names", None),
+            getattr(self, "tournament_system", None),
+            default_name="",
+            team_a=team_a,
+            team_b=team_b,
+        )
+
+    def _export_trf_from_filepath(self, filepath: str) -> None:
+        """Export a saved tournament JSON file straight to TRF16, without
+        requiring the user to open it first - mirrors
+        _export_csv_from_filepath/_export_html_from_filepath."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read tournament file:\n{exc}")
+            return
+
+        history = data.get("tournament_history", [])
+        if not history:
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+
+        team_a = team_b = None
+        schev_a_names = data.get("schev_team_a_names") or []
+        schev_b_names = data.get("schev_team_b_names") or []
+        players = self._build_players_from_save_data(data)
+        if schev_a_names and schev_b_names:
+            by_name = {p.name: p for p in players}
+            team_a = [by_name[n] for n in schev_a_names if n in by_name]
+            team_b = [by_name[n] for n in schev_b_names if n in by_name]
+
+        # apply_tiebreak reads self.tiebreak_method - temporarily swap it
+        # to the SAVED file's own setting for this export, then restore
+        # whatever it was before. Without the restore, exporting some
+        # OTHER, past tournament from the "browse saved tournaments"
+        # screen while a different tournament is live in memory would
+        # silently corrupt that live tournament's tiebreak calculations
+        # from this point on.
+        previous_tiebreak_method = getattr(self, "tiebreak_method", None)
+        self.tiebreak_method = data.get("tiebreak_method")
+        try:
+            self._write_trf16(
+                players,
+                history,
+                data.get("trf_starting_rank_names"),
+                data.get("tournament_system"),
+                default_name="",
+                team_a=team_a,
+                team_b=team_b,
+            )
+        finally:
+            self.tiebreak_method = previous_tiebreak_method
+
+    # ============ END TRF16 EXPORT ============
+
     # ============ HTML EXPORT ============
 
     def _html_theme_css(self) -> str:
@@ -8100,6 +8731,11 @@ class PlayerSorterApp:
                     "current_round": getattr(self, "current_round", len(history)),
                 },
             ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="♟ Export as TRF16",
+            command=self.export_tournament_to_trf,
         ).pack(side=tk.LEFT, padx=5)
 
     # ============ END TOURNAMENT MODE ============
