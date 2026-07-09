@@ -7855,9 +7855,9 @@ class PlayerSorterApp:
         # eliminated before this round; TRF's "Z").
         return "0000", "-", "Z"
 
-    def _trf_player_line(self, player, rank, rank_by_name, history):
+    def _trf_player_line(self, player, starting_rank, standing_rank, rank_by_name, history):
         line = list("001")
-        self._trf_set(line, 5, str(rank), 4)
+        self._trf_set(line, 5, str(starting_rank), 4)
         self._trf_set(line, 10, (player.sex or "").lower(), 1)
         self._trf_set(line, 11, player.title or "", 3)
         display_name = f"{player.last_name}, {player.first_name}".strip(", ")
@@ -7869,8 +7869,19 @@ class PlayerSorterApp:
         self._trf_set(line, 54, player.fide_federation or "", 3)
         self._trf_set(line, 58, player.fide_id or "", 11)
         self._trf_set(line, 70, player.birth_date or "", 10)
-        self._trf_set(line, 81, f"{player.points:.1f}", 4)
-        self._trf_set(line, 86, str(rank), 4)
+        # Points field is a fixed 4-char column (81-84). "%.1f" normally
+        # fits ("11.5"), but at 100+ points ("100.0") that's 5 chars -
+        # slicing it in _trf_set would silently drop the decimal digit
+        # and leave a malformed trailing-dot token ("100."). Fall back to
+        # an integer-only representation in that case instead - still
+        # technically off-spec (FIDE never anticipated 100+ point
+        # totals) but at least a valid, unambiguous number rather than a
+        # truncated non-number.
+        points_str = f"{player.points:.1f}"
+        if len(points_str) > 4:
+            points_str = f"{player.points:.0f}"
+        self._trf_set(line, 81, points_str, 4)
+        self._trf_set(line, 86, str(standing_rank), 4)
 
         for round_idx, round_entry in enumerate(history):
             opp_id, color_char, result_char = self._trf_result_for_player(
@@ -7928,8 +7939,13 @@ class PlayerSorterApp:
         standing_rank = {p.name: i + 1 for i, (p, _tb) in enumerate(sorted_players)}
 
         for player in sorted(players, key=lambda p: rank_by_name.get(p.name, 1 << 30)):
-            rank = standing_rank.get(player.name, rank_by_name[player.name])
-            lines.append(self._trf_player_line(player, rank, rank_by_name, history))
+            starting_rank = rank_by_name[player.name]
+            standing_rank_value = standing_rank.get(player.name, starting_rank)
+            lines.append(
+                self._trf_player_line(
+                    player, starting_rank, standing_rank_value, rank_by_name, history
+                )
+            )
 
         if team_a is not None and team_b is not None:
             lines.append(
