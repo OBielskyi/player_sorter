@@ -29,7 +29,7 @@ from typing import List
 # ── Version / update-check constants ──────────────────────────────────────────
 # Bump this on every release. Used solely to compare against the latest GitHub
 # release tag to power the startup "Update available" check below.
-__version__ = "2.4.0"
+__version__ = "2.5.0"
 
 # owner/repo slug for the GitHub API's "latest release" endpoint. That endpoint
 # already resolves to the newest non-draft, non-prerelease release, so no
@@ -432,7 +432,35 @@ class Player:
         # degrade gracefully (treat unknown results as contributing 0)
         # rather than raising.
         self.results_vs_opponents = []
+        # Colour played in each REAL game (never for byes/half-byes, which
+        # FIDE treats as colourless), parallel to `opponents` /
+        # `results_vs_opponents`: "white" or "black" per entry. Used to
+        # compute colour balance/streak for Chess Colour Balancing. Old
+        # saves won't have this - defaults to [] and every consumer below
+        # degrades gracefully (treats a player with no colour history as
+        # having no preference yet) rather than crashing.
+        self.colors = []
         self.requested_half_bye = False  # For current round
+
+        # ===== FIDE / TRF16 fields (all optional, chess-only) =====
+        # None of these are required to use the app - they only matter if
+        # the director wants a TRF16 export usable for actual FIDE rating
+        # submission (as opposed to just pairing/tiebreak interop, which
+        # works fine without them). Old saves won't have any of these;
+        # every consumer treats a missing/None value as "unknown, leave
+        # blank in the export" rather than raising.
+        self.sex = None  # "m" or "w" (FIDE's own two-letter convention)
+        self.title = None  # One of: GM, IM, WGM, FM, WIM, CM, WFM, WCM
+        self.fide_federation = None  # 3-letter FIDE federation code
+        self.fide_id = None  # FIDE ID number, as a string
+        self.birth_date = None  # "YYYY/MM/DD" (partial dates not supported by TRF16)
+        # Snapshot of `rating` at the moment THIS tournament started, used
+        # for TRF starting-rank assignment (by descending rating "at
+        # start") and for the TRF FIDE-Rating column - both of which
+        # should reflect the rating a player entered the event with, not
+        # a rating this app's automatic ELO mode may have since adjusted
+        # mid-event. None until a tournament actually starts.
+        self.initial_rating = None
 
     @property
     def name(self):
@@ -480,6 +508,21 @@ class Player:
     def games_played(self):
         """Games actually played (excluding byes and half-byes)"""
         return self.wins + self.losses + self.draws
+
+    @property
+    def white_games(self):
+        """Number of REAL games played with White (byes are colourless)"""
+        return self.colors.count("white")
+
+    @property
+    def black_games(self):
+        """Number of REAL games played with Black (byes are colourless)"""
+        return self.colors.count("black")
+
+    @property
+    def color_difference(self):
+        """White games minus Black games (FIDE 'colour difference')"""
+        return self.white_games - self.black_games
 
 
 class PlayerSorterApp:
@@ -1320,6 +1363,16 @@ class PlayerSorterApp:
             filepath = selected[0]
             self._export_html_from_filepath(filepath)
 
+        def on_export_trf():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showwarning(
+                    "No Selection", "Please select a tournament to export."
+                )
+                return
+            filepath = selected[0]
+            self._export_trf_from_filepath(filepath)
+
         def on_delete():
             selected = tree.selection()
             if not selected:
@@ -1370,6 +1423,11 @@ class PlayerSorterApp:
             btn_frame,
             text="🌐 Export as HTML",
             command=on_export_html,
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="♟ Export as TRF16",
+            command=on_export_trf,
         ).pack(side=tk.LEFT, padx=5)
         ttk.Button(
             btn_frame,
@@ -1613,6 +1671,7 @@ class PlayerSorterApp:
             ("Buchholz", "buchholz", "Sum of opponents' scores"),
             ("Sonneborn-Berger", "sonneborn_berger", "Weighted opponents' scores"),
             ("Direct Encounter", "direct_encounter", "Head-to-head result"),
+            ("Schmuljan", "schmuljan", "Opponents' scores, wins add/losses subtract"),
             ("None (Rating)", "rating", "Use rating as tiebreak"),
         ]
 
@@ -2029,6 +2088,7 @@ class PlayerSorterApp:
             ("Buchholz", "buchholz"),
             ("Sonneborn-Berger", "sonneborn_berger"),
             ("Direct Encounter", "direct_encounter"),
+            ("Schmuljan", "schmuljan"),
             ("Rating", "rating"),
         ]
 
@@ -2625,6 +2685,61 @@ class PlayerSorterApp:
         )
         self.add_update_btn.grid(row=1, column=4, padx=15, pady=8)
 
+        # Optional FIDE info - only relevant for chess tournaments (Swiss/
+        # Round-Robin/Knockout/Scheveningen), where it can be exported via
+        # TRF16. Left blank, a TRF16 export still works fine for pairing/
+        # tiebreak interop - these only matter for genuine FIDE rating
+        # submission, so nobody is forced to fill them in.
+        self.fide_fields_shown = is_chess and is_tournament
+        if self.fide_fields_shown:
+            fide_frame = ttk.LabelFrame(
+                input_frame, text="FIDE Info (optional)", padding="8"
+            )
+            fide_frame.grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
+
+            ttk.Label(fide_frame, text="Sex:", font=("Arial", 10)).grid(
+                row=0, column=0, sticky=tk.W, padx=6, pady=4
+            )
+            self.sex_combo = ttk.Combobox(
+                fide_frame, width=5, font=("Arial", 10),
+                values=["", "m", "w"], state="readonly",
+            )
+            self.sex_combo.set("")
+            self.sex_combo.grid(row=0, column=1, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Title:", font=("Arial", 10)).grid(
+                row=0, column=2, sticky=tk.W, padx=6, pady=4
+            )
+            self.title_combo = ttk.Combobox(
+                fide_frame, width=6, font=("Arial", 10),
+                values=["", "GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM"],
+                state="readonly",
+            )
+            self.title_combo.set("")
+            self.title_combo.grid(row=0, column=3, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Federation:", font=("Arial", 10)).grid(
+                row=0, column=4, sticky=tk.W, padx=6, pady=4
+            )
+            self.federation_entry = ttk.Entry(
+                fide_frame, width=6, font=("Arial", 10)
+            )
+            self.federation_entry.grid(row=0, column=5, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="FIDE ID:", font=("Arial", 10)).grid(
+                row=1, column=0, sticky=tk.W, padx=6, pady=4
+            )
+            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=("Arial", 10))
+            self.fide_id_entry.grid(row=1, column=1, padx=6, pady=4)
+
+            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=("Arial", 10)).grid(
+                row=1, column=2, columnspan=2, sticky=tk.W, padx=6, pady=4
+            )
+            self.birth_date_entry = ttk.Entry(
+                fide_frame, width=12, font=("Arial", 10)
+            )
+            self.birth_date_entry.grid(row=1, column=4, padx=6, pady=4)
+
         # Requirements label
         req_text = ""
         if is_chess and is_tournament:
@@ -2637,7 +2752,7 @@ class PlayerSorterApp:
         req_label = ttk.Label(
             input_frame, text=req_text, font=("Arial", 9, "italic"), foreground="blue"
         )
-        req_label.grid(row=2, column=0, columnspan=5, pady=5)
+        req_label.grid(row=3, column=0, columnspan=5, pady=5)
 
         # Player list with more height
         list_frame = ttk.LabelFrame(main_frame, text="Players", padding="15")
@@ -2785,9 +2900,66 @@ class PlayerSorterApp:
         self.rating_entry.delete(0, tk.END)
         self.rating_entry.insert(0, str(player.rating))
 
+        if self.fide_fields_shown:
+            self.sex_combo.set(player.sex or "")
+            self.title_combo.set(player.title or "")
+            self.federation_entry.delete(0, tk.END)
+            self.federation_entry.insert(0, player.fide_federation or "")
+            self.fide_id_entry.delete(0, tk.END)
+            self.fide_id_entry.insert(0, player.fide_id or "")
+            self.birth_date_entry.delete(0, tk.END)
+            self.birth_date_entry.insert(0, player.birth_date or "")
+
         # Change button text
         self.add_update_btn.config(text="Update Player")
         self.first_name_entry.focus()
+
+    def _read_fide_fields(self):
+        """Read and loosely validate the optional FIDE Info fields.
+        Returns a dict of {sex, title, fide_federation, fide_id,
+        birth_date} - each None if left blank - or None if something
+        was filled in but doesn't look right (a warning is shown in that
+        case). Every field here is optional, so an all-blank form is
+        always valid."""
+        if not self.fide_fields_shown:
+            return {
+                "sex": None, "title": None, "fide_federation": None,
+                "fide_id": None, "birth_date": None,
+            }
+
+        sex = self.sex_combo.get().strip() or None
+        title = self.title_combo.get().strip() or None
+        federation = self.federation_entry.get().strip().upper() or None
+        fide_id = self.fide_id_entry.get().strip() or None
+        birth_date = self.birth_date_entry.get().strip() or None
+
+        if federation and (len(federation) != 3 or not federation.isalpha()):
+            messagebox.showwarning(
+                "Invalid Federation",
+                "FIDE Federation should be a 3-letter code (e.g. USA, GER), "
+                "or left blank.",
+            )
+            return None
+
+        if fide_id and not fide_id.isdigit():
+            messagebox.showwarning(
+                "Invalid FIDE ID", "FIDE ID should contain digits only, or be left blank."
+            )
+            return None
+
+        if birth_date:
+            if not re.match(r"^\d{4}/\d{2}/\d{2}$", birth_date):
+                messagebox.showwarning(
+                    "Invalid Birth Date",
+                    "Birth date should be in YYYY/MM/DD format (e.g. "
+                    "2005/03/17), or left blank.",
+                )
+                return None
+
+        return {
+            "sex": sex, "title": title, "fide_federation": federation,
+            "fide_id": fide_id, "birth_date": birth_date,
+        }
 
     def add_or_update_player(self):
         """Add a new player or update existing one with name validation"""
@@ -2872,6 +3044,10 @@ class PlayerSorterApp:
                 )
                 return
 
+        fide_fields = self._read_fide_fields()
+        if fide_fields is None:
+            return  # a warning was already shown
+
         # Build the candidate name's display form the same way the real
         # Player object would, so the duplicate check below can never
         # drift out of sync with how names actually render in the UI.
@@ -2908,6 +3084,11 @@ class PlayerSorterApp:
             player.last_name = last_name
             player.nickname = nickname
             player.rating = rating
+            player.sex = fide_fields["sex"]
+            player.title = fide_fields["title"]
+            player.fide_federation = fide_fields["fide_federation"]
+            player.fide_id = fide_fields["fide_id"]
+            player.birth_date = fide_fields["birth_date"]
             self.editing_player_index = None  # Clear edit mode
             self.add_update_btn.config(text="Add Player")
         else:
@@ -2930,6 +3111,11 @@ class PlayerSorterApp:
                     # "update this player's rating" rather than an error,
                     # to preserve the previous convenience behavior.
                     existing_player.rating = rating
+                    existing_player.sex = fide_fields["sex"]
+                    existing_player.title = fide_fields["title"]
+                    existing_player.fide_federation = fide_fields["fide_federation"]
+                    existing_player.fide_id = fide_fields["fide_id"]
+                    existing_player.birth_date = fide_fields["birth_date"]
                 else:
                     messagebox.showwarning(
                         "Duplicate Player",
@@ -2944,6 +3130,11 @@ class PlayerSorterApp:
                 # Genuinely new player
                 player = candidate
                 player.rating = rating
+                player.sex = fide_fields["sex"]
+                player.title = fide_fields["title"]
+                player.fide_federation = fide_fields["fide_federation"]
+                player.fide_id = fide_fields["fide_id"]
+                player.birth_date = fide_fields["birth_date"]
                 self.players.append(player)
 
         # Clear entries
@@ -2951,6 +3142,12 @@ class PlayerSorterApp:
         self.last_name_entry.delete(0, tk.END)
         self.nickname_entry.delete(0, tk.END)
         self.rating_entry.delete(0, tk.END)
+        if self.fide_fields_shown:
+            self.sex_combo.set("")
+            self.title_combo.set("")
+            self.federation_entry.delete(0, tk.END)
+            self.fide_id_entry.delete(0, tk.END)
+            self.birth_date_entry.delete(0, tk.END)
         self.add_update_btn.config(text="Add Player")
 
         # Refresh list
@@ -3041,6 +3238,11 @@ class PlayerSorterApp:
                     "draws": player.draws,
                     "byes": player.byes,
                     "half_byes": player.half_byes,
+                    "sex": player.sex,
+                    "title": player.title,
+                    "fide_federation": player.fide_federation,
+                    "fide_id": player.fide_id,
+                    "birth_date": player.birth_date,
                 }
                 data["players"].append(player_data)
 
@@ -3095,6 +3297,11 @@ class PlayerSorterApp:
                         byes=player_data.get("byes", 0),
                         half_byes=player_data.get("half_byes", 0),
                     )
+                    player.sex = player_data.get("sex")
+                    player.title = player_data.get("title")
+                    player.fide_federation = player_data.get("fide_federation")
+                    player.fide_id = player_data.get("fide_id")
+                    player.birth_date = player_data.get("birth_date")
                 else:
                     # Old format - convert 'name' to first_name + last_name
                     old_name = player_data.get("name", "")
@@ -3177,7 +3384,14 @@ class PlayerSorterApp:
                     "withdrawal_round": player.withdrawal_round,
                     "opponents": player.opponents,
                     "results_vs_opponents": player.results_vs_opponents,
+                    "colors": player.colors,
                     "requested_half_bye": player.requested_half_bye,
+                    "sex": player.sex,
+                    "title": player.title,
+                    "fide_federation": player.fide_federation,
+                    "fide_id": player.fide_id,
+                    "birth_date": player.birth_date,
+                    "initial_rating": player.initial_rating,
                 }
             )
 
@@ -3207,6 +3421,14 @@ class PlayerSorterApp:
             ],
             "schev_team_a_names": schev_team_a_names,
             "schev_team_b_names": schev_team_b_names,
+            "schev_team_a_white_first": getattr(
+                self, "schev_team_a_white_first", None
+            ),
+            # TRF16 starting ranks are assigned once, at tournament start,
+            # by descending rating-at-start - never recomputed later, so
+            # they must be saved rather than derived fresh on load (by
+            # then, live ratings may have moved under automatic ELO mode).
+            "trf_starting_rank_names": getattr(self, "trf_starting_rank_names", None),
             "players": players_data,
             "tournament_history": getattr(self, "tournament_history", []),
         }
@@ -3275,6 +3497,58 @@ class PlayerSorterApp:
 
         messagebox.showinfo("Saved", f"Tournament saved to:\n{filename}")
 
+    def _build_players_from_save_data(self, data: dict) -> list:
+        """Reconstruct full Player objects from a tournament save dict's
+        "players" list. Shared by load_tournament_from_file (loading a
+        tournament to keep working on) and the TRF16 exporter (which
+        needs full Player objects too - e.g. for apply_tiebreak - even
+        when exporting straight from a file the user hasn't opened)."""
+        players = []
+        for pd in data.get("players", []):
+            player = Player(
+                first_name=pd.get("first_name", ""),
+                last_name=pd.get("last_name", ""),
+                nickname=pd.get("nickname", ""),
+                rating=pd.get("rating", 0),
+                wins=pd.get("wins", 0),
+                losses=pd.get("losses", 0),
+                draws=pd.get("draws", 0),
+                byes=pd.get("byes", 0),
+                half_byes=pd.get("half_byes", 0),
+            )
+            player.eliminated = pd.get("eliminated", False)
+            player.withdrawn = pd.get("withdrawn", False)
+            player.withdrawal_round = pd.get("withdrawal_round")
+            player.opponents = pd.get("opponents", [])
+            # Old saves won't have this field. If it's missing or shorter
+            # than `opponents` (e.g. partially-written old data), pad with
+            # "" so the two lists stay the same length - apply_tiebreak
+            # treats an empty/unknown result as contributing 0, rather
+            # than crashing on a zip() length mismatch.
+            results_vs_opponents = pd.get("results_vs_opponents", [])
+            if len(results_vs_opponents) < len(player.opponents):
+                results_vs_opponents = results_vs_opponents + [""] * (
+                    len(player.opponents) - len(results_vs_opponents)
+                )
+            player.results_vs_opponents = results_vs_opponents
+            # Old saves won't have this either; pad the same way. A
+            # missing/unrecognised entry is treated as "no colour info"
+            # for that game by every consumer (_color_preference etc.),
+            # rather than crashing or silently miscounting.
+            colors = pd.get("colors", [])
+            if len(colors) < len(player.opponents):
+                colors = colors + [None] * (len(player.opponents) - len(colors))
+            player.colors = colors
+            player.requested_half_bye = pd.get("requested_half_bye", False)
+            player.sex = pd.get("sex")
+            player.title = pd.get("title")
+            player.fide_federation = pd.get("fide_federation")
+            player.fide_id = pd.get("fide_id")
+            player.birth_date = pd.get("birth_date")
+            player.initial_rating = pd.get("initial_rating")
+            players.append(player)
+        return players
+
     def load_tournament_from_file(self, filepath: str) -> bool:
         """Load a saved tournament file and restore all state.
         Returns True on success, False on failure."""
@@ -3306,48 +3580,30 @@ class PlayerSorterApp:
         self.schev_round = data.get("schev_round") or 0
         self.schev_total_rounds = data.get("schev_total_rounds") or 0
         self.scheveningen_team_size = data.get("scheveningen_team_size") or 0
+        self.schev_team_a_white_first = data.get("schev_team_a_white_first")
 
         # Restore round-robin stable round count (0 means "not set / old save")
         self.round_robin_total_rounds = data.get("round_robin_total_rounds") or 0
+        # The colour plan is deterministic from order + total_rounds, so it's
+        # cheap and safest to just recompute it lazily rather than trust
+        # anything left over in memory from a different tournament.
+        self.round_robin_color_plan = None
+
+        # TRF16 starting ranks, assigned once at tournament start by
+        # descending rating-at-start (see _compute_trf_starting_ranks) -
+        # restored as-is rather than recomputed, since current ratings
+        # may have since moved under automatic ELO mode.
+        self.trf_starting_rank_names = data.get("trf_starting_rank_names")
 
         # Restore players
-        self.players = []
+        self.players = self._build_players_from_save_data(data)
         # name -> list of Player objects with that name, in save order. A
         # list (not a single Player) because older or hand-edited save
         # files might contain duplicate names; keeping all candidates lets
         # the team-reconstruction step below consume them one at a time
         # instead of one duplicate silently overwriting another.
         player_map = {}
-
-        for pd in data.get("players", []):
-            player = Player(
-                first_name=pd.get("first_name", ""),
-                last_name=pd.get("last_name", ""),
-                nickname=pd.get("nickname", ""),
-                rating=pd.get("rating", 0),
-                wins=pd.get("wins", 0),
-                losses=pd.get("losses", 0),
-                draws=pd.get("draws", 0),
-                byes=pd.get("byes", 0),
-                half_byes=pd.get("half_byes", 0),
-            )
-            player.eliminated = pd.get("eliminated", False)
-            player.withdrawn = pd.get("withdrawn", False)
-            player.withdrawal_round = pd.get("withdrawal_round")
-            player.opponents = pd.get("opponents", [])
-            # Old saves won't have this field. If it's missing or shorter
-            # than `opponents` (e.g. partially-written old data), pad with
-            # "" so the two lists stay the same length - apply_tiebreak
-            # treats an empty/unknown result as contributing 0, rather
-            # than crashing on a zip() length mismatch.
-            results_vs_opponents = pd.get("results_vs_opponents", [])
-            if len(results_vs_opponents) < len(player.opponents):
-                results_vs_opponents = results_vs_opponents + [""] * (
-                    len(player.opponents) - len(results_vs_opponents)
-                )
-            player.results_vs_opponents = results_vs_opponents
-            player.requested_half_bye = pd.get("requested_half_bye", False)
-            self.players.append(player)
+        for player in self.players:
             player_map.setdefault(player.name, []).append(player)
 
         # Restore scheveningen teams (by matching saved names to Player
@@ -5039,7 +5295,19 @@ class PlayerSorterApp:
             player.withdrawal_round = None
             player.opponents = []
             player.results_vs_opponents = []
+            # This was missed when Colour Balancing was first added: without
+            # resetting it here too, colour history from a PREVIOUS
+            # tournament in the same app session would carry over and
+            # corrupt colour-balance decisions (streaks, W/B counts) from
+            # round 1 of a new one.
+            player.colors = []
             player.requested_half_bye = False
+            # Snapshot the rating this player is STARTING this session
+            # with. Used for TRF16 starting-rank assignment and its
+            # FIDE-Rating column - both should reflect the rating a
+            # player entered with, not one automatic ELO mode may since
+            # have adjusted mid-session.
+            player.initial_rating = player.rating
 
     # ============ TOURNAMENT MODE METHODS ============
 
@@ -5079,6 +5347,18 @@ class PlayerSorterApp:
         # _reset_players_for_new_session for why this is needed).
         self._reset_players_for_new_session()
 
+        # TRF16 starting ranks: assigned once, here, by descending rating
+        # AT tournament start (ties broken by original entry order, since
+        # Python's sort is stable) - the standard convention, and never
+        # recomputed later even if automatic ELO mode subsequently moves
+        # players' ratings.
+        self.trf_starting_rank_names = [
+            p.name
+            for p in sorted(
+                self.players, key=lambda p: p.initial_rating, reverse=True
+            )
+        ]
+
         if self.tournament_system == "swiss":
             self.show_swiss_round()
         elif self.tournament_system == "round_robin":
@@ -5098,6 +5378,9 @@ class PlayerSorterApp:
             # and withdrawals are handled later by substituting byes into that
             # round's OUTPUT, not by removing anyone from this list.
             self.round_robin_player_order = list(self.players)
+            # New tournament - any cached colour plan from a previous
+            # Round-Robin tournament this session must not carry over.
+            self.round_robin_color_plan = None
             self.show_round_robin_round()
         elif self.tournament_system == "knockout":
             self.show_knockout_round()
@@ -5126,6 +5409,177 @@ class PlayerSorterApp:
         # Display pairings
         self.display_tournament_pairings(frame, pairings, "swiss")
 
+    # ===== COLOUR BALANCING (Chess tournament formats only) =====
+    #
+    # Applied to Swiss, Round-Robin, Knockout and Scheveningen. Modelled
+    # on the FIDE colour-allocation rules (FIDE Handbook C.04.1/C.04.3):
+    #   - A bye/half-bye is colourless: it neither counts towards the
+    #     White/Black balance nor breaks a same-colour streak.
+    #   - A player's "colour preference" for their next REAL game is:
+    #       * ABSOLUTE if their colour difference (white - black) is
+    #         already +/-2 or worse, or if their last two real games
+    #         were the same colour (never allow a 3rd in a row).
+    #       * otherwise a soft preference: the colour that would even
+    #         out the difference, or - if already even - whichever
+    #         colour they didn't just play (alternation).
+    #   - When assigning colours for an already-decided pair: an
+    #     absolute preference always wins; if both have one (shouldn't
+    #     normally happen - see _colors_conflict below), the player with
+    #     the bigger need wins and the other accepts a documented
+    #     exception (mirrors FIDE C.04.1 #6/#7, which allow rare
+    #     exceptions when there's no legal alternative); otherwise ties
+    #     are broken by alternating from these two players' most recent
+    #     meeting, then by rating, then - if truly no information exists
+    #     (e.g. round 1) - by a coin flip ("drawing of lots", the actual
+    #     FIDE round-1 rule).
+    def _color_preference(self, player):
+        """Return (preferred_color, is_absolute, is_streak) for a
+        player's next real game. preferred_color is 'white', 'black', or
+        None (no games played yet, or - defensively - unrecognised
+        data). is_streak marks the specific case where the preference is
+        absolute because they'd otherwise get a 3rd-in-a-row, as opposed
+        to being absolute purely from being at the +/-2 colour
+        difference boundary - both count equally as "absolute" per FIDE
+        Article 1.7.1 (C.04.3), and when two absolute preferences
+        collide for the same colour, _assign_colors resolves it per
+        Article 5.2.2 by comparing raw |colour difference| magnitude,
+        with no separate priority for the streak-based case. is_streak
+        is kept here purely as diagnostic/descriptive information about
+        *why* a preference is absolute, not as an input to any priority
+        decision."""
+        colors = player.colors
+        if not colors:
+            return None, False, False
+        if len(colors) >= 2 and colors[-1] == colors[-2]:
+            # Same colour last two real games -> must switch (absolute)
+            return ("black" if colors[-1] == "white" else "white"), True, True
+        diff = player.color_difference
+        if diff >= 2:
+            return "black", True, False
+        if diff <= -2:
+            return "white", True, False
+        if diff == 1:
+            return "black", False, False
+        if diff == -1:
+            return "white", False, False
+        # Perfectly balanced: alternate from the last real game played
+        return ("black" if colors[-1] == "white" else "white"), False, False
+
+    def _colors_conflict(self, a, b):
+        """True if both players have an ABSOLUTE preference for the same
+        colour, meaning no matter how we assign this pair, one of them
+        must take a documented exception. Used as a secondary (softer
+        than repeat-opponent-avoidance) constraint in Swiss pairing, so
+        the matcher tries to avoid creating such pairs in the first
+        place - matching FIDE C.04.3 [C3]."""
+        pref_a, abs_a, _ = self._color_preference(a)
+        pref_b, abs_b, _ = self._color_preference(b)
+        return abs_a and abs_b and pref_a == pref_b
+
+    def _last_color_vs(self, player, opponent_name):
+        """The colour `player` had the most recent time they played
+        `opponent_name`, or None if they've never met (or data is old)."""
+        for opp, col in zip(reversed(player.opponents), reversed(player.colors)):
+            if opp == opponent_name:
+                return col
+        return None
+
+    def _assign_colors(self, a, b):
+        """Decide who of (a, b) plays White vs Black for a game that has
+        already been decided as a pairing. Returns (white_player,
+        black_player)."""
+        pref_a, abs_a, _ = self._color_preference(a)
+        pref_b, abs_b, _ = self._color_preference(b)
+
+        # 1) An absolute preference wins over a non-absolute one.
+        if abs_a and not abs_b:
+            return (a, b) if pref_a == "white" else (b, a)
+        if abs_b and not abs_a:
+            return (b, a) if pref_b == "white" else (a, b)
+
+        # 2) Both absolute: if for different colours, trivial; if for
+        # the SAME colour (a genuine conflict - rare, and Swiss pairing
+        # tries hard to avoid ever creating this pair at all; in
+        # Round-Robin/Scheveningen, whose schedules are fixed, it can be
+        # genuinely unavoidable), FIDE Article 5.2.2 (C.04.3) resolves
+        # this by granting it to whoever has the WIDER colour
+        # difference - a single, direct magnitude comparison. There is
+        # no separate rule elevating a streak-based absolute preference
+        # over a difference-based one; both simply count as "absolute"
+        # (Article 1.7.1) and are then compared purely on
+        # abs(colour_difference). An earlier version of this code gave
+        # streak-based need its own higher tier regardless of
+        # magnitude, which isn't what the rule says and let one
+        # player's difference drift arbitrarily far in testing whenever
+        # they kept meeting streak-driven opponents.
+        if abs_a and abs_b:
+            if pref_a != pref_b:
+                return (a, b) if pref_a == "white" else (b, a)
+            need_a = abs(a.color_difference)
+            need_b = abs(b.color_difference)
+            if need_a != need_b:
+                winner, loser = (a, b) if need_a > need_b else (b, a)
+            else:
+                # Genuinely tied on |colour difference| (this also
+                # covers two players who are BOTH here purely on a
+                # streak with an otherwise-equal difference, e.g. both
+                # at 0). Deliberately NOT using rating here: a fixed,
+                # deterministic tiebreak (e.g. "higher rated wins")
+                # would mean the same player (e.g. whoever has the
+                # single lowest rating in the field) loses every future
+                # tie too, compounding into a long run of forced
+                # same-colour exceptions for them specifically - exactly
+                # what happened in testing. A coin flip spreads
+                # exceptions around instead.
+                winner, loser = (a, b) if random.random() < 0.5 else (b, a)
+            winner_pref, _, _ = self._color_preference(winner)
+            return (winner, loser) if winner_pref == "white" else (loser, winner)
+
+        # 3) Neither has an absolute preference. If they have opposite
+        # soft preferences, grant them.
+        if pref_a and pref_b and pref_a != pref_b:
+            return (a, b) if pref_a == "white" else (b, a)
+
+        # 4) Same soft preference (or one/both have none, e.g. round 1,
+        # or a perfectly-tied alternation) - alternate from the last
+        # time these two specific players met, if ever.
+        last = self._last_color_vs(a, b.name)
+        if last:
+            return (b, a) if last == "white" else (a, b)
+
+        # 5) Still nothing to go on - prefer the higher-rated player's
+        # soft preference if there is one...
+        if pref_a and not pref_b:
+            return (a, b) if pref_a == "white" else (b, a)
+        if pref_b and not pref_a:
+            return (b, a) if pref_b == "white" else (a, b)
+
+        # 5b) Both have the SAME soft preference (rule 3 above already
+        # handled the case where they differ) - satisfying both is
+        # impossible, so give it to whoever needs it more urgently
+        # (bigger |colour difference|), the same magnitude-based
+        # tiebreak already used for a genuine ABSOLUTE conflict in step
+        # 2. Without this, a large Round-Robin can end up coin-flipping
+        # away a real, matching soft preference and needlessly nudging
+        # a player past what a slightly smarter choice would have kept
+        # within bounds - confirmed in testing on a 40-player
+        # Round-Robin, where this was the one demonstrably avoidable
+        # colour-difference violation out of dozens of genuinely
+        # unavoidable ones.
+        if pref_a and pref_b:  # implies pref_a == pref_b here
+            need_a = abs(a.color_difference)
+            need_b = abs(b.color_difference)
+            if need_a != need_b:
+                neediest, other = (a, b) if need_a > need_b else (b, a)
+                if pref_a == "white":
+                    return (neediest, other)
+                else:
+                    return (other, neediest)
+            # Equally urgent - fall through to the coin flip below.
+
+        # 6) ...otherwise (true round-1-style tie) decide by lot.
+        return (a, b) if random.random() < 0.5 else (b, a)
+
     def generate_swiss_pairings(self):
         """Generate Swiss system pairings"""
         active = [p for p in self.players if not p.eliminated and not p.withdrawn]
@@ -5149,7 +5603,12 @@ class PlayerSorterApp:
             bottom_half = playing_players[mid:]
 
             for i in range(min(len(top_half), len(bottom_half))):
-                pairings.append([top_half[i], bottom_half[i], None])
+                # No colour history exists yet, so who gets White is
+                # decided purely by lot (this is the actual FIDE round-1
+                # rule, not just a simplification).
+                a, b = top_half[i], bottom_half[i]
+                white, black = self._assign_colors(a, b)
+                pairings.append([white, black, None])
 
             # Handle odd number
             if len(playing_players) % 2 == 1:
@@ -5163,7 +5622,8 @@ class PlayerSorterApp:
                 if b is None:
                     pairings.append([a, None, "bye"])
                 else:
-                    pairings.append([a, b, None])
+                    white, black = self._assign_colors(a, b)
+                    pairings.append([white, black, None])
 
         return pairings
 
@@ -5189,6 +5649,16 @@ class PlayerSorterApp:
         handing out more than one bye - a repeat is the standard Swiss
         convention for an otherwise-unresolvable round, and is less
         disruptive than multiple simultaneous byes.
+
+        Colour balancing note: avoiding a repeat opponent still ranks
+        above colour concerns (matches FIDE C1 outranking C3), but right
+        below that we also try to avoid ever pairing two players who
+        BOTH have an absolute colour preference for the same colour
+        (_colors_conflict) - since if we do, one of them is guaranteed a
+        documented colour-rule exception no matter how colours are then
+        assigned. That's tried before we're willing to allow a repeat
+        opponent, and only given up on (in that order) if truly no legal
+        full pairing exists that avoids it.
         """
         # Hard safety cap: backtracking search is worst-case exponential.
         # Realistic Swiss fields (dozens of players, sparse "already
@@ -5199,12 +5669,15 @@ class PlayerSorterApp:
         # problem than the app freezing.
         call_budget = [20000]
 
-        def can_play(a, b, allow_repeats):
-            if allow_repeats:
-                return True
-            return b.name not in a.opponents and a.name not in b.opponents
+        def can_play(a, b, allow_repeats, avoid_color_conflicts):
+            if not allow_repeats:
+                if b.name in a.opponents or a.name in b.opponents:
+                    return False
+            if avoid_color_conflicts and self._colors_conflict(a, b):
+                return False
+            return True
 
-        def backtrack(remaining, allow_repeats):
+        def backtrack(remaining, allow_repeats, avoid_color_conflicts):
             call_budget[0] -= 1
             if call_budget[0] <= 0:
                 return None
@@ -5217,26 +5690,41 @@ class PlayerSorterApp:
             rest = remaining[1:]
 
             for i, candidate in enumerate(rest):
-                if can_play(first, candidate, allow_repeats):
+                if can_play(first, candidate, allow_repeats, avoid_color_conflicts):
                     new_remaining = rest[:i] + rest[i + 1 :]
-                    sub_result = backtrack(new_remaining, allow_repeats)
+                    sub_result = backtrack(
+                        new_remaining, allow_repeats, avoid_color_conflicts
+                    )
                     if sub_result is not None:
                         return [(first, candidate)] + sub_result
 
             # Odd-sized remaining group: `first` could be the bye instead
             # of being forced into one of the pairings tried above.
             if len(remaining) % 2 == 1:
-                sub_result = backtrack(rest, allow_repeats)
+                sub_result = backtrack(rest, allow_repeats, avoid_color_conflicts)
                 if sub_result is not None:
                     return [(first, None)] + sub_result
 
             return None
 
-        result = backtrack(list(playing_players), allow_repeats=False)
-        if result is None and call_budget[0] > 0:
-            # No pairing avoiding all repeats exists - allow a repeat
-            # rather than handing out extra byes.
-            result = backtrack(list(playing_players), allow_repeats=True)
+        result = None
+        # Tiers in descending priority: (no repeats, no colour conflicts)
+        # -> (no repeats, colour conflicts allowed) -> (repeats allowed,
+        # no colour conflicts) -> (repeats allowed, colour conflicts
+        # allowed). Each tier is only tried while budget remains.
+        for allow_repeats, avoid_color_conflicts in (
+            (False, True),
+            (False, False),
+            (True, True),
+            (True, False),
+        ):
+            if call_budget[0] <= 0:
+                break
+            result = backtrack(
+                list(playing_players), allow_repeats, avoid_color_conflicts
+            )
+            if result is not None:
+                break
         if result is None:
             # Either the safety cap was hit, or even allowing repeats
             # failed (shouldn't happen for an even count, but playing it
@@ -5264,6 +5752,135 @@ class PlayerSorterApp:
                     result.append((player, None))
                     paired.add(player.name)
         return result
+
+    def _compute_round_robin_color_plan(self, order, total_rounds):
+        """Precompute a colour assignment for EVERY game of a Round-Robin
+        tournament, assuming full attendance, and return it as a dict
+        {(round_idx_0_based, frozenset({name_a, name_b})): white_name}.
+
+        Why precompute instead of deciding colours round-by-round as they
+        happen (like Swiss does): unlike Swiss, a Round-Robin's entire
+        WHO-PLAYS-WHOM schedule for every round is already fully
+        determined at tournament start - it never depends on results.
+        That means colours can and should be planned for the whole event
+        at once rather than greedily round-by-round, because a greedy
+        per-round choice has no way to see that an easy, arbitrary
+        choice now (e.g. an unconstrained tie) will box a player into an
+        unavoidable same-colour-twice-in-a-row situation several rounds
+        later - and testing confirmed this actually happens occasionally
+        with a purely greedy approach, even with full attendance and an
+        even number of players. A full round-robin colouring that never
+        needs a 3rd-in-a-row exception is mathematically always
+        possible (this is exactly what published Berger tables
+        guarantee), so backtracking - trying the balance-preferred
+        colour first at each game, backing up when a later game turns
+        out to be impossible - is guaranteed to find a clean assignment,
+        and in practice needs little to no backtracking since the
+        balance-first heuristic already mirrors how Berger tables are
+        built.
+
+        Half-byes/withdrawals aren't modelled here (this assumes full
+        attendance) because they're requested round-by-round and can't
+        be known in advance; when an individual player's real history
+        ends up desynced from this plan by a bye, the caller falls back
+        to per-player override logic (see generate_round_robin_pairings)
+        exactly like Scheveningen does for the same reason.
+        """
+        n = len(order)
+        rotation_input = list(order)
+        if n % 2 == 1:
+            rotation_input.append(None)
+            n += 1
+
+        schedule = []  # list of rounds, each a list of (name_a, name_b)
+        rotated = rotation_input.copy()
+        for _ in range(total_rounds):
+            round_pairs = []
+            for i in range(n // 2):
+                pa, pb = rotated[i], rotated[n - 1 - i]
+                if pa is not None and pb is not None:
+                    round_pairs.append((pa.name, pb.name))
+            schedule.append(round_pairs)
+            rotated = [rotated[0]] + [rotated[-1]] + rotated[1:-1]
+
+        flat_games = [
+            (r_idx, a, b)
+            for r_idx, pairs in enumerate(schedule)
+            for (a, b) in pairs
+        ]
+
+        histories = {p.name: [] for p in order}
+
+        def would_violate(name, color):
+            """Mirrors _color_preference's definition of an ABSOLUTE
+            violation exactly (streak of 2, or already at the +/-2
+            colour-difference boundary) - the plan and the per-player
+            override check in generate_round_robin_pairings must always
+            agree on what counts as a violation, or the override ends up
+            fighting a plan that already thought it had this handled."""
+            h = histories[name]
+            if len(h) >= 2 and h[-1] == color and h[-2] == color:
+                return True
+            diff = h.count("white") - h.count("black")
+            new_diff = diff + (1 if color == "white" else -1)
+            return new_diff > 2 or new_diff < -2
+
+        plan = {}
+
+        # Hard safety cap, mirroring the same guard in
+        # _find_swiss_matching: this backtracking search is worst-case
+        # exponential, and unlike Swiss (which only searches one round
+        # at a time), this searches the WHOLE tournament schedule at
+        # once, so the blowup shows up much sooner - testing found a
+        # 44-player round-robin alone taking upwards of 20 seconds and
+        # climbing steeply from there, which would freeze the UI while
+        # generating pairings. If the budget is exhausted, give up fast
+        # rather than slowly - `backtrack` unwinds cleanly (every
+        # partial history/plan entry it added gets popped on the way
+        # back out, same as a normal failed branch) and the caller's
+        # existing "shouldn't normally happen" empty-plan fallback below
+        # takes over, same as it would for a genuine impossibility.
+        call_budget = [50000]
+
+        def backtrack(idx):
+            call_budget[0] -= 1
+            if call_budget[0] <= 0:
+                return False
+            if idx == len(flat_games):
+                return True
+            r_idx, a, b = flat_games[idx]
+            diff_a = histories[a].count("white") - histories[a].count("black")
+            diff_b = histories[b].count("white") - histories[b].count("black")
+            # Try giving White to whoever currently has fewer Whites
+            # relative to Blacks first - this single heuristic is enough
+            # to make backtracking essentially unnecessary in practice,
+            # since it's the same logic a Berger table encodes directly.
+            order_ab = diff_a <= diff_b
+            for white_is_a in (order_ab, not order_ab):
+                white_name, black_name = (a, b) if white_is_a else (b, a)
+                if would_violate(white_name, "white") or would_violate(
+                    black_name, "black"
+                ):
+                    continue
+                histories[white_name].append("white")
+                histories[black_name].append("black")
+                plan[(r_idx, frozenset((a, b)))] = white_name
+                if backtrack(idx + 1):
+                    return True
+                histories[white_name].pop()
+                histories[black_name].pop()
+                del plan[(r_idx, frozenset((a, b)))]
+            return False
+
+        if not backtrack(0):
+            # Either a genuine impossibility (shouldn't happen for a
+            # standard round-robin schedule) or the safety cap above was
+            # hit - either way, an empty plan makes every lookup miss,
+            # and the caller's per-player override logic (the same one
+            # used for bye-desync) becomes the sole decision-maker
+            # instead - degraded, but still safe.
+            return {}
+        return plan
 
     # ===== ROUND-ROBIN =====
 
@@ -5413,7 +6030,53 @@ class PlayerSorterApp:
                 pairings.append([p1, None, "bye"])
                 p2.requested_half_bye = False
             else:
-                pairings.append([p1, p2, None])
+                # Colour Balancing: look up this game's colour in the
+                # precomputed full-attendance plan (see
+                # _compute_round_robin_color_plan for why this is
+                # precomputed rather than decided greedily per round).
+                # Computed once and cached, keyed off the same stable
+                # round_robin_player_order the schedule itself is based
+                # on.
+                if getattr(self, "round_robin_color_plan", None) is None:
+                    self.round_robin_color_plan = self._compute_round_robin_color_plan(
+                        order, total_rounds
+                    )
+                plan_key = (round_idx, frozenset((p1.name, p2.name)))
+                planned_white_name = self.round_robin_color_plan.get(plan_key)
+
+                if planned_white_name == p1.name:
+                    default_white, default_black = p1, p2
+                elif planned_white_name == p2.name:
+                    default_white, default_black = p2, p1
+                else:
+                    # Plan lookup somehow missed (shouldn't normally
+                    # happen) - fall back to the general cascade.
+                    default_white, default_black = self._assign_colors(p1, p2)
+
+                # A half-bye/withdrawal earlier in the tournament can
+                # still desync an individual player's REAL colour
+                # history from what the full-attendance plan assumed for
+                # them. If honouring the plan's default here would force
+                # an absolute violation for either player, don't just
+                # swap the two colours - swapping to fix one player can
+                # just as easily create a brand new violation for the
+                # other (whoever wasn't a problem under the default may
+                # have had their OWN absolute preference for the colour
+                # the default already gave them). Defer entirely to the
+                # general cascade instead, which already correctly
+                # handles every combination of single/double absolute
+                # preference - same mechanism used for the same reason
+                # in Scheveningen.
+                pref_w, abs_w, _ = self._color_preference(default_white)
+                pref_b, abs_b, _ = self._color_preference(default_black)
+                violation_white = abs_w and pref_w != "white"
+                violation_black = abs_b and pref_b != "black"
+                if violation_white or violation_black:
+                    white, black = self._assign_colors(p1, p2)
+                else:
+                    white, black = default_white, default_black
+
+                pairings.append([white, black, None])
 
         return pairings
 
@@ -5472,7 +6135,12 @@ class PlayerSorterApp:
         while len(active) >= 2:
             p1 = active.pop(0)
             p2 = active.pop(0)
-            pairings.append([p1, p2, None])
+            # If these two are meeting again (e.g. a drawn final that has
+            # to be replayed), _assign_colors' step 4 (alternate from
+            # their most recent meeting) takes care of flipping colours
+            # for the rematch automatically.
+            white, black = self._assign_colors(p1, p2)
+            pairings.append([white, black, None])
 
         # Bye for odd player
         if active:
@@ -5505,6 +6173,11 @@ class PlayerSorterApp:
 
         self.schev_round = 0
         self.schev_total_rounds = team_size
+        # Classic Scheveningen colour convention: the whole team plays one
+        # colour for the entire round, and teams swap colours every round.
+        # Which team gets White in round 1 is decided by lot, same as any
+        # other "no history yet" colour decision (FIDE's round-1 rule).
+        self.schev_team_a_white_first = random.random() < 0.5
         self.show_scheveningen_round()
 
     def show_scheveningen_round(self):
@@ -5530,6 +6203,45 @@ class PlayerSorterApp:
         pairings = self._generate_scheveningen_pairings(self.schev_round)
 
         self.display_tournament_pairings(frame, pairings, "scheveningen")
+
+    def _scheveningen_team_a_is_white(self, schev_round):
+        """Whether Team A plays White this round, under the classic
+        Scheveningen convention (whole team plays one colour, alternating
+        every round). Falls back to a fresh lot for saves from before
+        this feature existed, same pattern as other backward-compat
+        fallbacks in this file."""
+        white_first = getattr(self, "schev_team_a_white_first", None)
+        if white_first is None:
+            white_first = random.random() < 0.5
+            self.schev_team_a_white_first = white_first
+        return white_first if (schev_round % 2 == 1) else (not white_first)
+
+    def _scheveningen_assign_colors(self, a_player, b_player, team_a_is_white):
+        """Colour assignment for one Scheveningen pairing: uses the
+        team-wide default, but overrides it for an individual player if
+        the default would force an absolute colour-rule violation for
+        them (possible because half-byes/withdrawals can desync one
+        player's personal streak/balance from their team's round-parity
+        schedule). Falls back to the general cross-format cascade in the
+        rare case both players would be violated by the same default."""
+        default_white, default_black = (
+            (a_player, b_player) if team_a_is_white else (b_player, a_player)
+        )
+
+        pref_w, abs_w, _ = self._color_preference(default_white)
+        pref_b, abs_b, _ = self._color_preference(default_black)
+        violation_white = abs_w and pref_w != "white"
+        violation_black = abs_b and pref_b != "black"
+
+        if not violation_white and not violation_black:
+            return default_white, default_black
+        # Don't just swap to fix a single violation - swapping to fix one
+        # player can just as easily create a brand new violation for the
+        # other, if they had their own absolute preference for the
+        # colour the team default already (correctly) gave them. Defer
+        # to the general cascade, which correctly handles every
+        # combination of single/double absolute preference.
+        return self._assign_colors(a_player, b_player)
 
     def _generate_scheveningen_pairings(self, schev_round):
         """Generate this round's Scheveningen pairings by rotating the
@@ -5620,7 +6332,11 @@ class PlayerSorterApp:
                 pairings.append([a_player, None, "bye"])
                 b_player.requested_half_bye = False
             else:
-                pairings.append([a_player, b_player, None])
+                team_a_is_white = self._scheveningen_team_a_is_white(schev_round)
+                white, black = self._scheveningen_assign_colors(
+                    a_player, b_player, team_a_is_white
+                )
+                pairings.append([white, black, None])
 
         for b_player in unscheduled_b:
             if b_player.withdrawn:
@@ -5926,10 +6642,19 @@ class PlayerSorterApp:
             p1, p2, pairing_type = pairing
             result = result_var.get()
 
+            # Colour Balancing (chess tournament formats): by the time a
+            # pairing reaches this point, p1 is always the White player
+            # and p2 the Black player for a real game - byes are
+            # colourless and get None/None. Recorded explicitly (rather
+            # than leaving it as an implicit positional convention) so
+            # history/exports/older code reading this back stay
+            # unambiguous even if that convention ever changes.
             entry = {
                 "board": board_idx,
                 "player1": p1.name if p1 else None,
                 "player2": p2.name if p2 else None,
+                "player1_color": "white" if p2 else None,
+                "player2_color": "black" if p2 else None,
                 "result": result,  # "p1_win", "p2_win", "draw", "bye", "half_bye"
                 "type": "bye" if p2 is None else "game",
             }
@@ -5974,6 +6699,8 @@ class PlayerSorterApp:
                     "draws": player.draws,
                     "byes": player.byes,
                     "half_byes": player.half_byes,
+                    "white_games": player.white_games,
+                    "black_games": player.black_games,
                     "tiebreak": round(tb_score, 2) if tb_score is not None else None,
                     "status": status,
                     "team": team,
@@ -6038,8 +6765,24 @@ class PlayerSorterApp:
                     result_var = tk.StringVar(value="bye")
                 self.tournament_results.append((pairing, result_var))
             else:
+                # Colour Balancing: p1/p2 arrive here already decided as
+                # White/Black respectively (chess tournament formats
+                # only) - show it so the director can see it, not just
+                # infer it after the fact from exports.
+                show_colors = self.game_type == "chess" and system in (
+                    "swiss",
+                    "round_robin",
+                    "knockout",
+                    "scheveningen",
+                )
+                p1_color_suffix = " (White)" if show_colors else ""
+                p2_color_suffix = " (Black)" if show_colors else ""
+
                 # Player 1
-                p1_label = f"{p1.name} ({rating_name}: {p1.rating}, Pts: {p1.points})"
+                p1_label = (
+                    f"{p1.name}{p1_color_suffix} "
+                    f"({rating_name}: {p1.rating}, Pts: {p1.points})"
+                )
                 ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
                     row=0, column=0, sticky=tk.W, padx=5
                 )
@@ -6050,7 +6793,10 @@ class PlayerSorterApp:
                 )
 
                 # Player 2
-                p2_label = f"{p2.name} ({rating_name}: {p2.rating}, Pts: {p2.points})"
+                p2_label = (
+                    f"{p2.name}{p2_color_suffix} "
+                    f"({rating_name}: {p2.rating}, Pts: {p2.points})"
+                )
                 ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
                     row=0, column=2, sticky=tk.W, padx=5
                 )
@@ -6113,6 +6859,9 @@ class PlayerSorterApp:
 
             if result == "bye":
                 p1.byes += 1
+                # No colour is recorded for a bye - FIDE treats it as
+                # colourless, so it neither counts towards the balance
+                # nor breaks a same-colour streak.
             elif result == "half_bye":
                 p1.half_byes += 1
             elif result == "p1_win":
@@ -6122,6 +6871,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("win")
                 p2.results_vs_opponents.append("loss")
+                p1.colors.append("white")
+                p2.colors.append("black")
             elif result == "p2_win":
                 p2.wins += 1
                 p1.losses += 1
@@ -6129,6 +6880,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("loss")
                 p2.results_vs_opponents.append("win")
+                p1.colors.append("white")
+                p2.colors.append("black")
             elif result == "draw":
                 p1.draws += 1
                 p2.draws += 1
@@ -6136,6 +6889,8 @@ class PlayerSorterApp:
                 p2.opponents.append(p1.name)
                 p1.results_vs_opponents.append("draw")
                 p2.results_vs_opponents.append("draw")
+                p1.colors.append("white")
+                p2.colors.append("black")
 
         # Handle elimination for knockout
         if system == "knockout":
@@ -6263,6 +7018,8 @@ class PlayerSorterApp:
                 "draws",
                 "byes",
                 "hbyes",
+                "white",
+                "black",
                 "tiebreak",
             ],
             show="headings",
@@ -6278,6 +7035,8 @@ class PlayerSorterApp:
         tree.heading("draws", text="D")
         tree.heading("byes", text="Bye")
         tree.heading("hbyes", text="½Bye")
+        tree.heading("white", text="White")
+        tree.heading("black", text="Black")
         tree.heading("tiebreak", text="TB")
 
         tree.column("rank", width=45)
@@ -6289,6 +7048,8 @@ class PlayerSorterApp:
         tree.column("draws", width=35)
         tree.column("byes", width=35)
         tree.column("hbyes", width=40)
+        tree.column("white", width=45)
+        tree.column("black", width=45)
         tree.column("tiebreak", width=60)
 
         for i, (player, tb_score) in enumerate(sorted_players, 1):
@@ -6305,6 +7066,8 @@ class PlayerSorterApp:
                     player.draws,
                     player.byes,
                     player.half_byes,
+                    player.white_games,
+                    player.black_games,
                     f"{tb_score:.1f}" if tb_score is not None else "-",
                 ),
             )
@@ -6523,6 +7286,24 @@ class PlayerSorterApp:
                             elif outcome == "draw":
                                 tb_score += p.points * 0.5
                             # "loss" (or unknown, from an old save)
+                            # contributes 0.
+                            break
+            elif self.tiebreak_method == "schmuljan":
+                # Sum of each opponent's own score, ADDED for a win against
+                # them and SUBTRACTED for a loss to them. Draws contribute
+                # nothing at all (not half, unlike Sonneborn-Berger - draws
+                # are simply excluded from this evaluation). This means the
+                # score can legitimately go negative, e.g. for a player who
+                # beat weak opponents but lost to strong ones.
+                tb_score = 0
+                for opp_name, outcome in opponent_results:
+                    for p in players:
+                        if p.name == opp_name:
+                            if outcome == "win":
+                                tb_score += p.points
+                            elif outcome == "loss":
+                                tb_score -= p.points
+                            # "draw" (or unknown, from an old save)
                             # contributes 0.
                             break
             elif self.tiebreak_method == "rating":
@@ -6850,6 +7631,7 @@ class PlayerSorterApp:
             "buchholz": "Buchholz",
             "sonneborn_berger": "Sonneborn-Berger",
             "direct_encounter": "Direct Encounter",
+            "schmuljan": "Schmuljan",
             "rating": "Rating",
         }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
 
@@ -6891,7 +7673,7 @@ class PlayerSorterApp:
                     w.writerow(
                         ["Rank", "Team", "Name", "ELO", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "Tiebreak", "Status"]
+                         "White", "Black", "Tiebreak", "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -6905,6 +7687,8 @@ class PlayerSorterApp:
                             s["draws"],
                             s["byes"],
                             s["half_byes"],
+                            s.get("white_games", "—"),
+                            s.get("black_games", "—"),
                             s["tiebreak"] if s["tiebreak"] is not None else "—",
                             s["status"],
                         ])
@@ -6912,7 +7696,7 @@ class PlayerSorterApp:
                     w.writerow(
                         ["Rank", "Name", "ELO", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "Tiebreak", "Status"]
+                         "White", "Black", "Tiebreak", "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -6925,6 +7709,8 @@ class PlayerSorterApp:
                             s["draws"],
                             s["byes"],
                             s["half_byes"],
+                            s.get("white_games", "—"),
+                            s.get("black_games", "—"),
                             s["tiebreak"] if s["tiebreak"] is not None else "—",
                             s["status"],
                         ])
@@ -6949,7 +7735,7 @@ class PlayerSorterApp:
                         w.writerow(
                             ["Rank", "Team", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "Tiebreak", "Status"]
+                             "White", "Black", "Tiebreak", "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -6962,6 +7748,8 @@ class PlayerSorterApp:
                                 s["draws"],
                                 s["byes"],
                                 s["half_byes"],
+                                s.get("white_games", "—"),
+                                s.get("black_games", "—"),
                                 s["tiebreak"] if s["tiebreak"] is not None else "—",
                                 s["status"],
                             ])
@@ -6969,7 +7757,7 @@ class PlayerSorterApp:
                         w.writerow(
                             ["Rank", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "Tiebreak", "Status"]
+                             "White", "Black", "Tiebreak", "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -6981,6 +7769,8 @@ class PlayerSorterApp:
                                 s["draws"],
                                 s["byes"],
                                 s["half_byes"],
+                                s.get("white_games", "—"),
+                                s.get("black_games", "—"),
                                 s["tiebreak"] if s["tiebreak"] is not None else "—",
                                 s["status"],
                             ])
@@ -7025,6 +7815,415 @@ class PlayerSorterApp:
         self.export_tournament_to_csv(history, meta)
 
     # ============ END CSV EXPORT ============
+
+    # ============ TRF16 EXPORT ============
+    #
+    # FIDE's "Tournament Report File" format (C.04 Annex 2, TRF16),
+    # https://www.fide.com/FIDE/handbook/C04Annex2_TRF16.pdf - a fixed-
+    # column-width plain text format used for pairing/tiebreak
+    # verification tools and, when the demographic fields are filled in,
+    # for actual FIDE rating submission. Every column position below is
+    # taken directly from that spec.
+
+    _TRF_TITLES = ("GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM")
+
+    @staticmethod
+    def _trf_set(line: list, col_1indexed: int, text: str, width: int) -> None:
+        """Place `text` (left-justified, space-padded/truncated to
+        `width`) starting at 1-indexed column `col_1indexed` of a
+        mutable list of characters, extending the list with spaces if
+        it isn't long enough yet."""
+        start = col_1indexed - 1
+        text = (text or "")[:width]
+        needed = start + width
+        if len(line) < needed:
+            line.extend([" "] * (needed - len(line)))
+        for i, ch in enumerate(text):
+            line[start + i] = ch
+
+    def _trf_tournament_lines(self, meta: dict) -> list:
+        """Build the Tournament Section lines (012, 022, 032, ...). Every
+        one of these fields is free text after the 3-digit code (per the
+        spec's own "position 1-3 ... from position 5 (free text)"
+        pattern) - there's no numeric code table to get right here,
+        unlike the Player Section."""
+        lines = []
+
+        def add(code, text):
+            if text:
+                lines.append(f"{code} {text}")
+
+        add("012", meta.get("name"))
+        add("022", meta.get("city"))
+        add("032", meta.get("federation"))
+        add("042", meta.get("date_start"))
+        add("052", meta.get("date_end"))
+        add("062", str(meta.get("num_players")) if meta.get("num_players") else None)
+        add("092", meta.get("tournament_type"))
+        add("102", meta.get("chief_arbiter"))
+        add("112", meta.get("deputy_arbiters"))
+        add("122", meta.get("time_control"))
+
+        round_dates = meta.get("round_dates") or []
+        if round_dates:
+            line = list("132")
+            for i, d in enumerate(round_dates):
+                col = 92 + i * 10
+                self._trf_set(line, col, d, 8)
+            lines.append("".join(line).rstrip())
+
+        return lines
+
+    def _trf_result_for_player(self, player_name, rank_by_name, round_entry):
+        """Return (opponent_id_str, colour_char, result_char) for one
+        player in one already-played round, or the "absent" triple if
+        they don't appear in that round's pairings at all (this is how a
+        withdrawn or eliminated player's later rounds show up, since
+        this app simply stops generating pairings for them - see
+        _build_players_from_save_data/withdrawn filtering)."""
+        for pr in round_entry.get("pairings", []):
+            side = None
+            if pr.get("player1") == player_name:
+                side = "p1"
+            elif pr.get("player2") == player_name:
+                side = "p2"
+            if side is None:
+                continue
+
+            if pr.get("player2") is None:
+                # A bye of some kind - never colourless-mandatory Z here,
+                # since the player WAS accounted for this round, just not
+                # paired against anyone.
+                result = pr.get("result")
+                # "half_bye" is this app's voluntary, 0.5-point sit-out -
+                # exactly TRF's "H". Anything else unpaired ("bye") is a
+                # bye the PAIRING SYSTEM assigned (an odd player out, or
+                # the opponent of someone else's half-bye) - TRF's "U".
+                result_char = "H" if result == "half_bye" else "U"
+                return "0000", "-", result_char
+
+            opp_name = pr["player2"] if side == "p1" else pr["player1"]
+            opp_rank = rank_by_name.get(opp_name)
+            opp_id_str = f"{opp_rank:04d}" if opp_rank else "0000"
+
+            color_raw = pr.get("player1_color") if side == "p1" else pr.get(
+                "player2_color"
+            )
+            color_char = {"white": "w", "black": "b"}.get(color_raw, "-")
+
+            result = pr.get("result")
+            if side == "p1":
+                result_char = {"p1_win": "1", "p2_win": "0", "draw": "="}.get(
+                    result, " "
+                )
+            else:
+                result_char = {"p1_win": "0", "p2_win": "1", "draw": "="}.get(
+                    result, " "
+                )
+            return opp_id_str, color_char, result_char
+
+        # Not found in this round at all - known absence (withdrawn or
+        # eliminated before this round; TRF's "Z").
+        return "0000", "-", "Z"
+
+    def _trf_player_line(self, player, starting_rank, standing_rank, rank_by_name, history):
+        line = list("001")
+        self._trf_set(line, 5, str(starting_rank), 4)
+        self._trf_set(line, 10, (player.sex or "").lower(), 1)
+        self._trf_set(line, 11, player.title or "", 3)
+        display_name = f"{player.last_name}, {player.first_name}".strip(", ")
+        if not display_name:
+            display_name = player.name
+        self._trf_set(line, 15, display_name, 33)
+        fide_rating = player.initial_rating if player.initial_rating is not None else player.rating
+        self._trf_set(line, 49, str(fide_rating), 4)
+        self._trf_set(line, 54, player.fide_federation or "", 3)
+        self._trf_set(line, 58, player.fide_id or "", 11)
+        self._trf_set(line, 70, player.birth_date or "", 10)
+        # Points field is a fixed 4-char column (81-84). "%.1f" normally
+        # fits ("11.5"), but at 100+ points ("100.0") that's 5 chars -
+        # slicing it in _trf_set would silently drop the decimal digit
+        # and leave a malformed trailing-dot token ("100."). Fall back to
+        # an integer-only representation in that case instead - still
+        # technically off-spec (FIDE never anticipated 100+ point
+        # totals) but at least a valid, unambiguous number rather than a
+        # truncated non-number.
+        points_str = f"{player.points:.1f}"
+        if len(points_str) > 4:
+            points_str = f"{player.points:.0f}"
+        self._trf_set(line, 81, points_str, 4)
+        self._trf_set(line, 86, str(standing_rank), 4)
+
+        for round_idx, round_entry in enumerate(history):
+            opp_id, color_char, result_char = self._trf_result_for_player(
+                player.name, rank_by_name, round_entry
+            )
+            base = 92 + round_idx * 10
+            self._trf_set(line, base, opp_id, 4)
+            self._trf_set(line, base + 5, color_char, 1)
+            self._trf_set(line, base + 7, result_char, 1)
+
+        return "".join(line).rstrip()
+
+    def _trf_team_line(self, team_name, member_names, rank_by_name):
+        line = list("013")
+        self._trf_set(line, 5, team_name, 32)
+        for i, name in enumerate(member_names):
+            rank = rank_by_name.get(name)
+            col = 37 + i * 5
+            self._trf_set(line, col, str(rank) if rank else "", 4)
+        return "".join(line).rstrip()
+
+    def build_trf16_content(
+        self, players: list, history: list, starting_rank_names: list, meta: dict,
+        team_a=None, team_b=None, team_a_name="Team A", team_b_name="Team B",
+    ) -> str:
+        """Assemble the full TRF16 text content. `players` must be full
+        Player objects (apply_tiebreak needs opponents/results_vs_opponents).
+        `starting_rank_names` is the tournament's fixed starting-rank
+        order (see _compute at tournament start) - falls back to
+        descending current rating if unavailable (e.g. a very old save)."""
+        if not starting_rank_names:
+            starting_rank_names = [
+                p.name
+                for p in sorted(players, key=lambda p: p.rating, reverse=True)
+            ]
+        rank_by_name = {name: i + 1 for i, name in enumerate(starting_rank_names)}
+        # Any player not in the starting-rank list at all (shouldn't
+        # normally happen) still gets a rank rather than breaking export.
+        next_rank = len(rank_by_name) + 1
+        for p in players:
+            if p.name not in rank_by_name:
+                rank_by_name[p.name] = next_rank
+                next_rank += 1
+
+        meta = dict(meta or {})
+        meta.setdefault("num_players", len(players))
+
+        lines = self._trf_tournament_lines(meta)
+
+        # Standing rank (column 86-89) reflects FINAL tiebreak-resolved
+        # standing, not starting rank - these are two different numbers
+        # in TRF and this app already computes the former via
+        # apply_tiebreak exactly as the standings screens do.
+        sorted_players = self.apply_tiebreak(players)
+        standing_rank = {p.name: i + 1 for i, (p, _tb) in enumerate(sorted_players)}
+
+        for player in sorted(players, key=lambda p: rank_by_name.get(p.name, 1 << 30)):
+            starting_rank = rank_by_name[player.name]
+            standing_rank_value = standing_rank.get(player.name, starting_rank)
+            lines.append(
+                self._trf_player_line(
+                    player, starting_rank, standing_rank_value, rank_by_name, history
+                )
+            )
+
+        if team_a is not None and team_b is not None:
+            lines.append(
+                self._trf_team_line(team_a_name, [p.name for p in team_a], rank_by_name)
+            )
+            lines.append(
+                self._trf_team_line(team_b_name, [p.name for p in team_b], rank_by_name)
+            )
+
+        return "\n".join(lines) + "\n"
+
+    def _show_trf_metadata_dialog(self, default_name: str, on_confirm):
+        """Small modal dialog collecting the Tournament Section fields
+        TRF16 doesn't have anywhere else to pull from (this app has no
+        persistent notion of tournament name/city/arbiter/time control).
+        Every field is optional except Tournament Name - a blank name is
+        allowed too (TRF only warns, doesn't reject), but a real name
+        makes the file far more useful, so it's the one field with a
+        sensible pre-filled default instead of being left empty.
+        Calls on_confirm(meta_dict) if the user clicks Export, or does
+        nothing if they cancel."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("TRF16 Export Details")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        frame = ttk.Frame(dialog, padding="15")
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text="These details are optional (except leaving Tournament\n"
+            "Name blank is allowed too) - fill in what you have.",
+            font=("Arial", 9, "italic"),
+        ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=tk.W)
+
+        fields = [
+            ("name", "Tournament Name:", default_name),
+            ("city", "City:", ""),
+            ("federation", "Federation (3-letter code):", ""),
+            ("chief_arbiter", "Chief Arbiter:", ""),
+            ("deputy_arbiters", "Deputy Arbiter(s):", ""),
+            ("time_control", "Time Control:", ""),
+            ("date_start", "Start Date (YYYY/MM/DD):", ""),
+            ("date_end", "End Date (YYYY/MM/DD):", ""),
+        ]
+        entries = {}
+        for i, (key, label, default) in enumerate(fields, start=1):
+            ttk.Label(frame, text=label, font=("Arial", 10)).grid(
+                row=i, column=0, sticky=tk.W, padx=5, pady=4
+            )
+            entry = ttk.Entry(frame, width=30, font=("Arial", 10))
+            entry.insert(0, default)
+            entry.grid(row=i, column=1, padx=5, pady=4)
+            entries[key] = entry
+
+        def confirm():
+            result_meta = {k: e.get().strip() or None for k, e in entries.items()}
+            dialog.destroy()
+            on_confirm(result_meta)
+
+        def cancel():
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(frame)
+        btn_frame.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=cancel).pack(
+            side=tk.LEFT, padx=5
+        )
+        ttk.Button(btn_frame, text="Export", command=confirm).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        dialog.wait_window()
+
+    def _write_trf16(
+        self, players, history, starting_rank_names, tournament_system,
+        default_name, team_a=None, team_b=None, team_a_name="Team A",
+        team_b_name="Team B",
+    ):
+        """Shared tail end of both TRF export entry points: Knockout
+        warning, metadata dialog, save-file dialog, write."""
+        if tournament_system == "knockout":
+            proceed = messagebox.askyesno(
+                "TRF16 and Knockout",
+                "TRF16 assumes every player's score accumulates across "
+                "all rounds of the same event - it's built around Swiss "
+                "and Round-Robin-style tournaments. A Knockout eliminates "
+                "players partway through, which doesn't really fit that "
+                "model (and FIDE wouldn't rate a Knockout using this "
+                "format).\n\n"
+                "A file can still be generated - eliminated players will "
+                "simply show as absent for their remaining rounds - but "
+                "it may not be meaningful for real submission or for "
+                "other software to import.\n\n"
+                "Export anyway?",
+            )
+            if not proceed:
+                return
+
+        def on_confirm(meta):
+            meta["tournament_type"] = {
+                "swiss": "Individual: Swiss System",
+                "round_robin": "Individual: Round-Robin",
+                "knockout": "Individual: Knockout",
+                "scheveningen": "Team-Swiss: Scheveningen System",
+            }.get(tournament_system, "Individual")
+
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".trf",
+                filetypes=[("TRF16 files", "*.trf"), ("All files", "*.*")],
+                title="Export Tournament as TRF16",
+                initialfile="tournament.trf",
+            )
+            if not filename:
+                return
+            try:
+                content = self.build_trf16_content(
+                    players, history, starting_rank_names, meta,
+                    team_a=team_a, team_b=team_b,
+                    team_a_name=team_a_name, team_b_name=team_b_name,
+                )
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(content)
+                messagebox.showinfo("Exported", f"TRF16 file saved to:\n{filename}")
+            except Exception as exc:
+                messagebox.showerror(
+                    "Export Error", f"Could not write TRF16 file:\n{exc}"
+                )
+
+        self._show_trf_metadata_dialog(default_name, on_confirm)
+
+    def export_tournament_to_trf(self) -> None:
+        """Export the CURRENTLY LOADED (live, in-memory) tournament."""
+        if not getattr(self, "tournament_history", None):
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+        team_a = getattr(self, "schev_team_a", None) or None
+        team_b = getattr(self, "schev_team_b", None) or None
+        self._write_trf16(
+            self.players,
+            self.tournament_history,
+            getattr(self, "trf_starting_rank_names", None),
+            getattr(self, "tournament_system", None),
+            default_name="",
+            team_a=team_a,
+            team_b=team_b,
+        )
+
+    def _export_trf_from_filepath(self, filepath: str) -> None:
+        """Export a saved tournament JSON file straight to TRF16, without
+        requiring the user to open it first - mirrors
+        _export_csv_from_filepath/_export_html_from_filepath."""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as exc:
+            messagebox.showerror("Load Error", f"Could not read tournament file:\n{exc}")
+            return
+
+        history = data.get("tournament_history", [])
+        if not history:
+            messagebox.showinfo(
+                "No Data",
+                "This tournament has no round-by-round history to export.\n\n"
+                "Only tournaments that have completed at least one round "
+                "contain exportable data.",
+            )
+            return
+
+        team_a = team_b = None
+        schev_a_names = data.get("schev_team_a_names") or []
+        schev_b_names = data.get("schev_team_b_names") or []
+        players = self._build_players_from_save_data(data)
+        if schev_a_names and schev_b_names:
+            by_name = {p.name: p for p in players}
+            team_a = [by_name[n] for n in schev_a_names if n in by_name]
+            team_b = [by_name[n] for n in schev_b_names if n in by_name]
+
+        # apply_tiebreak reads self.tiebreak_method - temporarily swap it
+        # to the SAVED file's own setting for this export, then restore
+        # whatever it was before. Without the restore, exporting some
+        # OTHER, past tournament from the "browse saved tournaments"
+        # screen while a different tournament is live in memory would
+        # silently corrupt that live tournament's tiebreak calculations
+        # from this point on.
+        previous_tiebreak_method = getattr(self, "tiebreak_method", None)
+        self.tiebreak_method = data.get("tiebreak_method")
+        try:
+            self._write_trf16(
+                players,
+                history,
+                data.get("trf_starting_rank_names"),
+                data.get("tournament_system"),
+                default_name="",
+                team_a=team_a,
+                team_b=team_b,
+            )
+        finally:
+            self.tiebreak_method = previous_tiebreak_method
+
+    # ============ END TRF16 EXPORT ============
 
     # ============ HTML EXPORT ============
 
@@ -7204,6 +8403,7 @@ class PlayerSorterApp:
             "buchholz": "Buchholz",
             "sonneborn_berger": "Sonneborn-Berger",
             "direct_encounter": "Direct Encounter",
+            "schmuljan": "Schmuljan",
             "rating": "Rating",
         }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
 
@@ -7242,7 +8442,7 @@ class PlayerSorterApp:
                 headers.append("ELO")
             headers += [
                 "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                "Tiebreak", "Status",
+                "White", "Black", "Tiebreak", "Status",
             ]
             header_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
 
@@ -7260,6 +8460,7 @@ class PlayerSorterApp:
                 values += [
                     s.get("points"), s.get("wins"), s.get("losses"),
                     s.get("draws"), s.get("byes"), s.get("half_byes"),
+                    s.get("white_games"), s.get("black_games"),
                     s.get("tiebreak"),
                 ]
 
@@ -7525,7 +8726,7 @@ class PlayerSorterApp:
             )
             right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-            cols = ["rank", "name", "points", "record", "tiebreak", "status"]
+            cols = ["rank", "name", "points", "record", "white", "black", "tiebreak", "status"]
             stand_tree = ttk.Treeview(
                 right_frame, columns=cols, show="headings", height=14
             )
@@ -7533,12 +8734,16 @@ class PlayerSorterApp:
             stand_tree.heading("name", text="Name")
             stand_tree.heading("points", text="Pts")
             stand_tree.heading("record", text="W-L-D")
+            stand_tree.heading("white", text="White")
+            stand_tree.heading("black", text="Black")
             stand_tree.heading("tiebreak", text="TB")
             stand_tree.heading("status", text="Status")
             stand_tree.column("rank", width=30)
             stand_tree.column("name", width=140)
             stand_tree.column("points", width=40)
             stand_tree.column("record", width=80)
+            stand_tree.column("white", width=45)
+            stand_tree.column("black", width=45)
             stand_tree.column("tiebreak", width=55)
             stand_tree.column("status", width=120)
 
@@ -7552,6 +8757,8 @@ class PlayerSorterApp:
                         s["name"],
                         s["points"],
                         record,
+                        s.get("white_games", "—"),
+                        s.get("black_games", "—"),
                         s["tiebreak"] if s["tiebreak"] is not None else "-",
                         s["status"],
                     ),
@@ -7612,6 +8819,11 @@ class PlayerSorterApp:
                     "current_round": getattr(self, "current_round", len(history)),
                 },
             ),
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Button(
+            btn_frame,
+            text="♟ Export as TRF16",
+            command=self.export_tournament_to_trf,
         ).pack(side=tk.LEFT, padx=5)
 
     # ============ END TOURNAMENT MODE ============
