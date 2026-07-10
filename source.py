@@ -5546,6 +5546,29 @@ class PlayerSorterApp:
         if pref_b and not pref_a:
             return (b, a) if pref_b == "white" else (a, b)
 
+        # 5b) Both have the SAME soft preference (rule 3 above already
+        # handled the case where they differ) - satisfying both is
+        # impossible, so give it to whoever needs it more urgently
+        # (bigger |colour difference|), the same magnitude-based
+        # tiebreak already used for a genuine ABSOLUTE conflict in step
+        # 2. Without this, a large Round-Robin can end up coin-flipping
+        # away a real, matching soft preference and needlessly nudging
+        # a player past what a slightly smarter choice would have kept
+        # within bounds - confirmed in testing on a 40-player
+        # Round-Robin, where this was the one demonstrably avoidable
+        # colour-difference violation out of dozens of genuinely
+        # unavoidable ones.
+        if pref_a and pref_b:  # implies pref_a == pref_b here
+            need_a = abs(a.color_difference)
+            need_b = abs(b.color_difference)
+            if need_a != need_b:
+                neediest, other = (a, b) if need_a > need_b else (b, a)
+                if pref_a == "white":
+                    return (neediest, other)
+                else:
+                    return (other, neediest)
+            # Equally urgent - fall through to the coin flip below.
+
         # 6) ...otherwise (true round-1-style tie) decide by lot.
         return (a, b) if random.random() < 0.5 else (b, a)
 
@@ -5796,7 +5819,25 @@ class PlayerSorterApp:
 
         plan = {}
 
+        # Hard safety cap, mirroring the same guard in
+        # _find_swiss_matching: this backtracking search is worst-case
+        # exponential, and unlike Swiss (which only searches one round
+        # at a time), this searches the WHOLE tournament schedule at
+        # once, so the blowup shows up much sooner - testing found a
+        # 44-player round-robin alone taking upwards of 20 seconds and
+        # climbing steeply from there, which would freeze the UI while
+        # generating pairings. If the budget is exhausted, give up fast
+        # rather than slowly - `backtrack` unwinds cleanly (every
+        # partial history/plan entry it added gets popped on the way
+        # back out, same as a normal failed branch) and the caller's
+        # existing "shouldn't normally happen" empty-plan fallback below
+        # takes over, same as it would for a genuine impossibility.
+        call_budget = [50000]
+
         def backtrack(idx):
+            call_budget[0] -= 1
+            if call_budget[0] <= 0:
+                return False
             if idx == len(flat_games):
                 return True
             r_idx, a, b = flat_games[idx]
@@ -5824,11 +5865,12 @@ class PlayerSorterApp:
             return False
 
         if not backtrack(0):
-            # Mathematically shouldn't happen for a standard round-robin
-            # schedule, but if it somehow did, an empty plan makes every
-            # lookup miss, and the caller's per-player override logic
-            # (the same one used for bye-desync) becomes the sole
-            # decision-maker instead - degraded, but still safe.
+            # Either a genuine impossibility (shouldn't happen for a
+            # standard round-robin schedule) or the safety cap above was
+            # hit - either way, an empty plan makes every lookup miss,
+            # and the caller's per-player override logic (the same one
+            # used for bye-desync) becomes the sole decision-maker
+            # instead - degraded, but still safe.
             return {}
         return plan
 
