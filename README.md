@@ -42,6 +42,32 @@ Player Sorter is a comprehensive desktop application designed to organize and ma
 - Battle Royale elimination format
 - Balanced team creation and management
 
+### Chess-Specific Enhancements
+
+**Tiebreak Methods:**
+Swiss and Round-Robin tournaments support a choice of tiebreak method, selected when the tournament is configured:
+- Buchholz (sum of opponents' scores)
+- Sonneborn-Berger (opponents' scores weighted by result)
+- Direct Encounter (head-to-head result between tied players)
+- Schmuljan (opponents' scores, with wins adding and losses subtracting)
+- None (fall back to rating)
+
+**FIDE-Compliant Colour Balancing:**
+Swiss, Round-Robin, Knockout, and Scheveningen tournaments automatically balance White/Black assignments, modelled on FIDE's own colour-allocation rules (Handbook C.04.1/C.04.3). This includes preventing three same-colour games in a row, honouring absolute vs. soft colour preferences, and falling back to alternation, rating, or a coin flip when no other criterion applies. Byes and half-byes are treated as colourless and don't affect the balance.
+
+**Optional FIDE Player Details:**
+Chess players can optionally be given a title (GM, IM, WGM, FM, WIM, CM, WFM, WCM), FIDE ID, federation code, sex, and birth date. None of this is required for normal use — it only matters if you plan to export the tournament as a TRF16 file for official FIDE rating submission.
+
+**Configurable ELO Range:**
+When setting up a chess tournament, you can optionally restrict player ratings to a minimum and/or maximum ELO.
+
+### Export & Tournament Management
+
+- **Export to CSV** — quick, spreadsheet-friendly standings/results export.
+- **Export to HTML** — a shareable, browser-viewable tournament report.
+- **Export to TRF16** — generates a FIDE-standard Tournament Report File suitable for actual FIDE rating submission, prompting for tournament name, city, federation, chief/deputy arbiter(s), time control, and start/end dates. (Not recommended for Knockout tournaments, since TRF16 assumes scores accumulate across all rounds the way they do in Swiss/Round-Robin — the app will warn you if you try.)
+- **Saved Tournament Manager** — browse every saved tournament (finished or still in progress), resume an unfinished one from where you left off, delete old ones, or export any of them (CSV/HTML/TRF16) without having to reopen it first.
+
 ### Perfect For
 
 - Chess club directors managing weekly tournaments
@@ -57,6 +83,7 @@ Player Sorter is a comprehensive desktop application designed to organize and ma
 - **Cross-platform** - Works on Windows, macOS, and Linux
 - **Lightweight** - Runs efficiently on any modern computer
 - **Data persistence** - Automatically saves players and preferences
+- **Update notifications** - Checks GitHub in the background on startup for a newer release and lets you know (non-intrusively, and only once per version — dismissing a version's notice keeps it from reappearing)
 
 ### Get Started
 
