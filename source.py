@@ -5437,13 +5437,16 @@ class PlayerSorterApp:
         player's next real game. preferred_color is 'white', 'black', or
         None (no games played yet, or - defensively - unrecognised
         data). is_streak marks the specific case where the preference is
-        absolute because they'd otherwise get a 3rd-in-a-row - this is
-        treated as more urgent than merely being at the +/-2 colour
-        difference boundary when resolving a genuine conflict (see
-        _assign_colors), since FIDE's own wording singles out "same
-        colour three times in a row" ("no participant shall receive...")
-        as the one exception-averse case, whereas a +/-2 difference is
-        already explicitly tolerated."""
+        absolute because they'd otherwise get a 3rd-in-a-row, as opposed
+        to being absolute purely from being at the +/-2 colour
+        difference boundary - both count equally as "absolute" per FIDE
+        Article 1.7.1 (C.04.3), and when two absolute preferences
+        collide for the same colour, _assign_colors resolves it per
+        Article 5.2.2 by comparing raw |colour difference| magnitude,
+        with no separate priority for the streak-based case. is_streak
+        is kept here purely as diagnostic/descriptive information about
+        *why* a preference is absolute, not as an input to any priority
+        decision."""
         colors = player.colors
         if not colors:
             return None, False, False
@@ -5485,8 +5488,8 @@ class PlayerSorterApp:
         """Decide who of (a, b) plays White vs Black for a game that has
         already been decided as a pairing. Returns (white_player,
         black_player)."""
-        pref_a, abs_a, streak_a = self._color_preference(a)
-        pref_b, abs_b, streak_b = self._color_preference(b)
+        pref_a, abs_a, _ = self._color_preference(a)
+        pref_b, abs_b, _ = self._color_preference(b)
 
         # 1) An absolute preference wins over a non-absolute one.
         if abs_a and not abs_b:
@@ -5498,32 +5501,37 @@ class PlayerSorterApp:
         # the SAME colour (a genuine conflict - rare, and Swiss pairing
         # tries hard to avoid ever creating this pair at all; in
         # Round-Robin/Scheveningen, whose schedules are fixed, it can be
-        # genuinely unavoidable), give it to whoever needs it more:
-        # first, a streak-based need (would otherwise get a 3rd colour
-        # in a row) outranks a difference-based one (already tolerated
-        # up to +/-2 by FIDE); ties within that broken by bigger
-        # |colour difference|, then by rating.
+        # genuinely unavoidable), FIDE Article 5.2.2 (C.04.3) resolves
+        # this by granting it to whoever has the WIDER colour
+        # difference - a single, direct magnitude comparison. There is
+        # no separate rule elevating a streak-based absolute preference
+        # over a difference-based one; both simply count as "absolute"
+        # (Article 1.7.1) and are then compared purely on
+        # abs(colour_difference). An earlier version of this code gave
+        # streak-based need its own higher tier regardless of
+        # magnitude, which isn't what the rule says and let one
+        # player's difference drift arbitrarily far in testing whenever
+        # they kept meeting streak-driven opponents.
         if abs_a and abs_b:
             if pref_a != pref_b:
                 return (a, b) if pref_a == "white" else (b, a)
-            if streak_a != streak_b:
-                winner, loser = (a, b) if streak_a else (b, a)
+            need_a = abs(a.color_difference)
+            need_b = abs(b.color_difference)
+            if need_a != need_b:
+                winner, loser = (a, b) if need_a > need_b else (b, a)
             else:
-                need_a = abs(a.color_difference)
-                need_b = abs(b.color_difference)
-                if need_a != need_b:
-                    winner, loser = (a, b) if need_a > need_b else (b, a)
-                else:
-                    # Genuinely tied on every measure that should matter.
-                    # Deliberately NOT using rating here: a fixed,
-                    # deterministic tiebreak (e.g. "higher rated wins")
-                    # would mean the same player (e.g. whoever has the
-                    # single lowest rating in the field) loses every
-                    # future tie too, compounding into a long run of
-                    # forced same-colour exceptions for them specifically
-                    # - exactly what happened in testing. A coin flip
-                    # spreads exceptions around instead.
-                    winner, loser = (a, b) if random.random() < 0.5 else (b, a)
+                # Genuinely tied on |colour difference| (this also
+                # covers two players who are BOTH here purely on a
+                # streak with an otherwise-equal difference, e.g. both
+                # at 0). Deliberately NOT using rating here: a fixed,
+                # deterministic tiebreak (e.g. "higher rated wins")
+                # would mean the same player (e.g. whoever has the
+                # single lowest rating in the field) loses every future
+                # tie too, compounding into a long run of forced
+                # same-colour exceptions for them specifically - exactly
+                # what happened in testing. A coin flip spreads
+                # exceptions around instead.
+                winner, loser = (a, b) if random.random() < 0.5 else (b, a)
             winner_pref, _, _ = self._color_preference(winner)
             return (winner, loser) if winner_pref == "white" else (loser, winner)
 
