@@ -1178,7 +1178,7 @@ class PlayerSorterApp:
 
         ttk.Button(
             game_frame,
-            text="Chess (ELO)",
+            text="Chess (Rating)",
             width=30,
             style="Large.TButton",
             command=lambda: self.select_game_type("chess"),
@@ -1535,25 +1535,23 @@ class PlayerSorterApp:
                 ("Teams", "teams", "Create balanced teams"),
             ]
 
-        # Create buttons in a centered column
+        # Create buttons in a centered, left-aligned grid so every button and
+        # description lines up on the same column regardless of description length
         btn_container = ttk.Frame(frame)
         btn_container.pack(pady=10)
 
-        for mode_name, mode_id, description in modes:
-            btn_frame = ttk.Frame(btn_container)
-            btn_frame.pack(pady=12)
-
+        for row, (mode_name, mode_id, description) in enumerate(modes):
             btn = ttk.Button(
-                btn_frame,
+                btn_container,
                 text=mode_name,
                 width=25,
                 command=lambda m=mode_id: self.select_mode(m),
             )
-            btn.pack(side=tk.LEFT, padx=10)
+            btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
-            ttk.Label(btn_frame, text=f"- {description}", font=("Arial", 11)).pack(
-                side=tk.LEFT, padx=10
-            )
+            ttk.Label(
+                btn_container, text=f"- {description}", font=("Arial", 11)
+            ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
         ttk.Button(frame, text="← Back", command=self.show_initial_selection).pack(
@@ -1604,25 +1602,23 @@ class PlayerSorterApp:
             ("Scheveningen", "scheveningen", "Team vs team, all vs all"),
         ]
 
-        # Create buttons in centered column
+        # Create buttons in a centered, left-aligned grid so every button and
+        # description lines up on the same column regardless of description length
         btn_container = ttk.Frame(frame)
         btn_container.pack(pady=10)
 
-        for sys_name, sys_id, description in systems:
-            btn_frame = ttk.Frame(btn_container)
-            btn_frame.pack(pady=12)
-
+        for row, (sys_name, sys_id, description) in enumerate(systems):
             btn = ttk.Button(
-                btn_frame,
+                btn_container,
                 text=sys_name,
                 width=30,
                 command=lambda s=sys_id: self.select_tournament_system(s),
             )
-            btn.pack(side=tk.LEFT, padx=10)
+            btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
-            ttk.Label(btn_frame, text=f"- {description}", font=("Arial", 11)).pack(
-                side=tk.LEFT, padx=10
-            )
+            ttk.Label(
+                btn_container, text=f"- {description}", font=("Arial", 11)
+            ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
         ttk.Button(frame, text="← Back", command=self.show_mode_selection).pack(pady=30)
@@ -1675,24 +1671,23 @@ class PlayerSorterApp:
             ("None (Rating)", "rating", "Use rating as tiebreak"),
         ]
 
+        # Create buttons in a centered, left-aligned grid so every button and
+        # description lines up on the same column regardless of description length
         btn_container = ttk.Frame(frame)
         btn_container.pack(pady=10)
 
-        for tb_name, tb_id, description in tiebreaks:
-            btn_frame = ttk.Frame(btn_container)
-            btn_frame.pack(pady=12)
-
+        for row, (tb_name, tb_id, description) in enumerate(tiebreaks):
             btn = ttk.Button(
-                btn_frame,
+                btn_container,
                 text=tb_name,
                 width=25,
                 command=lambda t=tb_id: self.set_tiebreak_and_continue(t),
             )
-            btn.pack(side=tk.LEFT, padx=10)
+            btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
-            ttk.Label(btn_frame, text=f"- {description}", font=("Arial", 11)).pack(
-                side=tk.LEFT, padx=10
-            )
+            ttk.Label(
+                btn_container, text=f"- {description}", font=("Arial", 11)
+            ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         ttk.Button(
             frame, text="← Back", command=self.show_tournament_system_selection
@@ -1746,7 +1741,7 @@ class PlayerSorterApp:
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
-                text="How should ELO ratings change after games?",
+                text="How should ratings change after games?",
                 font=("Arial", 12, "bold"),
             ).pack(pady=8)
 
@@ -1768,14 +1763,14 @@ class PlayerSorterApp:
             ).pack(anchor=tk.W, pady=4)
             ttk.Radiobutton(
                 rating_frame,
-                text="Manual - Manually update ELO after each round",
+                text="Manual - Manually update Rating after each round",
                 variable=self.rating_mode_var,
                 value="manual",
                 style="Large.TRadiobutton",
             ).pack(anchor=tk.W, pady=4)
             ttk.Radiobutton(
                 rating_frame,
-                text="Unranked - No ELO changes",
+                text="Unranked - No Rating changes",
                 variable=self.rating_mode_var,
                 value="unranked",
                 style="Large.TRadiobutton",
@@ -1897,13 +1892,13 @@ class PlayerSorterApp:
         # ELO Limits (Chess only) - larger
         if self.game_type == "chess":
             elo_frame = ttk.LabelFrame(
-                scrollable_frame, text="ELO Requirements", padding="20"
+                scrollable_frame, text="Rating Requirements", padding="20"
             )
             elo_frame.pack(pady=15, padx=30, fill=tk.X)
 
             ttk.Label(
                 elo_frame,
-                text="Set minimum and maximum ELO for tournament participants:",
+                text="Set minimum and maximum Rating for tournament participants:",
                 font=("Arial", 11),
             ).pack(pady=8)
 
@@ -1911,7 +1906,7 @@ class PlayerSorterApp:
             min_elo_frame = ttk.Frame(elo_frame)
             min_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(min_elo_frame, text="Minimum ELO:", font=("Arial", 11)).pack(
+            ttk.Label(min_elo_frame, text="Minimum Rating:", font=("Arial", 11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.min_elo_var = tk.StringVar(value="1000")
@@ -1931,7 +1926,7 @@ class PlayerSorterApp:
             max_elo_frame = ttk.Frame(elo_frame)
             max_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(max_elo_frame, text="Maximum ELO:", font=("Arial", 11)).pack(
+            ttk.Label(max_elo_frame, text="Maximum Rating:", font=("Arial", 11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.max_elo_var = tk.StringVar(value="")
@@ -2009,12 +2004,12 @@ class PlayerSorterApp:
                     self.min_elo = int(min_elo_str)
                     if self.min_elo < 100:
                         messagebox.showwarning(
-                            "Invalid Input", "Minimum ELO cannot be below 100"
+                            "Invalid Input", "Minimum Rating cannot be below 100"
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Minimum ELO must be a number"
+                        "Invalid Input", "Minimum Rating must be a number"
                     )
                     return
             else:
@@ -2029,14 +2024,14 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                                f"Maximum ELO ({self.max_elo}) must be greater than "
-                                f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum Rating ({self.max_elo}) must be greater than "
+                                f"or equal to minimum Rating ({self.min_elo})"
                             ),
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Maximum ELO must be a number"
+                        "Invalid Input", "Maximum Rating must be a number"
                     )
                     return
             else:
@@ -2133,7 +2128,7 @@ class PlayerSorterApp:
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
-                text="How should ELO ratings change after games?",
+                text="How should ratings change after games?",
                 font=("Arial", 10, "bold"),
             ).pack(pady=5)
 
@@ -2153,13 +2148,13 @@ class PlayerSorterApp:
             ).pack(anchor=tk.W, pady=2)
             ttk.Radiobutton(
                 rating_frame,
-                text="Manual - Manually update ELO after each round",
+                text="Manual - Manually update Rating after each round",
                 variable=self.rating_mode_var,
                 value="manual",
             ).pack(anchor=tk.W, pady=2)
             ttk.Radiobutton(
                 rating_frame,
-                text="Unranked - No ELO changes",
+                text="Unranked - No Rating changes",
                 variable=self.rating_mode_var,
                 value="unranked",
             ).pack(anchor=tk.W, pady=2)
@@ -2200,12 +2195,12 @@ class PlayerSorterApp:
 
         # ELO Limits (Chess only)
         if self.game_type == "chess":
-            elo_frame = ttk.LabelFrame(frame, text="ELO Requirements", padding="15")
+            elo_frame = ttk.LabelFrame(frame, text="Rating Requirements", padding="15")
             elo_frame.pack(pady=10, padx=40, fill=tk.X)
 
             ttk.Label(
                 elo_frame,
-                text="Set minimum and maximum ELO for tournament participants:",
+                text="Set minimum and maximum Rating for tournament participants:",
                 font=("Arial", 10),
             ).pack(pady=5)
 
@@ -2213,7 +2208,7 @@ class PlayerSorterApp:
             min_elo_frame = ttk.Frame(elo_frame)
             min_elo_frame.pack(pady=5, fill=tk.X)
 
-            ttk.Label(min_elo_frame, text="Min ELO:").pack(side=tk.LEFT, padx=5)
+            ttk.Label(min_elo_frame, text="Min Rating:").pack(side=tk.LEFT, padx=5)
             self.min_elo_var = tk.StringVar(value="1000")
             ttk.Entry(min_elo_frame, textvariable=self.min_elo_var, width=10).pack(
                 side=tk.LEFT, padx=5
@@ -2228,7 +2223,7 @@ class PlayerSorterApp:
             max_elo_frame = ttk.Frame(elo_frame)
             max_elo_frame.pack(pady=5, fill=tk.X)
 
-            ttk.Label(max_elo_frame, text="Max ELO:").pack(side=tk.LEFT, padx=5)
+            ttk.Label(max_elo_frame, text="Max Rating:").pack(side=tk.LEFT, padx=5)
             self.max_elo_var = tk.StringVar(value="")
             ttk.Entry(max_elo_frame, textvariable=self.max_elo_var, width=10).pack(
                 side=tk.LEFT, padx=5
@@ -2279,12 +2274,12 @@ class PlayerSorterApp:
                     self.min_elo = int(min_elo_str)
                     if self.min_elo < 100:
                         messagebox.showwarning(
-                            "Invalid Input", "Minimum ELO cannot be below 100"
+                            "Invalid Input", "Minimum Rating cannot be below 100"
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Minimum ELO must be a number"
+                        "Invalid Input", "Minimum Rating must be a number"
                     )
                     return
             else:
@@ -2299,14 +2294,14 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                                f"Maximum ELO ({self.max_elo}) must be greater than "
-                                f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum Rating ({self.max_elo}) must be greater than "
+                                f"or equal to minimum Rating ({self.min_elo})"
                             ),
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Maximum ELO must be a number"
+                        "Invalid Input", "Maximum Rating must be a number"
                     )
                     return
             else:
@@ -2351,7 +2346,7 @@ class PlayerSorterApp:
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
-                text="How should ELO ratings change after games?",
+                text="How should ratings change after games?",
                 font=("Arial", 12, "bold"),
             ).pack(pady=5)
 
@@ -2371,13 +2366,13 @@ class PlayerSorterApp:
             ).pack(anchor=tk.W, pady=2)
             ttk.Radiobutton(
                 rating_frame,
-                text="Manual - Manually update ELO after each round",
+                text="Manual - Manually update Rating after each round",
                 variable=self.rating_mode_var,
                 value="manual",
             ).pack(anchor=tk.W, pady=2)
             ttk.Radiobutton(
                 rating_frame,
-                text="Unranked - No ELO changes",
+                text="Unranked - No Rating changes",
                 variable=self.rating_mode_var,
                 value="unranked",
             ).pack(anchor=tk.W, pady=2)
@@ -2478,13 +2473,13 @@ class PlayerSorterApp:
         # ELO Limits (Chess only)
         if self.game_type == "chess":
             elo_frame = ttk.LabelFrame(
-                scrollable_frame, text="ELO Requirements", padding="15"
+                scrollable_frame, text="Rating Requirements", padding="15"
             )
             elo_frame.pack(pady=15, padx=30, fill=tk.X)
 
             ttk.Label(
                 elo_frame,
-                text="Set minimum and maximum ELO for tournament participants:",
+                text="Set minimum and maximum Rating for tournament participants:",
                 font=("Arial", 11),
             ).pack(pady=5)
 
@@ -2492,7 +2487,7 @@ class PlayerSorterApp:
             min_elo_frame = ttk.Frame(elo_frame)
             min_elo_frame.pack(pady=5, fill=tk.X)
 
-            ttk.Label(min_elo_frame, text="Minimum ELO:").pack(side=tk.LEFT, padx=5)
+            ttk.Label(min_elo_frame, text="Minimum Rating:").pack(side=tk.LEFT, padx=5)
             self.min_elo_var = tk.StringVar(value="1000")
             ttk.Entry(min_elo_frame, textvariable=self.min_elo_var, width=10).pack(
                 side=tk.LEFT, padx=5
@@ -2507,7 +2502,7 @@ class PlayerSorterApp:
             max_elo_frame = ttk.Frame(elo_frame)
             max_elo_frame.pack(pady=5, fill=tk.X)
 
-            ttk.Label(max_elo_frame, text="Maximum ELO:").pack(side=tk.LEFT, padx=5)
+            ttk.Label(max_elo_frame, text="Maximum Rating:").pack(side=tk.LEFT, padx=5)
             self.max_elo_var = tk.StringVar(value="")
             ttk.Entry(max_elo_frame, textvariable=self.max_elo_var, width=10).pack(
                 side=tk.LEFT, padx=5
@@ -2564,12 +2559,12 @@ class PlayerSorterApp:
                     self.min_elo = int(min_elo_str)
                     if self.min_elo < 100:
                         messagebox.showwarning(
-                            "Invalid Input", "Minimum ELO cannot be below 100"
+                            "Invalid Input", "Minimum Rating cannot be below 100"
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Minimum ELO must be a number"
+                        "Invalid Input", "Minimum Rating must be a number"
                     )
                     return
             else:
@@ -2584,14 +2579,14 @@ class PlayerSorterApp:
                         messagebox.showwarning(
                             "Invalid Input",
                             (
-                                f"Maximum ELO ({self.max_elo}) must be greater than "
-                                f"or equal to minimum ELO ({self.min_elo})"
+                                f"Maximum Rating ({self.max_elo}) must be greater than "
+                                f"or equal to minimum Rating ({self.min_elo})"
                             ),
                         )
                         return
                 except ValueError:
                     messagebox.showwarning(
-                        "Invalid Input", "Maximum ELO must be a number"
+                        "Invalid Input", "Maximum Rating must be a number"
                     )
                     return
             else:
@@ -2635,7 +2630,7 @@ class PlayerSorterApp:
             mode_name = system_names.get(self.tournament_system, "Tournament")
         else:
             mode_name = self.sort_mode.replace("_", " ").title()
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         title = ttk.Label(
             main_frame, text=f"{game_name} - {mode_name}", font=("Arial", 20, "bold")
@@ -3014,7 +3009,7 @@ class PlayerSorterApp:
         if self.game_type == "chess":
             # Absolute minimum is 100
             if rating < 100:
-                messagebox.showwarning("Invalid Rating", "ELO cannot be below 100")
+                messagebox.showwarning("Invalid Rating", "Rating cannot be below 100")
                 return
 
             # Check tournament ELO limits if set
@@ -3022,14 +3017,14 @@ class PlayerSorterApp:
                 if self.min_elo and rating < self.min_elo:
                     messagebox.showwarning(
                         "Invalid Rating",
-                        f"ELO ({rating}) is below tournament minimum ({self.min_elo})",
+                        f"Rating ({rating}) is below tournament minimum ({self.min_elo})",
                     )
                     return
 
                 if self.max_elo and rating > self.max_elo:
                     messagebox.showwarning(
                         "Invalid Rating",
-                        f"ELO ({rating}) is above tournament maximum ({self.max_elo})",
+                        f"Rating ({rating}) is above tournament maximum ({self.max_elo})",
                     )
                     return
         else:
@@ -3675,12 +3670,12 @@ class PlayerSorterApp:
         rating_frame = ttk.LabelFrame(frame, text="Rating Changes", padding="20")
         rating_frame.pack(pady=20, padx=40, fill=tk.X)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         if self.game_type == "chess":
             ttk.Label(
                 rating_frame,
-                text=f"How should {rating_name} ratings change after games?",
+                text="How should ratings change after games?",
                 font=("Arial", 11, "bold"),
             ).pack(pady=10)
 
@@ -3710,13 +3705,13 @@ class PlayerSorterApp:
 
             ttk.Radiobutton(
                 rating_frame,
-                text="Manual - Manually update ELO after each round",
+                text="Manual - Manually update Rating after each round",
                 variable=self.rating_mode_var,
                 value="manual",
             ).pack(anchor=tk.W, pady=5, padx=20)
             ttk.Radiobutton(
                 rating_frame,
-                text="Unranked - No ELO changes",
+                text="Unranked - No Rating changes",
                 variable=self.rating_mode_var,
                 value="unranked",
             ).pack(anchor=tk.W, pady=5, padx=20)
@@ -3898,7 +3893,7 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         # Store result variables
         self.dual_results = []
@@ -4081,7 +4076,7 @@ class PlayerSorterApp:
 
         tree.heading("rank", text="Rank")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO" if self.game_type == "chess" else "Trophies")
+        tree.heading("rating", text="Rating" if self.game_type == "chess" else "Trophies")
         tree.heading("wins", text="W")
         tree.heading("losses", text="L")
         tree.heading("draws", text="D")
@@ -4199,7 +4194,7 @@ class PlayerSorterApp:
 
         tree.heading("rank", text="Rank")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO" if self.game_type == "chess" else "Trophies")
+        tree.heading("rating", text="Rating" if self.game_type == "chess" else "Trophies")
         tree.heading("wins", text="W")
         tree.heading("losses", text="L")
         tree.heading("draws", text="D")
@@ -4291,7 +4286,7 @@ class PlayerSorterApp:
             table_frame, columns=columns[:-1], show="headings", height=12
         )
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
         self.br_tree.heading("name", text="Name")
         self.br_tree.heading("rating", text=rating_name)
         self.br_tree.heading("wins", text="Wins")
@@ -4502,7 +4497,7 @@ class PlayerSorterApp:
         winner_frame = ttk.LabelFrame(frame, text="Champion", padding="20")
         winner_frame.pack(pady=20)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
         ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
             pady=10
         )
@@ -4594,7 +4589,7 @@ class PlayerSorterApp:
 
         tree.heading("rank", text="Rank")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO" if self.game_type == "chess" else "Trophies")
+        tree.heading("rating", text="Rating" if self.game_type == "chess" else "Trophies")
         tree.heading("wins", text="W")
         tree.heading("losses", text="L")
         tree.heading("draws", text="D")
@@ -4734,7 +4729,7 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         for i, team in enumerate(self.teams, 1):
             avg_rating = sum(p.rating for p in team) / len(team) if team else 0
@@ -4873,7 +4868,7 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
@@ -5004,7 +4999,7 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         for rank, (team_num, team, avg_wr, avg_rating, mvp) in enumerate(
             team_stats, 1
@@ -5152,7 +5147,7 @@ class PlayerSorterApp:
         frame = ttk.Frame(self.root, padding="20")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
         title = ttk.Label(
             frame, text=f"Update {rating_name} Ratings", font=("Arial", 16, "bold")
         )
@@ -6393,7 +6388,7 @@ class PlayerSorterApp:
         tree.heading("rank", text="Rank")
         tree.heading("team", text="Team")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO")
+        tree.heading("rating", text="Rating")
         tree.heading("points", text="Points")
         tree.heading("wins", text="W")
         tree.heading("losses", text="L")
@@ -6735,7 +6730,7 @@ class PlayerSorterApp:
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
 
-        rating_name = "ELO" if self.game_type == "chess" else "Trophies"
+        rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         self.tournament_results = []
 
@@ -7028,7 +7023,7 @@ class PlayerSorterApp:
 
         tree.heading("rank", text="Rank")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO")
+        tree.heading("rating", text="Rating")
         tree.heading("points", text="Points")
         tree.heading("wins", text="W")
         tree.heading("losses", text="L")
@@ -7451,7 +7446,7 @@ class PlayerSorterApp:
 
         tree.heading("rank", text="Rank")
         tree.heading("name", text="Name")
-        tree.heading("rating", text="ELO")
+        tree.heading("rating", text="Rating")
         tree.heading("points", text="Points")
         tree.heading("record", text="Record")
         tree.heading("status", text="Status")
@@ -7535,7 +7530,7 @@ class PlayerSorterApp:
         ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
             pady=10
         )
-        ttk.Label(winner_frame, text=f"ELO: {winner.rating}", font=("Arial", 14)).pack(
+        ttk.Label(winner_frame, text=f"Rating: {winner.rating}", font=("Arial", 14)).pack(
             pady=5
         )
         ttk.Label(
@@ -7671,7 +7666,7 @@ class PlayerSorterApp:
 
                 if is_schev:
                     w.writerow(
-                        ["Rank", "Team", "Name", "ELO", "Points",
+                        ["Rank", "Team", "Name", "Rating", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
                          "White", "Black", "Tiebreak", "Status"]
                     )
@@ -7694,7 +7689,7 @@ class PlayerSorterApp:
                         ])
                 else:
                     w.writerow(
-                        ["Rank", "Name", "ELO", "Points",
+                        ["Rank", "Name", "Rating", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
                          "White", "Black", "Tiebreak", "Status"]
                     )
@@ -8429,7 +8424,7 @@ class PlayerSorterApp:
         def standings_table(standings: list, include_rating: bool) -> str:
             """Render a standings snapshot as an HTML table.
 
-            include_rating controls whether an ELO column is shown - the CSV
+            include_rating controls whether a Rating column is shown - the CSV
             export only includes it in the FINAL standings section, not in
             the per-round "standings after round" sections, so this mirrors
             that exactly rather than showing it everywhere.
@@ -8439,7 +8434,7 @@ class PlayerSorterApp:
                 headers.append("Team")
             headers.append("Name")
             if include_rating:
-                headers.append("ELO")
+                headers.append("Rating")
             headers += [
                 "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
                 "White", "Black", "Tiebreak", "Status",
