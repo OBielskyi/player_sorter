@@ -19,6 +19,8 @@ import pathlib
 import random
 import re
 import shutil
+import ssl
+import sys
 import threading
 import tkinter as tk
 import urllib.error
@@ -40,6 +42,45 @@ _GITHUB_LATEST_RELEASE_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest
 
 # JSON file that persists the "Don't show this again" update-notification choice
 _UPDATE_SETTINGS_FILE = "player_sorter_update_settings.json"
+
+
+def _build_update_check_ssl_context() -> ssl.SSLContext:
+    """Build the SSLContext used for the update-check HTTPS request.
+
+    On Windows, urllib's default context verifies certificates against
+    whatever the OS certificate store already has cached locally. Windows
+    normally fills in missing intermediate CAs on demand (via Windows
+    Update) the first time a native app encounters them, but Python/OpenSSL
+    does not trigger that fetch itself - so on a machine that hasn't
+    already cached the relevant intermediate (fresh installs, sandboxed/
+    test VMs, machines with restricted access to Windows Update), this
+    request can fail with CERTIFICATE_VERIFY_FAILED even though the
+    connection and the certificate itself are both fine. Linux doesn't hit
+    this because distros ship a complete, static CA bundle.
+
+    To avoid depending on that on-demand cache, this loads a bundled,
+    static CA file (cacert.pem - Mozilla's curated root list, e.g. from
+    https://curl.se/ca/cacert.pem) shipped alongside the executable/script,
+    and falls back to the interpreter's normal default verification if
+    that file isn't present (e.g. a dev checkout that hasn't been given a
+    copy of it - the update check just silently no-ops in that case, same
+    as any other network failure).
+
+    NOTE: this deliberately does NOT use Nuitka's __compiled__.containing_dir.
+    Field testing showed that for --standalone (non-onefile) Windows builds,
+    that attribute reflects a compile-time path from the build machine, not
+    the exe's actual runtime location - it returned a bare drive letter
+    ("C:") on a real install, which only "worked" by the accident of
+    Windows' obscure per-drive current-directory resolution matching the
+    exe's folder. sys.argv[0] has been confirmed (via that same field test)
+    to reliably report the real, full path to the running executable, so
+    that's what's used instead.
+    """
+    base_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    cafile = os.path.join(base_dir, "cacert.pem")
+    if os.path.isfile(cafile):
+        return ssl.create_default_context(cafile=cafile)
+    return ssl.create_default_context()
 
 
 def _parse_version(version_str: str) -> tuple:
@@ -704,7 +745,9 @@ class PlayerSorterApp:
                     "Accept": "application/vnd.github+json",
                 },
             )
-            with urllib.request.urlopen(request, timeout=5) as response:
+            with urllib.request.urlopen(
+                request, timeout=5, context=_build_update_check_ssl_context()
+            ) as response:
                 data = json.loads(response.read().decode("utf-8"))
             latest_tag = data.get("tag_name", "")
         except (
