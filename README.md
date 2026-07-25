@@ -101,7 +101,7 @@ Download and run the executable[^2] for your OS.
 #### For *Windows*
 
 The command used for building the Windows executables from the *[source code](https://github.com/OBielskyi/player_sorter/blob/main/source.py)* is as follows: 
-`python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --include-data-files=cacert.pem=cacert.pem --windows-company-name="Oleksandr Bielskyi" --windows-product-name="Player Sorter" --windows-product-version=X.X.X --windows-file-version=X.X.X --windows-file-description="Professional tournament management software" --enable-plugin=tk-inter --windows-console-mode=disable --windows-icon-from-ico=logo.ico --output-filename="PlayerSorter-vX.X.X-Windows" source.py`
+`python -m nuitka --jobs=8 --lto=yes --python-flag=no_asserts --standalone --include-data-files=cacert.pem=cacert.pem --windows-company-name="Oleksandr Bielskyi" --windows-product-name="Player Sorter" --windows-product-version=X.X.X --windows-file-version=X.X.X --windows-file-description="Professional tournament management software" --enable-plugin=tk-inter --windows-console-mode=disable --windows-icon-from-ico=logo.ico --output-filename="PlayerSorter-vX.X.X-Windows" source.py`\
 Note that ***cacert.pem* must be sitting alongside source.py and the logo** because it's required for the update checker to work on Windows. Download it *[here](https://curl.se/ca/cacert.pem)*.
 
 #### For *Linux*
