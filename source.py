@@ -245,6 +245,16 @@ THEMES = {
 # Supported UI scale percentages
 SCALE_OPTIONS = [25, 50, 75, 100, 125, 150, 175, 200]
 
+# Smallest a font is ever allowed to become (expressed in the same base-size
+# unit passed to _sf(), i.e. before the display's own DPI scaling is applied),
+# no matter how low the user's chosen UI scale percentage is. Without this
+# floor, low scale settings (50% and below) would keep shrinking text
+# proportionally forever until it becomes unreadable. 6 keeps even the
+# smallest labels legible at the lowest scale setting (25%) while still
+# leaving room for most text to visibly keep shrinking/growing with the
+# chosen scale rather than everything collapsing to one flat size.
+_MIN_FONT_SIZE = 6
+
 # JSON file that persists the chosen scale between sessions
 _DISPLAY_SETTINGS_FILE = "player_sorter_display_settings.json"
 
@@ -802,7 +812,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text="A new version of Player Sorter is available!",
-            font=("Segoe UI", 13, "bold"),
+            font=self._sf(13, "bold", family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["title_fg"],
             wraplength=380,
@@ -813,7 +823,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text=f"Current version: {current_version}\nLatest version:  {latest_version}",
-            font=("Segoe UI", 10),
+            font=self._sf(10, family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["fg"],
             justify=tk.LEFT,
@@ -822,7 +832,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text="Release link (select and copy):",
-            font=("Segoe UI", 9),
+            font=self._sf(9, family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["subtitle_fg"],
             justify=tk.LEFT,
@@ -830,7 +840,7 @@ class PlayerSorterApp:
 
         link_entry = tk.Entry(
             container,
-            font=("Segoe UI", 10),
+            font=self._sf(10, family="Segoe UI"),
             justify=tk.LEFT,
             width=48,
         )
@@ -876,11 +886,29 @@ class PlayerSorterApp:
         new_scaling = base_scaling * self._scale_multiplier
         self.root.tk.call("tk", "scaling", new_scaling)
     
-    def _sf(self, base_size: int, weight: str = "") -> tuple:
-        """Scale Font helper: returns (family, scaled_size, weight) tuple."""
-        scaled = int(base_size * getattr(self, '_scale_multiplier', 1.0))
+    def _sf(self, base_size: int, weight: str = "", family: str = "Arial") -> tuple:
+        """Scale Font helper: returns a (family, size, weight) tuple for
+        base_size, honoring the current UI scale percentage but never
+        letting the rendered size fall below _MIN_FONT_SIZE.
+
+        The returned size is *negative* (i.e. a pixel size, not a point
+        size) and already includes the platform's base DPI scaling
+        (_get_base_scaling()). This is deliberate: Tk treats a positive
+        font size as "points" and independently re-scales those using the
+        app-wide `tk scaling` factor set in _apply_scale(). If this helper
+        also multiplied by the scale percentage AND returned a positive
+        (point) size, the result would be scaled twice - once here, once
+        by Tk - shrinking or growing far more than intended (e.g. a 50%
+        UI scale would make text render at roughly 25% size). Returning an
+        already-DPI-adjusted pixel size sidesteps that: Tk takes it
+        literally, so this is the only place the scaling math happens,
+        and the floor below is guaranteed to hold regardless of scale.
+        """
+        multiplier = getattr(self, "_scale_multiplier", 1.0)
+        effective_size = max(base_size * multiplier, _MIN_FONT_SIZE)
+        pixels = max(1, round(effective_size * self._get_base_scaling()))
         weight_value = weight if weight else "normal"
-        return ("Arial", scaled, weight_value)
+        return (family, -pixels, weight_value)
     
     def _sp(self, base_value: int) -> str:
         """Scale Padding helper: returns scaled padding as string.
@@ -1020,7 +1048,9 @@ class PlayerSorterApp:
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
         style.configure("TFrame", background=theme["bg"])
-        style.configure("TLabel", background=theme["bg"], foreground=theme["fg"])
+        style.configure(
+            "TLabel", background=theme["bg"], foreground=theme["fg"], font=self._sf(10)
+        )
         style.configure(
             "TLabelframe",
             background=theme["bg"],
@@ -1075,10 +1105,38 @@ class PlayerSorterApp:
             fieldbackground=theme["entry_bg"],
             foreground=theme["entry_fg"],
             bordercolor=theme["border"],
+            font=self._sf(10),
+        )
+
+        # Comboboxes (dropdown selectors)
+        style.configure(
+            "TCombobox",
+            fieldbackground=theme["entry_bg"],
+            foreground=theme["entry_fg"],
+            background=theme["button_bg"],
+            bordercolor=theme["border"],
+            font=self._sf(10),
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", theme["entry_bg"])],
+            foreground=[("readonly", theme["entry_fg"])],
+        )
+        # The popdown listbox isn't a ttk widget, so it isn't themable via
+        # style.configure - it's an option-database entry instead, which
+        # expects a Tk font descriptor string rather than a Python tuple.
+        combo_family, combo_size, combo_weight = self._sf(10)
+        self.root.option_add(
+            "*TCombobox*Listbox.font", f"{{{combo_family}}} {combo_size} {combo_weight}"
         )
 
         # Radiobuttons with proper backgrounds
-        style.configure("TRadiobutton", background=theme["bg"], foreground=theme["fg"])
+        style.configure(
+            "TRadiobutton",
+            background=theme["bg"],
+            foreground=theme["fg"],
+            font=self._sf(10),
+        )
         style.configure(
             "Large.TRadiobutton",
             font=self._sf(11),
@@ -1093,7 +1151,12 @@ class PlayerSorterApp:
         )
 
         # Checkbuttons
-        style.configure("TCheckbutton", background=theme["bg"], foreground=theme["fg"])
+        style.configure(
+            "TCheckbutton",
+            background=theme["bg"],
+            foreground=theme["fg"],
+            font=self._sf(10),
+        )
 
         # Treeview (tables) with colored headings for themed look
         style.configure(
@@ -1167,24 +1230,35 @@ class PlayerSorterApp:
         subtitle = ttk.Label(frame, text="Select Theme", font=self._sf(18))
         subtitle.pack(pady=20)
 
-        # Theme buttons
-        theme_frame = ttk.Frame(frame)
-        theme_frame.pack(pady=20)
+        # Theme picker - a single dropdown instead of one button per theme.
+        # Keeping this to one compact row (rather than stacking a button
+        # for every theme, as before) means the screen's total height no
+        # longer grows with the number of available themes, so the
+        # "Continue to App" button below always stays on-screen regardless
+        # of the chosen UI scale or how many themes get added in future.
+        theme_row = ttk.Frame(frame)
+        theme_row.pack(pady=20)
 
-        for i, theme_name in enumerate(THEMES.keys()):
-            btn = ttk.Button(
-                theme_frame,
-                text=theme_name,
-                width=25,
-                command=lambda t=theme_name: self.select_theme(t),
-            )
-            btn.pack(pady=8)
+        ttk.Label(theme_row, text="Theme:", font=self._sf(12)).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
 
-            # Highlight current theme
-            if theme_name == self.current_theme:
-                ttk.Label(
-                    theme_frame, text="✓ Current", font=self._sf(9, "italic")
-                ).pack()
+        theme_names = list(THEMES.keys())
+        self._theme_select_var = tk.StringVar(value=self.current_theme)
+        theme_combo = ttk.Combobox(
+            theme_row,
+            textvariable=self._theme_select_var,
+            values=theme_names,
+            state="readonly",
+            width=22,
+            font=self._sf(12),
+        )
+        theme_combo.pack(side=tk.LEFT)
+
+        def _on_theme_selected(event=None):
+            self.select_theme(self._theme_select_var.get())
+
+        theme_combo.bind("<<ComboboxSelected>>", _on_theme_selected)
 
         # Continue button
         ttk.Button(
@@ -1319,14 +1393,14 @@ class PlayerSorterApp:
         frame = ttk.Frame(self.root, padding="40")
         frame.pack(expand=True, fill=tk.BOTH)
 
-        ttk.Label(frame, text="Load a Tournament", font=("Arial", 24, "bold")).pack(
+        ttk.Label(frame, text="Load a Tournament", font=self._sf(24, "bold")).pack(
             pady=20
         )
         ttk.Label(
             frame,
             text="Select a tournament to view or resume. "
             "Unfinished tournaments are listed first.",
-            font=("Arial", 12),
+            font=self._sf(12),
         ).pack(pady=5)
 
         list_frame = ttk.Frame(frame)
@@ -1553,12 +1627,12 @@ class PlayerSorterApp:
         # Title
         game_name = "Chess" if self.game_type == "chess" else "E-Sports"
         title = ttk.Label(
-            frame, text=f"{game_name} - Select Mode", font=("Arial", 24, "bold")
+            frame, text=f"{game_name} - Select Mode", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Mode Selection
-        ttk.Label(frame, text="Select Sorting Mode:", font=("Arial", 14)).pack(pady=20)
+        ttk.Label(frame, text="Select Sorting Mode:", font=self._sf(14)).pack(pady=20)
 
         if self.game_type == "chess":
             modes = [
@@ -1593,7 +1667,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
@@ -1625,12 +1699,12 @@ class PlayerSorterApp:
 
         # Title with larger font
         title = ttk.Label(
-            frame, text="Chess - Select Tournament System", font=("Arial", 24, "bold")
+            frame, text="Chess - Select Tournament System", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Tournament systems with larger fonts
-        ttk.Label(frame, text="Select Tournament System:", font=("Arial", 14)).pack(
+        ttk.Label(frame, text="Select Tournament System:", font=self._sf(14)).pack(
             pady=20
         )
 
@@ -1660,7 +1734,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
@@ -1697,12 +1771,12 @@ class PlayerSorterApp:
             "Swiss System" if self.tournament_system == "swiss" else "Round-Robin"
         )
         title = ttk.Label(
-            frame, text=f"{system_name} - Configuration", font=("Arial", 24, "bold")
+            frame, text=f"{system_name} - Configuration", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Tiebreak selection
-        ttk.Label(frame, text="Select Tiebreak Method:", font=("Arial", 14)).pack(
+        ttk.Label(frame, text="Select Tiebreak Method:", font=self._sf(14)).pack(
             pady=20
         )
 
@@ -1729,7 +1803,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         ttk.Button(
@@ -1755,7 +1829,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"{system_name} - Tournament Settings",
-            font=("Arial", 22, "bold"),
+            font=self._sf(22, "bold"),
         )
         title.pack(pady=20)
 
@@ -1785,7 +1859,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=8)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -1822,7 +1896,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=8)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -1849,7 +1923,7 @@ class PlayerSorterApp:
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=8)
 
@@ -1881,7 +1955,7 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=8)
 
@@ -1910,26 +1984,26 @@ class PlayerSorterApp:
         ttk.Label(
             rounds_frame,
             text="Set maximum number of rounds (optional):",
-            font=("Arial", 11),
+            font=self._sf(11),
         ).pack(pady=8)
 
         rounds_input_frame = ttk.Frame(rounds_frame)
         rounds_input_frame.pack(pady=8)
 
         self.max_rounds_var = tk.StringVar(value="")
-        ttk.Label(rounds_input_frame, text="Rounds:", font=("Arial", 11)).pack(
+        ttk.Label(rounds_input_frame, text="Rounds:", font=self._sf(11)).pack(
             side=tk.LEFT, padx=8
         )
         ttk.Entry(
             rounds_input_frame,
             textvariable=self.max_rounds_var,
             width=15,
-            font=("Arial", 11),
+            font=self._sf(11),
         ).pack(side=tk.LEFT, padx=8)
         ttk.Label(
             rounds_input_frame,
             text="(leave empty for unlimited)",
-            font=("Arial", 10, "italic"),
+            font=self._sf(10, "italic"),
         ).pack(side=tk.LEFT, padx=8)
 
         # ELO Limits (Chess only) - larger
@@ -1942,14 +2016,14 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(pady=8)
 
             # Minimum ELO
             min_elo_frame = ttk.Frame(elo_frame)
             min_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(min_elo_frame, text="Minimum Rating:", font=("Arial", 11)).pack(
+            ttk.Label(min_elo_frame, text="Minimum Rating:", font=self._sf(11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.min_elo_var = tk.StringVar(value="1000")
@@ -1957,19 +2031,19 @@ class PlayerSorterApp:
                 min_elo_frame,
                 textvariable=self.min_elo_var,
                 width=15,
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(side=tk.LEFT, padx=8)
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, absolute minimum: 100)",
-                font=("Arial", 10, "italic"),
+                font=self._sf(10, "italic"),
             ).pack(side=tk.LEFT, padx=8)
 
             # Maximum ELO
             max_elo_frame = ttk.Frame(elo_frame)
             max_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(max_elo_frame, text="Maximum Rating:", font=("Arial", 11)).pack(
+            ttk.Label(max_elo_frame, text="Maximum Rating:", font=self._sf(11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.max_elo_var = tk.StringVar(value="")
@@ -1977,12 +2051,12 @@ class PlayerSorterApp:
                 max_elo_frame,
                 textvariable=self.max_elo_var,
                 width=15,
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(side=tk.LEFT, padx=8)
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no upper limit)",
-                font=("Arial", 10, "italic"),
+                font=self._sf(10, "italic"),
             ).pack(side=tk.LEFT, padx=8)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
@@ -2094,20 +2168,20 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         title = ttk.Label(
-            frame, text="Scheveningen System - Setup", font=("Arial", 16, "bold")
+            frame, text="Scheveningen System - Setup", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
         ttk.Label(
-            frame, text="In Scheveningen, two teams compete.", font=("Arial", 11)
+            frame, text="In Scheveningen, two teams compete.", font=self._sf(11)
         ).pack(pady=5)
         ttk.Label(
             frame,
             text="Every player from Team A plays every player from Team B.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
-        ttk.Label(frame, text="\nPlayers per team:", font=("Arial", 11, "bold")).pack(
+        ttk.Label(frame, text="\nPlayers per team:", font=self._sf(11, "bold")).pack(
             pady=10
         )
 
@@ -2117,7 +2191,7 @@ class PlayerSorterApp:
         )
         spinbox.pack(pady=5)
 
-        ttk.Label(frame, text="\nTiebreak method:", font=("Arial", 11, "bold")).pack(
+        ttk.Label(frame, text="\nTiebreak method:", font=self._sf(11, "bold")).pack(
             pady=10
         )
 
@@ -2160,7 +2234,7 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         title = ttk.Label(
-            frame, text="Knockout - Tournament Settings", font=("Arial", 16, "bold")
+            frame, text="Knockout - Tournament Settings", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
@@ -2172,7 +2246,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 10, "bold"),
+                font=self._sf(10, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -2205,7 +2279,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 10, "bold"),
+                font=self._sf(10, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -2232,7 +2306,7 @@ class PlayerSorterApp:
             "• No half-byes (players must compete)\n"
             "• No withdrawals (single elimination)\n"
             "• Natural end (continues to 1 winner)",
-            font=("Arial", 9),
+            font=self._sf(9),
             justify=tk.LEFT,
         ).pack()
 
@@ -2244,7 +2318,7 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(pady=5)
 
             # Minimum ELO
@@ -2259,7 +2333,7 @@ class PlayerSorterApp:
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, min: 100)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
             # Maximum ELO
@@ -2274,7 +2348,7 @@ class PlayerSorterApp:
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no limit)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
         # Buttons
@@ -2363,7 +2437,7 @@ class PlayerSorterApp:
         frame.pack(expand=True, fill=tk.BOTH)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Tournament Settings", font=("Arial", 22, "bold")
+            frame, text="Scheveningen - Tournament Settings", font=self._sf(22, "bold")
         )
         title.pack(pady=20)
 
@@ -2390,7 +2464,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -2423,7 +2497,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -2448,7 +2522,7 @@ class PlayerSorterApp:
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=5)
 
@@ -2478,7 +2552,7 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=5)
 
@@ -2509,7 +2583,7 @@ class PlayerSorterApp:
                 f"Total rounds: {self.scheveningen_team_size} "
                 "(each player plays each opponent once)"
             ),
-            font=("Arial", 10),
+            font=self._sf(10),
             justify=tk.LEFT,
         ).pack()
 
@@ -2523,7 +2597,7 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(pady=5)
 
             # Minimum ELO
@@ -2538,7 +2612,7 @@ class PlayerSorterApp:
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, absolute minimum: 100)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
             # Maximum ELO
@@ -2553,7 +2627,7 @@ class PlayerSorterApp:
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no upper limit)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
@@ -2676,7 +2750,7 @@ class PlayerSorterApp:
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         title = ttk.Label(
-            main_frame, text=f"{game_name} - {mode_name}", font=("Arial", 20, "bold")
+            main_frame, text=f"{game_name} - {mode_name}", font=self._sf(20, "bold")
         )
         title.pack(pady=15)
 
@@ -2692,29 +2766,29 @@ class PlayerSorterApp:
         # Row 0: First Name, Last Name
         # Row 1: Nickname, Rating, Add Button
 
-        ttk.Label(input_frame, text="First Name:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="First Name:", font=self._sf(11)).grid(
             row=0, column=0, sticky=tk.W, padx=10, pady=8
         )
-        self.first_name_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.first_name_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.first_name_entry.grid(row=0, column=1, padx=10, pady=8)
 
-        ttk.Label(input_frame, text="Last Name:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="Last Name:", font=self._sf(11)).grid(
             row=0, column=2, sticky=tk.W, padx=10, pady=8
         )
-        self.last_name_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.last_name_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.last_name_entry.grid(row=0, column=3, padx=10, pady=8)
 
-        ttk.Label(input_frame, text="Nickname:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="Nickname:", font=self._sf(11)).grid(
             row=1, column=0, sticky=tk.W, padx=10, pady=8
         )
-        self.nickname_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.nickname_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.nickname_entry.grid(row=1, column=1, padx=10, pady=8)
 
         # Rating input
-        ttk.Label(input_frame, text=f"{rating_name}:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text=f"{rating_name}:", font=self._sf(11)).grid(
             row=1, column=2, sticky=tk.W, padx=10, pady=8
         )
-        self.rating_entry = ttk.Entry(input_frame, width=15, font=("Arial", 11))
+        self.rating_entry = ttk.Entry(input_frame, width=15, font=self._sf(11))
         self.rating_entry.grid(row=1, column=3, padx=10, pady=8)
 
         # Add/Update button
@@ -2735,46 +2809,46 @@ class PlayerSorterApp:
             )
             fide_frame.grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
 
-            ttk.Label(fide_frame, text="Sex:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Sex:", font=self._sf(10)).grid(
                 row=0, column=0, sticky=tk.W, padx=6, pady=4
             )
             self.sex_combo = ttk.Combobox(
-                fide_frame, width=5, font=("Arial", 10),
+                fide_frame, width=5, font=self._sf(10),
                 values=["", "m", "w"], state="readonly",
             )
             self.sex_combo.set("")
             self.sex_combo.grid(row=0, column=1, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Title:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Title:", font=self._sf(10)).grid(
                 row=0, column=2, sticky=tk.W, padx=6, pady=4
             )
             self.title_combo = ttk.Combobox(
-                fide_frame, width=6, font=("Arial", 10),
+                fide_frame, width=6, font=self._sf(10),
                 values=["", "GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM"],
                 state="readonly",
             )
             self.title_combo.set("")
             self.title_combo.grid(row=0, column=3, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Federation:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Federation:", font=self._sf(10)).grid(
                 row=0, column=4, sticky=tk.W, padx=6, pady=4
             )
             self.federation_entry = ttk.Entry(
-                fide_frame, width=6, font=("Arial", 10)
+                fide_frame, width=6, font=self._sf(10)
             )
             self.federation_entry.grid(row=0, column=5, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="FIDE ID:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="FIDE ID:", font=self._sf(10)).grid(
                 row=1, column=0, sticky=tk.W, padx=6, pady=4
             )
-            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=("Arial", 10))
+            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=self._sf(10))
             self.fide_id_entry.grid(row=1, column=1, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=self._sf(10)).grid(
                 row=1, column=2, columnspan=2, sticky=tk.W, padx=6, pady=4
             )
             self.birth_date_entry = ttk.Entry(
-                fide_frame, width=12, font=("Arial", 10)
+                fide_frame, width=12, font=self._sf(10)
             )
             self.birth_date_entry.grid(row=1, column=4, padx=6, pady=4)
 
@@ -2788,7 +2862,7 @@ class PlayerSorterApp:
             req_text = "Required: Nickname | Optional: First Name + Last Name"
 
         req_label = ttk.Label(
-            input_frame, text=req_text, font=("Arial", 9, "italic"), foreground="blue"
+            input_frame, text=req_text, font=self._sf(9, "italic"), foreground="blue"
         )
         req_label.grid(row=3, column=0, columnspan=5, pady=5)
 
@@ -2832,8 +2906,8 @@ class PlayerSorterApp:
 
         # Configure treeview font
         style = ttk.Style()
-        style.configure("Treeview", font=("Arial", 10), rowheight=25)
-        style.configure("Treeview.Heading", font=("Arial", 11, "bold"))
+        style.configure("Treeview", font=self._sf(10), rowheight=25)
+        style.configure("Treeview.Heading", font=self._sf(11, "bold"))
 
         # Bind selection event
         self.tree.bind("<<TreeviewSelect>>", self.on_player_select)
@@ -3705,7 +3779,7 @@ class PlayerSorterApp:
 
         mode_name = self.sort_mode.replace("_", " ").title()
         title = ttk.Label(
-            frame, text=f"{mode_name} - Rating Settings", font=("Arial", 16, "bold")
+            frame, text=f"{mode_name} - Rating Settings", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
@@ -3719,7 +3793,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             ).pack(pady=10)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -3762,7 +3836,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text=f"Should {rating_name} ratings be updated?",
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             ).pack(pady=10)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -3788,7 +3862,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rounds_frame,
                 text="Set maximum number of rounds (optional):",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(pady=5)
 
             rounds_input_frame = ttk.Frame(rounds_frame)
@@ -3802,7 +3876,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rounds_input_frame,
                 text="(leave empty for unlimited)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
         # Buttons
@@ -3914,7 +3988,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Dual Mode - Round {self.current_round}",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=10)
 
@@ -3950,18 +4024,18 @@ class PlayerSorterApp:
 
             # Player 1
             p1_label = f"{p1.name} ({rating_name}: {p1.rating}, WR: {p1.win_rate:.1f}%)"
-            ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
+            ttk.Label(pair_frame, text=p1_label, font=self._sf(10)).grid(
                 row=0, column=0, sticky=tk.W, padx=5
             )
 
             # VS
-            ttk.Label(pair_frame, text="vs", font=("Arial", 10, "italic")).grid(
+            ttk.Label(pair_frame, text="vs", font=self._sf(10, "italic")).grid(
                 row=0, column=1, padx=10
             )
 
             # Player 2
             p2_label = f"{p2.name} ({rating_name}: {p2.rating}, WR: {p2.win_rate:.1f}%)"
-            ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
+            ttk.Label(pair_frame, text=p2_label, font=self._sf(10)).grid(
                 row=0, column=2, sticky=tk.W, padx=5
             )
 
@@ -3999,7 +4073,7 @@ class PlayerSorterApp:
                     f"{leftover.name} ({rating_name}: {leftover.rating}, "
                     f"WR: {leftover.win_rate:.1f}%)"
                 ),
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W)
             # Bye round counts as 1 full point
             self.dual_results.append(
@@ -4088,7 +4162,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Dual Mode - Standings After Round {self.current_round}",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=10)
 
@@ -4199,7 +4273,7 @@ class PlayerSorterApp:
 
         # Title
         title = ttk.Label(
-            frame, text="Dual Mode - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Dual Mode - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -4211,7 +4285,7 @@ class PlayerSorterApp:
         if sorted_players:
             winner = sorted_players[0]
             ttk.Label(
-                frame, text=f"🏆 Winner: {winner.name} 🏆", font=("Arial", 16, "bold")
+                frame, text=f"🏆 Winner: {winner.name} 🏆", font=self._sf(16, "bold")
             ).pack(pady=10)
 
         # Results table
@@ -4303,7 +4377,7 @@ class PlayerSorterApp:
                 f"Battle Royale - Round {self.current_round} "
                 f"({len(active_players)} players remaining)"
             ),
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4311,12 +4385,12 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Add wins, losses, or draws for each player, then finish the round.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
         ttk.Label(
             frame,
             text="Bottom 3 players will be eliminated after each round.",
-            font=("Arial", 9, "italic"),
+            font=self._sf(9, "italic"),
         ).pack(pady=2)
 
         # Player table with action buttons
@@ -4472,7 +4546,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Round {self.current_round} - Eliminations",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=20)
 
@@ -4484,13 +4558,13 @@ class PlayerSorterApp:
             ttk.Label(
                 elim_frame,
                 text=f"❌ {player.name} (Win Rate: {player.win_rate:.1f}%)",
-                font=("Arial", 12),
+                font=self._sf(12),
             ).pack(pady=5)
 
         # Remaining count
         remaining = len([p for p in self.players if not p.eliminated])
         ttk.Label(
-            frame, text=f"{remaining} players remaining", font=("Arial", 11)
+            frame, text=f"{remaining} players remaining", font=self._sf(11)
         ).pack(pady=10)
 
         # Button
@@ -4534,21 +4608,21 @@ class PlayerSorterApp:
         winner = active_players[0]
 
         # Title
-        ttk.Label(frame, text="🏆 WINNER! 🏆", font=("Arial", 24, "bold")).pack(pady=20)
+        ttk.Label(frame, text="🏆 WINNER! 🏆", font=self._sf(24, "bold")).pack(pady=20)
 
         # Winner info
         winner_frame = ttk.LabelFrame(frame, text="Champion", padding="20")
         winner_frame.pack(pady=20)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
-        ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
+        ttk.Label(winner_frame, text=winner.name, font=self._sf(20, "bold")).pack(
             pady=10
         )
         ttk.Label(
-            winner_frame, text=f"{rating_name}: {winner.rating}", font=("Arial", 14)
+            winner_frame, text=f"{rating_name}: {winner.rating}", font=self._sf(14)
         ).pack(pady=5)
         ttk.Label(
-            winner_frame, text=f"Win Rate: {winner.win_rate:.1f}%", font=("Arial", 14)
+            winner_frame, text=f"Win Rate: {winner.win_rate:.1f}%", font=self._sf(14)
         ).pack(pady=5)
 
         record = f"Record: {winner.wins}W - {winner.losses}L - {winner.draws}D"
@@ -4557,7 +4631,7 @@ class PlayerSorterApp:
         if winner.half_byes > 0:
             record += f" - {winner.half_byes}½Bye"
 
-        ttk.Label(winner_frame, text=record, font=("Arial", 12)).pack(pady=5)
+        ttk.Label(winner_frame, text=record, font=self._sf(12)).pack(pady=5)
 
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -4581,7 +4655,7 @@ class PlayerSorterApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         title = ttk.Label(
-            frame, text="Battle Royale - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Battle Royale - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -4702,7 +4776,7 @@ class PlayerSorterApp:
         frame = ttk.Frame(dialog, padding="20")
         frame.pack(expand=True)
 
-        ttk.Label(frame, text="Number of Teams:", font=("Arial", 11)).pack(pady=10)
+        ttk.Label(frame, text="Number of Teams:", font=self._sf(11)).pack(pady=10)
 
         num_teams_var = tk.IntVar(value=2)
         spinbox = ttk.Spinbox(
@@ -4745,7 +4819,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Teams Mode - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4753,7 +4827,7 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Add wins, losses, or draws for each player, then finish the round.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
         # Teams display with player stats
@@ -4801,7 +4875,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}%)"
                 )
                 ttk.Label(
-                    player_frame, text=info_text, font=("Arial", 9), width=40
+                    player_frame, text=info_text, font=self._sf(9), width=40
                 ).pack(side=tk.LEFT)
 
                 # Action buttons
@@ -4876,7 +4950,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Teams Mode - Standings After Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4930,13 +5004,13 @@ class PlayerSorterApp:
             if mvp:
                 mvp_frame = ttk.Frame(team_frame)
                 mvp_frame.pack(fill=tk.X, pady=5)
-                ttk.Label(mvp_frame, text="🏅 MVP:", font=("Arial", 10, "bold")).pack(
+                ttk.Label(mvp_frame, text="🏅 MVP:", font=self._sf(10, "bold")).pack(
                     side=tk.LEFT
                 )
                 ttk.Label(
                     mvp_frame,
                     text=f"{mvp.name} (WR: {mvp.win_rate:.1f}%)",
-                    font=("Arial", 10),
+                    font=self._sf(10),
                 ).pack(side=tk.LEFT, padx=5)
 
             # Players
@@ -4946,7 +5020,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}% "
                     f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
-                ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
+                ttk.Label(team_frame, text=player_text, font=self._sf(9)).pack(
                     anchor=tk.W, pady=1
                 )
 
@@ -4992,7 +5066,7 @@ class PlayerSorterApp:
 
         # Title
         title = ttk.Label(
-            frame, text="Teams Mode - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Teams Mode - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -5021,7 +5095,7 @@ class PlayerSorterApp:
             ttk.Label(
                 frame,
                 text=f"🏆 Winning Team: Team {winning_team[0]} 🏆",
-                font=("Arial", 16, "bold"),
+                font=self._sf(16, "bold"),
             ).pack(pady=10)
 
         # Display teams
@@ -5061,13 +5135,13 @@ class PlayerSorterApp:
             if mvp:
                 mvp_frame = ttk.Frame(team_frame)
                 mvp_frame.pack(fill=tk.X, pady=5)
-                ttk.Label(mvp_frame, text="🏅 MVP:", font=("Arial", 10, "bold")).pack(
+                ttk.Label(mvp_frame, text="🏅 MVP:", font=self._sf(10, "bold")).pack(
                     side=tk.LEFT
                 )
                 ttk.Label(
                     mvp_frame,
                     text=f"{mvp.name} (WR: {mvp.win_rate:.1f}%)",
-                    font=("Arial", 10),
+                    font=self._sf(10),
                 ).pack(side=tk.LEFT, padx=5)
 
             # Players
@@ -5077,7 +5151,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}% "
                     f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
-                ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
+                ttk.Label(team_frame, text=player_text, font=self._sf(9)).pack(
                     anchor=tk.W, pady=1
                 )
 
@@ -5192,14 +5266,14 @@ class PlayerSorterApp:
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
         title = ttk.Label(
-            frame, text=f"Update {rating_name} Ratings", font=("Arial", 16, "bold")
+            frame, text=f"Update {rating_name} Ratings", font=self._sf(16, "bold")
         )
         title.pack(pady=10)
 
         ttk.Label(
             frame,
             text=f"Manually adjust {rating_name} ratings based on round performance:",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
         # Scrollable player list with rating inputs
@@ -5440,7 +5514,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Swiss System - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -5939,7 +6013,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Round-Robin - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -6152,7 +6226,7 @@ class PlayerSorterApp:
             round_name = f"Round {self.current_round}"
 
         title = ttk.Label(
-            frame, text=f"Knockout - {round_name}", font=("Arial", 16, "bold")
+            frame, text=f"Knockout - {round_name}", font=self._sf(16, "bold")
         )
         title.pack(pady=10)
 
@@ -6234,7 +6308,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Scheveningen - Round {self.schev_round}/{self.schev_total_rounds}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -6397,7 +6471,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Scheveningen - Standings After Round {self.schev_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -6493,7 +6567,7 @@ class PlayerSorterApp:
                     "Players can request a half-bye (0.5 points) "
                     "to skip the next round."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -6529,7 +6603,7 @@ class PlayerSorterApp:
                     "Select players to withdraw from the tournament "
                     "(they keep their current score)."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -6596,7 +6670,7 @@ class PlayerSorterApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Final Results", font=("Arial", 18, "bold")
+            frame, text="Scheveningen - Final Results", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -6612,7 +6686,7 @@ class PlayerSorterApp:
         else:
             winner_text = f"Draw! ({team_a_score} - {team_b_score})"
 
-        ttk.Label(frame, text=winner_text, font=("Arial", 16, "bold")).pack(pady=20)
+        ttk.Label(frame, text=winner_text, font=self._sf(16, "bold")).pack(pady=20)
 
         # Display teams with individual scores
         teams_frame = ttk.Frame(frame)
@@ -6628,7 +6702,7 @@ class PlayerSorterApp:
             ttk.Label(
                 team_a_frame,
                 text=f"{p.name}: {p.points} pts ({p.wins}W-{p.losses}L-{p.draws}D)",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W, pady=2)
 
         # Team B
@@ -6641,7 +6715,7 @@ class PlayerSorterApp:
             ttk.Label(
                 team_b_frame,
                 text=f"{p.name}: {p.points} pts ({p.wins}W-{p.losses}L-{p.draws}D)",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W, pady=2)
 
         btn_frame = ttk.Frame(frame)
@@ -6790,7 +6864,7 @@ class PlayerSorterApp:
                     ttk.Label(
                         pair_frame,
                         text=f"{p1.name} - HALF-BYE (0.5 points)",
-                        font=("Arial", 11, "bold"),
+                        font=self._sf(11, "bold"),
                         foreground="blue",
                     ).pack(anchor=tk.W)
                     result_var = tk.StringVar(value="half_bye")
@@ -6798,7 +6872,7 @@ class PlayerSorterApp:
                     ttk.Label(
                         pair_frame,
                         text=f"{p1.name} - BYE (1 point)",
-                        font=("Arial", 11, "bold"),
+                        font=self._sf(11, "bold"),
                     ).pack(anchor=tk.W)
                     result_var = tk.StringVar(value="bye")
                 self.tournament_results.append((pairing, result_var))
@@ -6821,12 +6895,12 @@ class PlayerSorterApp:
                     f"{p1.name}{p1_color_suffix} "
                     f"({rating_name}: {p1.rating}, Pts: {p1.points})"
                 )
-                ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
+                ttk.Label(pair_frame, text=p1_label, font=self._sf(10)).grid(
                     row=0, column=0, sticky=tk.W, padx=5
                 )
 
                 # VS
-                ttk.Label(pair_frame, text="vs", font=("Arial", 10, "italic")).grid(
+                ttk.Label(pair_frame, text="vs", font=self._sf(10, "italic")).grid(
                     row=0, column=1, padx=10
                 )
 
@@ -6835,7 +6909,7 @@ class PlayerSorterApp:
                     f"{p2.name}{p2_color_suffix} "
                     f"({rating_name}: {p2.rating}, Pts: {p2.points})"
                 )
-                ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
+                ttk.Label(pair_frame, text=p2_label, font=self._sf(10)).grid(
                     row=0, column=2, sticky=tk.W, padx=5
                 )
 
@@ -7033,7 +7107,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"{system_name} - Standings After Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -7129,7 +7203,7 @@ class PlayerSorterApp:
                     "Players can request a half-bye (0.5 points) "
                     "to skip the next round."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each player, keyed by player object
@@ -7164,7 +7238,7 @@ class PlayerSorterApp:
                     "Select players to withdraw from the tournament "
                     "(they keep their current score)."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -7454,7 +7528,7 @@ class PlayerSorterApp:
         system_name = system_names.get(self.tournament_system, "Tournament")
 
         title = ttk.Label(
-            frame, text=f"{system_name} - Final Standings", font=("Arial", 18, "bold")
+            frame, text=f"{system_name} - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -7465,7 +7539,7 @@ class PlayerSorterApp:
         if sorted_players:
             winner = sorted_players[0][0]
             ttk.Label(
-                frame, text=f"🏆 Winner: {winner.name} 🏆", font=("Arial", 16, "bold")
+                frame, text=f"🏆 Winner: {winner.name} 🏆", font=self._sf(16, "bold")
             ).pack(pady=10)
 
         # Display full standings
@@ -7564,20 +7638,20 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         ttk.Label(
-            frame, text="🏆 TOURNAMENT WINNER! 🏆", font=("Arial", 24, "bold")
+            frame, text="🏆 TOURNAMENT WINNER! 🏆", font=self._sf(24, "bold")
         ).pack(pady=20)
 
         winner_frame = ttk.LabelFrame(frame, text="Champion", padding="20")
         winner_frame.pack(pady=20)
 
-        ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
+        ttk.Label(winner_frame, text=winner.name, font=self._sf(20, "bold")).pack(
             pady=10
         )
-        ttk.Label(winner_frame, text=f"Rating: {winner.rating}", font=("Arial", 14)).pack(
+        ttk.Label(winner_frame, text=f"Rating: {winner.rating}", font=self._sf(14)).pack(
             pady=5
         )
         ttk.Label(
-            winner_frame, text=f"Points: {winner.points}", font=("Arial", 14)
+            winner_frame, text=f"Points: {winner.points}", font=self._sf(14)
         ).pack(pady=5)
 
         record = f"Record: {winner.wins}W - {winner.losses}L - {winner.draws}D"
@@ -7586,7 +7660,7 @@ class PlayerSorterApp:
         if winner.half_byes > 0:
             record += f" - {winner.half_byes}½Bye"
 
-        ttk.Label(winner_frame, text=record, font=("Arial", 12)).pack(pady=5)
+        ttk.Label(winner_frame, text=record, font=self._sf(12)).pack(pady=5)
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=20)
@@ -8088,7 +8162,7 @@ class PlayerSorterApp:
             frame,
             text="These details are optional (except leaving Tournament\n"
             "Name blank is allowed too) - fill in what you have.",
-            font=("Arial", 9, "italic"),
+            font=self._sf(9, "italic"),
         ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=tk.W)
 
         fields = [
@@ -8103,10 +8177,10 @@ class PlayerSorterApp:
         ]
         entries = {}
         for i, (key, label, default) in enumerate(fields, start=1):
-            ttk.Label(frame, text=label, font=("Arial", 10)).grid(
+            ttk.Label(frame, text=label, font=self._sf(10)).grid(
                 row=i, column=0, sticky=tk.W, padx=5, pady=4
             )
-            entry = ttk.Entry(frame, width=30, font=("Arial", 10))
+            entry = ttk.Entry(frame, width=30, font=self._sf(10))
             entry.insert(0, default)
             entry.grid(row=i, column=1, padx=5, pady=4)
             entries[key] = entry
@@ -8676,14 +8750,14 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Tournament Round-by-Round Details",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         ).pack(pady=10)
 
         # Round selector
         selector_frame = ttk.Frame(frame)
         selector_frame.pack(pady=5)
 
-        ttk.Label(selector_frame, text="Select Round:", font=("Arial", 12)).pack(
+        ttk.Label(selector_frame, text="Select Round:", font=self._sf(12)).pack(
             side=tk.LEFT, padx=5
         )
 
@@ -8696,7 +8770,7 @@ class PlayerSorterApp:
             values=round_labels,
             state="readonly",
             width=15,
-            font=("Arial", 11),
+            font=self._sf(11),
         )
         round_dropdown.pack(side=tk.LEFT, padx=5)
 
