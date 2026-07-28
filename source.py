@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -675,7 +676,14 @@ class PlayerSorterApp:
     # ── Scale / display-settings helpers ──────────────────────────────────────
 
     def _load_scale_preference(self) -> int:
-        """Return the saved scale percentage, or 100 if none / corrupt."""
+        """Return the saved scale percentage, or - if this is the first run
+        and nothing has been saved yet - a best-effort recommendation based
+        on the system's reported display scaling/resolution (see
+        _detect_recommended_scale()). Once anything has been saved (even
+        the auto-detected value the first time this runs), that saved
+        choice always wins on every future run; auto-detection never
+        silently overrides a preference that already exists.
+        """
         try:
             if os.path.exists(_DISPLAY_SETTINGS_FILE):
                 with open(_DISPLAY_SETTINGS_FILE, "r") as fh:
@@ -685,7 +693,244 @@ class PlayerSorterApp:
                     return scale
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             pass
-        return 100  # Safe default
+        return self._detect_recommended_scale()
+
+    def _detect_linux_env_scale_hint(self):
+        """Check common desktop-environment scale-factor signals that tend
+        to be more reliable than Tk's own DPI query on Linux - especially
+        under Wayland, where Tk (via the XWayland compatibility layer) is
+        often unable to see the compositor's real scale factor at all and
+        just reports a flat, unscaled 96 DPI no matter what the user has
+        actually set. Returns a float multiplier (e.g. 1.5 for a 150%
+        desktop scale), or None if nothing usable was found.
+
+        Important: the caller should NOT treat this value as "the scale
+        our own app should also apply". Many Linux compositors - including
+        recent KDE Plasma - already auto-scale legacy X11/XWayland apps
+        like this one to visually match the desktop's own scale factor,
+        transparently, outside this app's control. This value is really a
+        signal that such compensation is likely already happening, so
+        _detect_recommended_scale_verbose() uses it to recommend *staying*
+        at 100% rather than matching it (matching it would risk
+        compounding on top of the compositor's own scaling).
+
+        This still can't be verified against every real Wayland/KDE
+        session from this development sandbox, so treat it as an
+        additional best-effort signal, not a guarantee - hence the "Detect
+        Automatically" button always stays available to re-run this (or
+        just to be overridden manually) rather than being a one-shot,
+        trust-it-blindly calculation.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+
+        # On KDE, kscreen-doctor (KDE's own screen-config CLI, ships with
+        # Plasma) reports the real per-output scale directly and reliably -
+        # confirmed working where QT_SCALE_FACTOR/GDK_SCALE/XCURSOR_SIZE
+        # below all turned out to be unset in practice on a real Plasma
+        # Wayland session. Tried first since it's the most direct signal.
+        kde_scale = self._detect_kde_scale_via_kscreen()
+        if kde_scale is not None:
+            return kde_scale
+
+        # QT_SCALE_FACTOR / GDK_SCALE are set directly by Qt- and
+        # GTK-based desktop environments (KDE, GNOME, etc.) to the exact
+        # scale factor in use, independent of whether the session is X11
+        # or Wayland. Kept as a fallback for desktops/setups where they
+        # are actually set (e.g. some GNOME sessions), even though they
+        # weren't on the KDE Plasma session this was tested against.
+        for var in ("QT_SCALE_FACTOR", "GDK_SCALE"):
+            val = os.environ.get(var)
+            if val:
+                try:
+                    factor = float(val)
+                    if factor > 0:
+                        return factor
+                except ValueError:
+                    pass
+
+        # XCURSOR_SIZE scales with the desktop's scale factor on most Linux
+        # desktop environments (default is 24px at 100% scale), so it's a
+        # reasonable proxy signal when the more direct variables above
+        # aren't set.
+        cursor_size = os.environ.get("XCURSOR_SIZE")
+        if cursor_size:
+            try:
+                size = float(cursor_size)
+                if size > 0:
+                    return size / 24.0
+            except ValueError:
+                pass
+
+        return None
+
+    def _detect_kde_scale_via_kscreen(self):
+        """Read the real per-output scale factor from KDE's kscreen-doctor
+        CLI. Returns a float (e.g. 1.5), or None if kscreen-doctor isn't
+        available, isn't KDE, times out, or its output can't be parsed.
+
+        Example relevant output (one block per connected display):
+            Output: 1 eDP-1 ...
+                    enabled
+                    connected
+                    ...
+                    Scale: 1.5
+                    ...
+        This takes the first output block that's both "enabled" and
+        "connected" and reads its "Scale:" line. A multi-monitor setup
+        could have different scales per output, and there's no reliable
+        way from here to know which physical monitor the app's window is
+        actually on, so this is an approximation - good enough for the
+        common single-display laptop/desktop case this is mainly aimed at.
+        """
+        if os.environ.get("XDG_CURRENT_DESKTOP", "").upper() != "KDE":
+            return None
+        try:
+            result = subprocess.run(
+                ["kscreen-doctor", "-o"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+
+        enabled = False
+        connected = False
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Output:"):
+                enabled = False
+                connected = False
+            elif line == "enabled":
+                enabled = True
+            elif line == "connected":
+                connected = True
+            elif line.startswith("Scale:") and enabled and connected:
+                try:
+                    scale = float(line.split(":", 1)[1].strip())
+                    if scale > 0:
+                        return scale
+                except (ValueError, IndexError):
+                    pass
+        return None
+
+    def _detect_recommended_scale(self) -> int:
+        """Best-effort guess at a sensible starting UI scale. See
+        _detect_recommended_scale_verbose() for the full explanation and
+        caveats - this just returns the percentage on its own, for callers
+        that don't need the reasoning behind it.
+        """
+        pct, _reason = self._detect_recommended_scale_verbose()
+        return pct
+
+    def _detect_recommended_scale_verbose(self):
+        """Best-effort guess at a sensible starting UI scale, based on the
+        system's reported DPI and screen resolution, snapped to the
+        nearest value in SCALE_OPTIONS. Returns (percentage, reason_text)
+        so callers (namely the "Detect Automatically" button) can show
+        the user what signal was actually used - otherwise a recommendation
+        that happens to match the current setting looks exactly like the
+        button doing nothing at all.
+
+        This is only ever used to seed the very first run (see
+        _load_scale_preference()) and can be re-run any time via that
+        button - it never overwrites a preference the user has already
+        saved.
+
+        Core principle, learned the hard way: _get_base_scaling() (a
+        snapshot of Tk's reported DPI conversion, taken once at startup)
+        already flows into every _sf()/_scaled_px() calculation
+        automatically. So whenever ANYTHING - a KDE kscreen-doctor query, a
+        QT_SCALE_FACTOR-style env var, or even just Tk's own DPI query
+        (winfo_fpixels) - indicates the system is scaled away from 100%,
+        that scaling is already baked into our own "100%" baseline for
+        free. Recommending our own scale to *match* that same factor would
+        double it (e.g. a real 150% system scale plus our own 150% would
+        render at roughly 225%). This was first found and fixed for the
+        KDE/env-var signals, but it turns out the exact same bug was
+        hiding in the plain Tk-DPI-based branch too (confirmed on a
+        compiled build running directly on a host Wayland session, where
+        Tk's own DPI query correctly reported the real 150% scale, and
+        recommending our own 150% on top of it produced a visibly
+        oversized app). So now, ANY non-default scaling signal from any
+        source recommends staying at 100% - the screen-resolution fallback
+        below only fires when literally nothing indicates any scaling is
+        happening anywhere, which is the only situation where our own app
+        would actually need to compensate on its own.
+
+        Important limits, since this can't be verified on real hardware
+        from a development sandbox:
+        - DPI reporting depends on the OS/desktop environment being
+          configured correctly. _configure_platform_dpi_awareness() (called
+          once, at startup, before any Tk window exists) asks Windows to
+          report the user's actual display-scaling setting instead of a
+          fixed default; without it, Tk would see a flat 96 DPI on Windows
+          regardless of the user's real setting. On Linux, whether Tk's own
+          DPI query reflects the real scale seems to vary by how the app is
+          run (a compiled Nuitka build directly on the host reported it
+          correctly in testing; a Python/tkinter build run inside a
+          container did not) - _detect_linux_env_scale_hint() is checked
+          first specifically to cover the cases where Tk's own query can't
+          see it. macOS handles Retina scaling somewhat differently from
+          the other two.
+        - winfo_screenwidth()/winfo_screenheight() can report the combined
+          size of a multi-monitor virtual desktop on X11 rather than a
+          single monitor's actual size, which would look like one huge
+          high-res display. Screen height is used instead of width below,
+          since multi-monitor setups are far more often arranged side by
+          side (extending width) than stacked (extending height), but this
+          is still an approximation, not a guarantee.
+        Because of this, treat the result as a reasonable starting point,
+        not a guaranteed-correct fit - the user can always adjust it
+        manually afterwards, and doing so is expected to be common.
+        """
+        env_hint = self._detect_linux_env_scale_hint()
+        if env_hint is not None and abs(env_hint - 1.0) > 0.05:
+            return 100, (
+                f"your desktop reports {env_hint:g}x scaling, which is likely "
+                f"already being applied to this app automatically"
+            )
+
+        try:
+            dpi = self.root.winfo_fpixels("1i")
+        except tk.TclError:
+            dpi = 96.0
+        dpi_ratio = (dpi / 96.0) if dpi else 1.0
+
+        try:
+            screen_h = self.root.winfo_screenheight()
+        except tk.TclError:
+            screen_h = 1080
+
+        if abs(dpi_ratio - 1.0) > 0.05:
+            # Tk's own DPI query already reflects non-default scaling -
+            # meaning it's already baked into our own 100% baseline (see
+            # this method's docstring for why matching it again here would
+            # double it).
+            return 100, (
+                f"your display's reported DPI ({dpi:.0f}) already reflects "
+                f"non-default scaling, which is likely already being "
+                f"applied to this app automatically"
+            )
+
+        # DPI looks like "no scaling" - which might genuinely be true,
+        # or might mean the OS just isn't reporting it. Fall back to
+        # screen resolution: a small, low-res display likely benefits
+        # from scaling up, while a very tall/high-res one at a flat 96
+        # DPI (common on Windows machines without DPI awareness, or
+        # Linux desktops that don't set Xft.dpi) likely benefits from
+        # scaling down so text and buttons aren't tiny.
+        if screen_h <= 700:
+            recommended = 75
+        elif screen_h >= 1400:
+            recommended = 150
+        else:
+            recommended = 100
+        pct = min(SCALE_OPTIONS, key=lambda opt: abs(opt - recommended))
+        return pct, f"based on your screen resolution (no clear DPI/scale signal found; height={screen_h}px)"
 
     def _save_scale_preference(self, scale_pct: int) -> None:
         """Persist the chosen scale percentage to disk."""
@@ -877,15 +1122,42 @@ class PlayerSorterApp:
         return self._default_tk_scaling
 
     def _apply_scale(self, scale_pct: int) -> None:
-        """Apply the requested UI scale percentage."""
+        """Apply the requested UI scale percentage.
+
+        This used to also call `self.root.tk.call("tk", "scaling", ...)` to
+        change Tk's own reported DPI. That call was a leftover from before
+        _sf()/_scaled_px() existed: neither of them actually reads the live
+        Tk scaling value (they use _default_tk_scaling, a snapshot taken
+        once at startup, plus this method's own _scale_multiplier), so it
+        was doing nothing useful for our own math - and on at least one
+        Wayland/Plasma setup it caused real harm: lowering Tk's
+        self-reported DPI made the compositor upscale the *entire window*
+        to compensate (apparently treating a low self-reported DPI as "this
+        app was built for a much lower-res display"), which is the direct
+        cause of 25% scaling rendering far larger than 100%, and 200%
+        barely growing at all. Leaving Tk's own scaling untouched avoids
+        that side effect entirely, since every size we care about is
+        already computed explicitly instead of relying on it.
+        """
         self._current_scale_pct = scale_pct
         self._scale_multiplier = scale_pct / 100.0
-
-        # Apply to tk.scaling()
-        base_scaling = self._get_base_scaling()
-        new_scaling = base_scaling * self._scale_multiplier
-        self.root.tk.call("tk", "scaling", new_scaling)
     
+    def _scaled_px(self, base_px: int, floor_px: int = 6) -> int:
+        """Scale a plain pixel dimension - NOT a font - by the current UI
+        scale, with its own floor.
+
+        This exists for things like scrollbar width or checkbox/radio
+        indicator size: Tk draws these itself as fixed pixel constants that
+        are completely independent of font size, so they were never
+        touched by anything in _sf() and stayed a constant size no matter
+        what scale was chosen (e.g. a scrollbar that's the same few pixels
+        wide at 25% as at 200%, which looks disproportionately thin next
+        to now-larger text, or makes the whole window seem like it barely
+        grew at high scale because the chrome around the content didn't).
+        """
+        multiplier = getattr(self, "_scale_multiplier", 1.0)
+        return max(floor_px, round(base_px * multiplier))
+
     def _sf(self, base_size: int, weight: str = "", family: str = "Arial") -> tuple:
         """Scale Font helper: returns a (family, size, weight) tuple for
         base_size, honoring the current UI scale percentage but never
@@ -893,16 +1165,14 @@ class PlayerSorterApp:
 
         The returned size is *negative* (i.e. a pixel size, not a point
         size) and already includes the platform's base DPI scaling
-        (_get_base_scaling()). This is deliberate: Tk treats a positive
-        font size as "points" and independently re-scales those using the
-        app-wide `tk scaling` factor set in _apply_scale(). If this helper
-        also multiplied by the scale percentage AND returned a positive
-        (point) size, the result would be scaled twice - once here, once
-        by Tk - shrinking or growing far more than intended (e.g. a 50%
-        UI scale would make text render at roughly 25% size). Returning an
-        already-DPI-adjusted pixel size sidesteps that: Tk takes it
-        literally, so this is the only place the scaling math happens,
-        and the floor below is guaranteed to hold regardless of scale.
+        (_get_base_scaling(), a snapshot taken once at startup - see
+        _apply_scale() for why this deliberately no longer touches Tk's
+        own live `tk scaling` value). Tk treats a positive font size as
+        "points", auto-converted to pixels using whatever `tk scaling` is
+        currently set to; returning a negative (pixel) size instead means
+        Tk takes it literally, so this explicit calculation - multiplier,
+        floor, then the fixed DPI snapshot - is the only place any of the
+        scaling math happens.
         """
         multiplier = getattr(self, "_scale_multiplier", 1.0)
         effective_size = max(base_size * multiplier, _MIN_FONT_SIZE)
@@ -959,11 +1229,38 @@ class PlayerSorterApp:
         )
         scale_combo.pack(side=tk.LEFT)
 
+        detect_status_var = tk.StringVar(value="")
+
+        def _on_detect() -> None:
+            # Only fills in the drop-down with a fresh recommendation -
+            # doesn't take effect until the user clicks Apply, same as
+            # picking a percentage manually. Always shows what it found
+            # (even if that happens to match the current setting already),
+            # so this never looks like it silently did nothing.
+            recommended, reason = self._detect_recommended_scale_verbose()
+            scale_var.set(f"{recommended}%")
+            detect_status_var.set(f"Detected {recommended}% - {reason}")
+
+        ttk.Button(
+            scale_row, text="🔍 Detect Automatically", command=_on_detect
+        ).pack(side=tk.LEFT, padx=(15, 0))
+
+        ttk.Label(
+            frame,
+            textvariable=detect_status_var,
+            font=self._sf(9, "italic"),
+            justify=tk.CENTER,
+            wraplength=self._scaled_px(360, floor_px=200),
+        ).pack(pady=(8, 0))
+
         # ── Explanatory note ───────────────────────────────────────────────
         ttk.Label(
             frame,
             text=(
-                "The change takes effect immediately."
+                "The change takes effect immediately.\n"
+                "\"Detect Automatically\" suggests a scale based on your "
+                "system's display settings and screen size - it's a "
+                "best-effort guess, so feel free to fine-tune it afterwards."
             ),
             font=self._sf(10, "italic"),
             justify=tk.CENTER,
@@ -1048,6 +1345,22 @@ class PlayerSorterApp:
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
         style.configure("TFrame", background=theme["bg"])
+
+        # Scrollbars: Tk draws these as plain pixel constants (not fonts),
+        # so without this they stay a fixed width regardless of UI scale -
+        # this is why they used to look disproportionately thin at low
+        # scale and barely different at high scale.
+        scrollbar_thickness = self._scaled_px(14, floor_px=8)
+        style.configure(
+            "Vertical.TScrollbar",
+            width=scrollbar_thickness,
+            arrowsize=scrollbar_thickness,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            width=scrollbar_thickness,
+            arrowsize=scrollbar_thickness,
+        )
         style.configure(
             "TLabel", background=theme["bg"], foreground=theme["fg"], font=self._sf(10)
         )
@@ -1068,7 +1381,7 @@ class PlayerSorterApp:
         style.configure(
             "TButton",
             font=self._sf(12),
-            padding=10,
+            padding=self._scaled_px(10, floor_px=4),
             background=theme["button_bg"],
             foreground=theme["button_fg"],
             bordercolor=theme["border"],
@@ -1086,7 +1399,7 @@ class PlayerSorterApp:
         style.configure(
             "Large.TButton",
             font=self._sf(14, "bold"),
-            padding=15,
+            padding=self._scaled_px(15, floor_px=6),
             background=theme["accent_button_bg"],
             foreground=theme["accent_button_fg"],
         )
@@ -1109,6 +1422,7 @@ class PlayerSorterApp:
         )
 
         # Comboboxes (dropdown selectors)
+        combo_arrow = self._scaled_px(16, floor_px=10)
         style.configure(
             "TCombobox",
             fieldbackground=theme["entry_bg"],
@@ -1116,6 +1430,7 @@ class PlayerSorterApp:
             background=theme["button_bg"],
             bordercolor=theme["border"],
             font=self._sf(10),
+            arrowsize=combo_arrow,
         )
         style.map(
             "TCombobox",
@@ -1131,18 +1446,21 @@ class PlayerSorterApp:
         )
 
         # Radiobuttons with proper backgrounds
+        radio_indicator = self._scaled_px(12, floor_px=8)
         style.configure(
             "TRadiobutton",
             background=theme["bg"],
             foreground=theme["fg"],
             font=self._sf(10),
+            indicatorsize=radio_indicator,
         )
         style.configure(
             "Large.TRadiobutton",
             font=self._sf(11),
-            padding=5,
+            padding=self._scaled_px(5, floor_px=2),
             background=theme["bg"],
             foreground=theme["fg"],
+            indicatorsize=radio_indicator,
         )
         style.map(
             "TRadiobutton",
@@ -1156,6 +1474,7 @@ class PlayerSorterApp:
             background=theme["bg"],
             foreground=theme["fg"],
             font=self._sf(10),
+            indicatorsize=radio_indicator,
         )
 
         # Treeview (tables) with colored headings for themed look
@@ -8982,7 +9301,36 @@ class PlayerSorterApp:
             widget.destroy()
 
 
+def _configure_platform_dpi_awareness() -> None:
+    """Tell Windows this process handles its own DPI scaling, so Tk's
+    reported DPI/resolution reflects the user's actual display-scaling
+    setting instead of a fixed 96 DPI default. This has to run before any
+    Tk window is created to take effect, which is why it's called at the
+    very top of main() rather than from PlayerSorterApp.__init__().
+
+    Safely a no-op on non-Windows platforms, and on Windows versions that
+    lack the relevant API (falls back to the older, coarser
+    SetProcessDPIAware() call, then simply gives up if that's missing too)
+    - this must never block or break startup.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        try:
+            # PROCESS_PER_MONITOR_DPI_AWARE - available on Windows 8.1+.
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            # Windows 8 and earlier don't have shcore; this coarser,
+            # system-wide (not per-monitor) API goes back to Vista.
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass  # Best-effort only.
+
+
 def main():
+    _configure_platform_dpi_awareness()
     root = tk.Tk()
     PlayerSorterApp(root)
     root.mainloop()
