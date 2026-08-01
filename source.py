@@ -20,6 +20,7 @@ import random
 import re
 import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import tkinter as tk
@@ -244,6 +245,16 @@ THEMES = {
 # ── Display / scaling constants ───────────────────────────────────────────────
 # Supported UI scale percentages
 SCALE_OPTIONS = [25, 50, 75, 100, 125, 150, 175, 200]
+
+# Smallest a font is ever allowed to become (expressed in the same base-size
+# unit passed to _sf(), i.e. before the display's own DPI scaling is applied),
+# no matter how low the user's chosen UI scale percentage is. Without this
+# floor, low scale settings (50% and below) would keep shrinking text
+# proportionally forever until it becomes unreadable. 6 keeps even the
+# smallest labels legible at the lowest scale setting (25%) while still
+# leaving room for most text to visibly keep shrinking/growing with the
+# chosen scale rather than everything collapsing to one flat size.
+_MIN_FONT_SIZE = 6
 
 # JSON file that persists the chosen scale between sessions
 _DISPLAY_SETTINGS_FILE = "player_sorter_display_settings.json"
@@ -665,7 +676,14 @@ class PlayerSorterApp:
     # ── Scale / display-settings helpers ──────────────────────────────────────
 
     def _load_scale_preference(self) -> int:
-        """Return the saved scale percentage, or 100 if none / corrupt."""
+        """Return the saved scale percentage, or - if this is the first run
+        and nothing has been saved yet - a best-effort recommendation based
+        on the system's reported display scaling/resolution (see
+        _detect_recommended_scale()). Once anything has been saved (even
+        the auto-detected value the first time this runs), that saved
+        choice always wins on every future run; auto-detection never
+        silently overrides a preference that already exists.
+        """
         try:
             if os.path.exists(_DISPLAY_SETTINGS_FILE):
                 with open(_DISPLAY_SETTINGS_FILE, "r") as fh:
@@ -675,7 +693,244 @@ class PlayerSorterApp:
                     return scale
         except (OSError, json.JSONDecodeError, ValueError, TypeError):
             pass
-        return 100  # Safe default
+        return self._detect_recommended_scale()
+
+    def _detect_linux_env_scale_hint(self):
+        """Check common desktop-environment scale-factor signals that tend
+        to be more reliable than Tk's own DPI query on Linux - especially
+        under Wayland, where Tk (via the XWayland compatibility layer) is
+        often unable to see the compositor's real scale factor at all and
+        just reports a flat, unscaled 96 DPI no matter what the user has
+        actually set. Returns a float multiplier (e.g. 1.5 for a 150%
+        desktop scale), or None if nothing usable was found.
+
+        Important: the caller should NOT treat this value as "the scale
+        our own app should also apply". Many Linux compositors - including
+        recent KDE Plasma - already auto-scale legacy X11/XWayland apps
+        like this one to visually match the desktop's own scale factor,
+        transparently, outside this app's control. This value is really a
+        signal that such compensation is likely already happening, so
+        _detect_recommended_scale_verbose() uses it to recommend *staying*
+        at 100% rather than matching it (matching it would risk
+        compounding on top of the compositor's own scaling).
+
+        This still can't be verified against every real Wayland/KDE
+        session from this development sandbox, so treat it as an
+        additional best-effort signal, not a guarantee - hence the "Detect
+        Automatically" button always stays available to re-run this (or
+        just to be overridden manually) rather than being a one-shot,
+        trust-it-blindly calculation.
+        """
+        if not sys.platform.startswith("linux"):
+            return None
+
+        # On KDE, kscreen-doctor (KDE's own screen-config CLI, ships with
+        # Plasma) reports the real per-output scale directly and reliably -
+        # confirmed working where QT_SCALE_FACTOR/GDK_SCALE/XCURSOR_SIZE
+        # below all turned out to be unset in practice on a real Plasma
+        # Wayland session. Tried first since it's the most direct signal.
+        kde_scale = self._detect_kde_scale_via_kscreen()
+        if kde_scale is not None:
+            return kde_scale
+
+        # QT_SCALE_FACTOR / GDK_SCALE are set directly by Qt- and
+        # GTK-based desktop environments (KDE, GNOME, etc.) to the exact
+        # scale factor in use, independent of whether the session is X11
+        # or Wayland. Kept as a fallback for desktops/setups where they
+        # are actually set (e.g. some GNOME sessions), even though they
+        # weren't on the KDE Plasma session this was tested against.
+        for var in ("QT_SCALE_FACTOR", "GDK_SCALE"):
+            val = os.environ.get(var)
+            if val:
+                try:
+                    factor = float(val)
+                    if factor > 0:
+                        return factor
+                except ValueError:
+                    pass
+
+        # XCURSOR_SIZE scales with the desktop's scale factor on most Linux
+        # desktop environments (default is 24px at 100% scale), so it's a
+        # reasonable proxy signal when the more direct variables above
+        # aren't set.
+        cursor_size = os.environ.get("XCURSOR_SIZE")
+        if cursor_size:
+            try:
+                size = float(cursor_size)
+                if size > 0:
+                    return size / 24.0
+            except ValueError:
+                pass
+
+        return None
+
+    def _detect_kde_scale_via_kscreen(self):
+        """Read the real per-output scale factor from KDE's kscreen-doctor
+        CLI. Returns a float (e.g. 1.5), or None if kscreen-doctor isn't
+        available, isn't KDE, times out, or its output can't be parsed.
+
+        Example relevant output (one block per connected display):
+            Output: 1 eDP-1 ...
+                    enabled
+                    connected
+                    ...
+                    Scale: 1.5
+                    ...
+        This takes the first output block that's both "enabled" and
+        "connected" and reads its "Scale:" line. A multi-monitor setup
+        could have different scales per output, and there's no reliable
+        way from here to know which physical monitor the app's window is
+        actually on, so this is an approximation - good enough for the
+        common single-display laptop/desktop case this is mainly aimed at.
+        """
+        if os.environ.get("XDG_CURRENT_DESKTOP", "").upper() != "KDE":
+            return None
+        try:
+            result = subprocess.run(
+                ["kscreen-doctor", "-o"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+
+        enabled = False
+        connected = False
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if line.startswith("Output:"):
+                enabled = False
+                connected = False
+            elif line == "enabled":
+                enabled = True
+            elif line == "connected":
+                connected = True
+            elif line.startswith("Scale:") and enabled and connected:
+                try:
+                    scale = float(line.split(":", 1)[1].strip())
+                    if scale > 0:
+                        return scale
+                except (ValueError, IndexError):
+                    pass
+        return None
+
+    def _detect_recommended_scale(self) -> int:
+        """Best-effort guess at a sensible starting UI scale. See
+        _detect_recommended_scale_verbose() for the full explanation and
+        caveats - this just returns the percentage on its own, for callers
+        that don't need the reasoning behind it.
+        """
+        pct, _reason = self._detect_recommended_scale_verbose()
+        return pct
+
+    def _detect_recommended_scale_verbose(self):
+        """Best-effort guess at a sensible starting UI scale, based on the
+        system's reported DPI and screen resolution, snapped to the
+        nearest value in SCALE_OPTIONS. Returns (percentage, reason_text)
+        so callers (namely the "Detect Automatically" button) can show
+        the user what signal was actually used - otherwise a recommendation
+        that happens to match the current setting looks exactly like the
+        button doing nothing at all.
+
+        This is only ever used to seed the very first run (see
+        _load_scale_preference()) and can be re-run any time via that
+        button - it never overwrites a preference the user has already
+        saved.
+
+        Core principle, learned the hard way: _get_base_scaling() (a
+        snapshot of Tk's reported DPI conversion, taken once at startup)
+        already flows into every _sf()/_scaled_px() calculation
+        automatically. So whenever ANYTHING - a KDE kscreen-doctor query, a
+        QT_SCALE_FACTOR-style env var, or even just Tk's own DPI query
+        (winfo_fpixels) - indicates the system is scaled away from 100%,
+        that scaling is already baked into our own "100%" baseline for
+        free. Recommending our own scale to *match* that same factor would
+        double it (e.g. a real 150% system scale plus our own 150% would
+        render at roughly 225%). This was first found and fixed for the
+        KDE/env-var signals, but it turns out the exact same bug was
+        hiding in the plain Tk-DPI-based branch too (confirmed on a
+        compiled build running directly on a host Wayland session, where
+        Tk's own DPI query correctly reported the real 150% scale, and
+        recommending our own 150% on top of it produced a visibly
+        oversized app). So now, ANY non-default scaling signal from any
+        source recommends staying at 100% - the screen-resolution fallback
+        below only fires when literally nothing indicates any scaling is
+        happening anywhere, which is the only situation where our own app
+        would actually need to compensate on its own.
+
+        Important limits, since this can't be verified on real hardware
+        from a development sandbox:
+        - DPI reporting depends on the OS/desktop environment being
+          configured correctly. _configure_platform_dpi_awareness() (called
+          once, at startup, before any Tk window exists) asks Windows to
+          report the user's actual display-scaling setting instead of a
+          fixed default; without it, Tk would see a flat 96 DPI on Windows
+          regardless of the user's real setting. On Linux, whether Tk's own
+          DPI query reflects the real scale seems to vary by how the app is
+          run (a compiled Nuitka build directly on the host reported it
+          correctly in testing; a Python/tkinter build run inside a
+          container did not) - _detect_linux_env_scale_hint() is checked
+          first specifically to cover the cases where Tk's own query can't
+          see it. macOS handles Retina scaling somewhat differently from
+          the other two.
+        - winfo_screenwidth()/winfo_screenheight() can report the combined
+          size of a multi-monitor virtual desktop on X11 rather than a
+          single monitor's actual size, which would look like one huge
+          high-res display. Screen height is used instead of width below,
+          since multi-monitor setups are far more often arranged side by
+          side (extending width) than stacked (extending height), but this
+          is still an approximation, not a guarantee.
+        Because of this, treat the result as a reasonable starting point,
+        not a guaranteed-correct fit - the user can always adjust it
+        manually afterwards, and doing so is expected to be common.
+        """
+        env_hint = self._detect_linux_env_scale_hint()
+        if env_hint is not None and abs(env_hint - 1.0) > 0.05:
+            return 100, (
+                f"your desktop reports {env_hint:g}x scaling, which is likely "
+                f"already being applied to this app automatically"
+            )
+
+        try:
+            dpi = self.root.winfo_fpixels("1i")
+        except tk.TclError:
+            dpi = 96.0
+        dpi_ratio = (dpi / 96.0) if dpi else 1.0
+
+        try:
+            screen_h = self.root.winfo_screenheight()
+        except tk.TclError:
+            screen_h = 1080
+
+        if abs(dpi_ratio - 1.0) > 0.05:
+            # Tk's own DPI query already reflects non-default scaling -
+            # meaning it's already baked into our own 100% baseline (see
+            # this method's docstring for why matching it again here would
+            # double it).
+            return 100, (
+                f"your display's reported DPI ({dpi:.0f}) already reflects "
+                f"non-default scaling, which is likely already being "
+                f"applied to this app automatically"
+            )
+
+        # DPI looks like "no scaling" - which might genuinely be true,
+        # or might mean the OS just isn't reporting it. Fall back to
+        # screen resolution: a small, low-res display likely benefits
+        # from scaling up, while a very tall/high-res one at a flat 96
+        # DPI (common on Windows machines without DPI awareness, or
+        # Linux desktops that don't set Xft.dpi) likely benefits from
+        # scaling down so text and buttons aren't tiny.
+        if screen_h <= 700:
+            recommended = 75
+        elif screen_h >= 1400:
+            recommended = 150
+        else:
+            recommended = 100
+        pct = min(SCALE_OPTIONS, key=lambda opt: abs(opt - recommended))
+        return pct, f"based on your screen resolution (no clear DPI/scale signal found; height={screen_h}px)"
 
     def _save_scale_preference(self, scale_pct: int) -> None:
         """Persist the chosen scale percentage to disk."""
@@ -802,7 +1057,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text="A new version of Player Sorter is available!",
-            font=("Segoe UI", 13, "bold"),
+            font=self._sf(13, "bold", family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["title_fg"],
             wraplength=380,
@@ -813,7 +1068,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text=f"Current version: {current_version}\nLatest version:  {latest_version}",
-            font=("Segoe UI", 10),
+            font=self._sf(10, family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["fg"],
             justify=tk.LEFT,
@@ -822,7 +1077,7 @@ class PlayerSorterApp:
         tk.Label(
             container,
             text="Release link (select and copy):",
-            font=("Segoe UI", 9),
+            font=self._sf(9, family="Segoe UI"),
             bg=theme["bg"],
             fg=theme["subtitle_fg"],
             justify=tk.LEFT,
@@ -830,7 +1085,7 @@ class PlayerSorterApp:
 
         link_entry = tk.Entry(
             container,
-            font=("Segoe UI", 10),
+            font=self._sf(10, family="Segoe UI"),
             justify=tk.LEFT,
             width=48,
         )
@@ -867,20 +1122,115 @@ class PlayerSorterApp:
         return self._default_tk_scaling
 
     def _apply_scale(self, scale_pct: int) -> None:
-        """Apply the requested UI scale percentage."""
+        """Apply the requested UI scale percentage.
+
+        This used to also call `self.root.tk.call("tk", "scaling", ...)` to
+        change Tk's own reported DPI. That call was a leftover from before
+        _sf()/_scaled_px() existed: neither of them actually reads the live
+        Tk scaling value (they use _default_tk_scaling, a snapshot taken
+        once at startup, plus this method's own _scale_multiplier), so it
+        was doing nothing useful for our own math - and on at least one
+        Wayland/Plasma setup it caused real harm: lowering Tk's
+        self-reported DPI made the compositor upscale the *entire window*
+        to compensate (apparently treating a low self-reported DPI as "this
+        app was built for a much lower-res display"), which is the direct
+        cause of 25% scaling rendering far larger than 100%, and 200%
+        barely growing at all. Leaving Tk's own scaling untouched avoids
+        that side effect entirely, since every size we care about is
+        already computed explicitly instead of relying on it.
+        """
         self._current_scale_pct = scale_pct
         self._scale_multiplier = scale_pct / 100.0
-
-        # Apply to tk.scaling()
-        base_scaling = self._get_base_scaling()
-        new_scaling = base_scaling * self._scale_multiplier
-        self.root.tk.call("tk", "scaling", new_scaling)
     
-    def _sf(self, base_size: int, weight: str = "") -> tuple:
-        """Scale Font helper: returns (family, scaled_size, weight) tuple."""
-        scaled = int(base_size * getattr(self, '_scale_multiplier', 1.0))
+    def make_scrollable_region(self, parent):
+        """Create a scrollable region - a themed canvas plus a vertical
+        scrollbar plus an inner content frame - that expands to fill
+        whatever space is left in `parent`.
+
+        Returns `scrollable_frame`: pack your actual content into that,
+        not into `parent` directly.
+
+        Usage:
+            scrollable = self.make_scrollable_region(main_frame)
+            ttk.Label(scrollable, text="...").pack(...)
+            # then, still packing into main_frame (NOT scrollable):
+            btn_frame = ttk.Frame(main_frame)
+            btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
+        IMPORTANT: this packs an intermediate container into `parent` with
+        side=tk.TOP, fill=tk.BOTH, expand=True. Any other widget you pack
+        directly into `parent` (e.g. a row of action buttons below the
+        scrollable content) MUST use side=tk.TOP (the default) or
+        side=tk.BOTTOM - never side=tk.LEFT/tk.RIGHT. Earlier hand-rolled
+        copies of this pattern packed the canvas itself with side=tk.LEFT
+        directly into the same parent as a later side=tk.TOP button frame;
+        mixing LEFT/RIGHT and TOP/BOTTOM siblings in one parent makes Tk's
+        packer carve a LEFT-anchored column for the canvas that spans the
+        *entire* remaining height, leaving only a slim leftover strip (to
+        the canvas's right) for anything packed afterward - so the button
+        row would end up squeezed into a column near the top-right corner
+        instead of spanning the bottom, exactly as reported. Wrapping the
+        canvas+scrollbar in their own intermediate container (packed
+        side=tk.TOP like everything else) keeps the LEFT/RIGHT pairing
+        contained to that inner frame, so siblings packed afterward into
+        `parent` stack normally below it, full-width, as intended.
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+        container = ttk.Frame(parent)
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, bg=theme["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        return scrollable_frame
+
+    def _scaled_px(self, base_px: int, floor_px: int = 6) -> int:
+        """Scale a plain pixel dimension - NOT a font - by the current UI
+        scale, with its own floor.
+
+        This exists for things like scrollbar width or checkbox/radio
+        indicator size: Tk draws these itself as fixed pixel constants that
+        are completely independent of font size, so they were never
+        touched by anything in _sf() and stayed a constant size no matter
+        what scale was chosen (e.g. a scrollbar that's the same few pixels
+        wide at 25% as at 200%, which looks disproportionately thin next
+        to now-larger text, or makes the whole window seem like it barely
+        grew at high scale because the chrome around the content didn't).
+        """
+        multiplier = getattr(self, "_scale_multiplier", 1.0)
+        return max(floor_px, round(base_px * multiplier))
+
+    def _sf(self, base_size: int, weight: str = "", family: str = "Arial") -> tuple:
+        """Scale Font helper: returns a (family, size, weight) tuple for
+        base_size, honoring the current UI scale percentage but never
+        letting the rendered size fall below _MIN_FONT_SIZE.
+
+        The returned size is *negative* (i.e. a pixel size, not a point
+        size) and already includes the platform's base DPI scaling
+        (_get_base_scaling(), a snapshot taken once at startup - see
+        _apply_scale() for why this deliberately no longer touches Tk's
+        own live `tk scaling` value). Tk treats a positive font size as
+        "points", auto-converted to pixels using whatever `tk scaling` is
+        currently set to; returning a negative (pixel) size instead means
+        Tk takes it literally, so this explicit calculation - multiplier,
+        floor, then the fixed DPI snapshot - is the only place any of the
+        scaling math happens.
+        """
+        multiplier = getattr(self, "_scale_multiplier", 1.0)
+        effective_size = max(base_size * multiplier, _MIN_FONT_SIZE)
+        pixels = max(1, round(effective_size * self._get_base_scaling()))
         weight_value = weight if weight else "normal"
-        return ("Arial", scaled, weight_value)
+        return (family, -pixels, weight_value)
     
     def _sp(self, base_value: int) -> str:
         """Scale Padding helper: returns scaled padding as string.
@@ -931,11 +1281,38 @@ class PlayerSorterApp:
         )
         scale_combo.pack(side=tk.LEFT)
 
+        detect_status_var = tk.StringVar(value="")
+
+        def _on_detect() -> None:
+            # Only fills in the drop-down with a fresh recommendation -
+            # doesn't take effect until the user clicks Apply, same as
+            # picking a percentage manually. Always shows what it found
+            # (even if that happens to match the current setting already),
+            # so this never looks like it silently did nothing.
+            recommended, reason = self._detect_recommended_scale_verbose()
+            scale_var.set(f"{recommended}%")
+            detect_status_var.set(f"Detected {recommended}% - {reason}")
+
+        ttk.Button(
+            scale_row, text="🔍 Detect Automatically", command=_on_detect
+        ).pack(side=tk.LEFT, padx=(15, 0))
+
+        ttk.Label(
+            frame,
+            textvariable=detect_status_var,
+            font=self._sf(9, "italic"),
+            justify=tk.CENTER,
+            wraplength=self._scaled_px(360, floor_px=200),
+        ).pack(pady=(8, 0))
+
         # ── Explanatory note ───────────────────────────────────────────────
         ttk.Label(
             frame,
             text=(
-                "The change takes effect immediately."
+                "The change takes effect immediately.\n"
+                "\"Detect Automatically\" suggests a scale based on your "
+                "system's display settings and screen size - it's a "
+                "best-effort guess, so feel free to fine-tune it afterwards."
             ),
             font=self._sf(10, "italic"),
             justify=tk.CENTER,
@@ -1020,7 +1397,25 @@ class PlayerSorterApp:
 
         # Configure all widget styles with proper backgrounds to avoid white spaces
         style.configure("TFrame", background=theme["bg"])
-        style.configure("TLabel", background=theme["bg"], foreground=theme["fg"])
+
+        # Scrollbars: Tk draws these as plain pixel constants (not fonts),
+        # so without this they stay a fixed width regardless of UI scale -
+        # this is why they used to look disproportionately thin at low
+        # scale and barely different at high scale.
+        scrollbar_thickness = self._scaled_px(14, floor_px=8)
+        style.configure(
+            "Vertical.TScrollbar",
+            width=scrollbar_thickness,
+            arrowsize=scrollbar_thickness,
+        )
+        style.configure(
+            "Horizontal.TScrollbar",
+            width=scrollbar_thickness,
+            arrowsize=scrollbar_thickness,
+        )
+        style.configure(
+            "TLabel", background=theme["bg"], foreground=theme["fg"], font=self._sf(10)
+        )
         style.configure(
             "TLabelframe",
             background=theme["bg"],
@@ -1038,7 +1433,7 @@ class PlayerSorterApp:
         style.configure(
             "TButton",
             font=self._sf(12),
-            padding=10,
+            padding=self._scaled_px(10, floor_px=4),
             background=theme["button_bg"],
             foreground=theme["button_fg"],
             bordercolor=theme["border"],
@@ -1056,7 +1451,7 @@ class PlayerSorterApp:
         style.configure(
             "Large.TButton",
             font=self._sf(14, "bold"),
-            padding=15,
+            padding=self._scaled_px(15, floor_px=6),
             background=theme["accent_button_bg"],
             foreground=theme["accent_button_fg"],
         )
@@ -1075,16 +1470,49 @@ class PlayerSorterApp:
             fieldbackground=theme["entry_bg"],
             foreground=theme["entry_fg"],
             bordercolor=theme["border"],
+            font=self._sf(10),
+        )
+
+        # Comboboxes (dropdown selectors)
+        combo_arrow = self._scaled_px(16, floor_px=10)
+        style.configure(
+            "TCombobox",
+            fieldbackground=theme["entry_bg"],
+            foreground=theme["entry_fg"],
+            background=theme["button_bg"],
+            bordercolor=theme["border"],
+            font=self._sf(10),
+            arrowsize=combo_arrow,
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", theme["entry_bg"])],
+            foreground=[("readonly", theme["entry_fg"])],
+        )
+        # The popdown listbox isn't a ttk widget, so it isn't themable via
+        # style.configure - it's an option-database entry instead, which
+        # expects a Tk font descriptor string rather than a Python tuple.
+        combo_family, combo_size, combo_weight = self._sf(10)
+        self.root.option_add(
+            "*TCombobox*Listbox.font", f"{{{combo_family}}} {combo_size} {combo_weight}"
         )
 
         # Radiobuttons with proper backgrounds
-        style.configure("TRadiobutton", background=theme["bg"], foreground=theme["fg"])
+        radio_indicator = self._scaled_px(12, floor_px=8)
+        style.configure(
+            "TRadiobutton",
+            background=theme["bg"],
+            foreground=theme["fg"],
+            font=self._sf(10),
+            indicatorsize=radio_indicator,
+        )
         style.configure(
             "Large.TRadiobutton",
             font=self._sf(11),
-            padding=5,
+            padding=self._scaled_px(5, floor_px=2),
             background=theme["bg"],
             foreground=theme["fg"],
+            indicatorsize=radio_indicator,
         )
         style.map(
             "TRadiobutton",
@@ -1093,7 +1521,13 @@ class PlayerSorterApp:
         )
 
         # Checkbuttons
-        style.configure("TCheckbutton", background=theme["bg"], foreground=theme["fg"])
+        style.configure(
+            "TCheckbutton",
+            background=theme["bg"],
+            foreground=theme["fg"],
+            font=self._sf(10),
+            indicatorsize=radio_indicator,
+        )
 
         # Treeview (tables) with colored headings for themed look
         style.configure(
@@ -1167,24 +1601,35 @@ class PlayerSorterApp:
         subtitle = ttk.Label(frame, text="Select Theme", font=self._sf(18))
         subtitle.pack(pady=20)
 
-        # Theme buttons
-        theme_frame = ttk.Frame(frame)
-        theme_frame.pack(pady=20)
+        # Theme picker - a single dropdown instead of one button per theme.
+        # Keeping this to one compact row (rather than stacking a button
+        # for every theme, as before) means the screen's total height no
+        # longer grows with the number of available themes, so the
+        # "Continue to App" button below always stays on-screen regardless
+        # of the chosen UI scale or how many themes get added in future.
+        theme_row = ttk.Frame(frame)
+        theme_row.pack(pady=20)
 
-        for i, theme_name in enumerate(THEMES.keys()):
-            btn = ttk.Button(
-                theme_frame,
-                text=theme_name,
-                width=25,
-                command=lambda t=theme_name: self.select_theme(t),
-            )
-            btn.pack(pady=8)
+        ttk.Label(theme_row, text="Theme:", font=self._sf(12)).pack(
+            side=tk.LEFT, padx=(0, 10)
+        )
 
-            # Highlight current theme
-            if theme_name == self.current_theme:
-                ttk.Label(
-                    theme_frame, text="✓ Current", font=self._sf(9, "italic")
-                ).pack()
+        theme_names = list(THEMES.keys())
+        self._theme_select_var = tk.StringVar(value=self.current_theme)
+        theme_combo = ttk.Combobox(
+            theme_row,
+            textvariable=self._theme_select_var,
+            values=theme_names,
+            state="readonly",
+            width=22,
+            font=self._sf(12),
+        )
+        theme_combo.pack(side=tk.LEFT)
+
+        def _on_theme_selected(event=None):
+            self.select_theme(self._theme_select_var.get())
+
+        theme_combo.bind("<<ComboboxSelected>>", _on_theme_selected)
 
         # Continue button
         ttk.Button(
@@ -1319,14 +1764,14 @@ class PlayerSorterApp:
         frame = ttk.Frame(self.root, padding="40")
         frame.pack(expand=True, fill=tk.BOTH)
 
-        ttk.Label(frame, text="Load a Tournament", font=("Arial", 24, "bold")).pack(
+        ttk.Label(frame, text="Load a Tournament", font=self._sf(24, "bold")).pack(
             pady=20
         )
         ttk.Label(
             frame,
             text="Select a tournament to view or resume. "
             "Unfinished tournaments are listed first.",
-            font=("Arial", 12),
+            font=self._sf(12),
         ).pack(pady=5)
 
         list_frame = ttk.Frame(frame)
@@ -1553,12 +1998,12 @@ class PlayerSorterApp:
         # Title
         game_name = "Chess" if self.game_type == "chess" else "E-Sports"
         title = ttk.Label(
-            frame, text=f"{game_name} - Select Mode", font=("Arial", 24, "bold")
+            frame, text=f"{game_name} - Select Mode", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Mode Selection
-        ttk.Label(frame, text="Select Sorting Mode:", font=("Arial", 14)).pack(pady=20)
+        ttk.Label(frame, text="Select Sorting Mode:", font=self._sf(14)).pack(pady=20)
 
         if self.game_type == "chess":
             modes = [
@@ -1593,7 +2038,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
@@ -1625,12 +2070,12 @@ class PlayerSorterApp:
 
         # Title with larger font
         title = ttk.Label(
-            frame, text="Chess - Select Tournament System", font=("Arial", 24, "bold")
+            frame, text="Chess - Select Tournament System", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Tournament systems with larger fonts
-        ttk.Label(frame, text="Select Tournament System:", font=("Arial", 14)).pack(
+        ttk.Label(frame, text="Select Tournament System:", font=self._sf(14)).pack(
             pady=20
         )
 
@@ -1660,7 +2105,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         # Back button
@@ -1697,12 +2142,12 @@ class PlayerSorterApp:
             "Swiss System" if self.tournament_system == "swiss" else "Round-Robin"
         )
         title = ttk.Label(
-            frame, text=f"{system_name} - Configuration", font=("Arial", 24, "bold")
+            frame, text=f"{system_name} - Configuration", font=self._sf(24, "bold")
         )
         title.pack(pady=30)
 
         # Tiebreak selection
-        ttk.Label(frame, text="Select Tiebreak Method:", font=("Arial", 14)).pack(
+        ttk.Label(frame, text="Select Tiebreak Method:", font=self._sf(14)).pack(
             pady=20
         )
 
@@ -1729,7 +2174,7 @@ class PlayerSorterApp:
             btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
 
             ttk.Label(
-                btn_container, text=f"- {description}", font=("Arial", 11)
+                btn_container, text=f"- {description}", font=self._sf(11)
             ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
 
         ttk.Button(
@@ -1755,22 +2200,12 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"{system_name} - Tournament Settings",
-            font=("Arial", 22, "bold"),
+            font=self._sf(22, "bold"),
         )
         title.pack(pady=20)
 
         # Scrollable frame for all options - larger height
-        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Rating Mode Option - larger fonts
         rating_frame = ttk.LabelFrame(
@@ -1785,7 +2220,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=8)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -1822,7 +2257,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=8)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -1849,7 +2284,7 @@ class PlayerSorterApp:
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=8)
 
@@ -1881,7 +2316,7 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=8)
 
@@ -1910,26 +2345,26 @@ class PlayerSorterApp:
         ttk.Label(
             rounds_frame,
             text="Set maximum number of rounds (optional):",
-            font=("Arial", 11),
+            font=self._sf(11),
         ).pack(pady=8)
 
         rounds_input_frame = ttk.Frame(rounds_frame)
         rounds_input_frame.pack(pady=8)
 
         self.max_rounds_var = tk.StringVar(value="")
-        ttk.Label(rounds_input_frame, text="Rounds:", font=("Arial", 11)).pack(
+        ttk.Label(rounds_input_frame, text="Rounds:", font=self._sf(11)).pack(
             side=tk.LEFT, padx=8
         )
         ttk.Entry(
             rounds_input_frame,
             textvariable=self.max_rounds_var,
             width=15,
-            font=("Arial", 11),
+            font=self._sf(11),
         ).pack(side=tk.LEFT, padx=8)
         ttk.Label(
             rounds_input_frame,
             text="(leave empty for unlimited)",
-            font=("Arial", 10, "italic"),
+            font=self._sf(10, "italic"),
         ).pack(side=tk.LEFT, padx=8)
 
         # ELO Limits (Chess only) - larger
@@ -1942,14 +2377,14 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(pady=8)
 
             # Minimum ELO
             min_elo_frame = ttk.Frame(elo_frame)
             min_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(min_elo_frame, text="Minimum Rating:", font=("Arial", 11)).pack(
+            ttk.Label(min_elo_frame, text="Minimum Rating:", font=self._sf(11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.min_elo_var = tk.StringVar(value="1000")
@@ -1957,19 +2392,19 @@ class PlayerSorterApp:
                 min_elo_frame,
                 textvariable=self.min_elo_var,
                 width=15,
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(side=tk.LEFT, padx=8)
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, absolute minimum: 100)",
-                font=("Arial", 10, "italic"),
+                font=self._sf(10, "italic"),
             ).pack(side=tk.LEFT, padx=8)
 
             # Maximum ELO
             max_elo_frame = ttk.Frame(elo_frame)
             max_elo_frame.pack(pady=8, fill=tk.X)
 
-            ttk.Label(max_elo_frame, text="Maximum Rating:", font=("Arial", 11)).pack(
+            ttk.Label(max_elo_frame, text="Maximum Rating:", font=self._sf(11)).pack(
                 side=tk.LEFT, padx=8
             )
             self.max_elo_var = tk.StringVar(value="")
@@ -1977,16 +2412,13 @@ class PlayerSorterApp:
                 max_elo_frame,
                 textvariable=self.max_elo_var,
                 width=15,
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(side=tk.LEFT, padx=8)
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no upper limit)",
-                font=("Arial", 10, "italic"),
+                font=self._sf(10, "italic"),
             ).pack(side=tk.LEFT, padx=8)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Buttons - larger
         btn_frame = ttk.Frame(frame)
@@ -2094,20 +2526,20 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         title = ttk.Label(
-            frame, text="Scheveningen System - Setup", font=("Arial", 16, "bold")
+            frame, text="Scheveningen System - Setup", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
         ttk.Label(
-            frame, text="In Scheveningen, two teams compete.", font=("Arial", 11)
+            frame, text="In Scheveningen, two teams compete.", font=self._sf(11)
         ).pack(pady=5)
         ttk.Label(
             frame,
             text="Every player from Team A plays every player from Team B.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
-        ttk.Label(frame, text="\nPlayers per team:", font=("Arial", 11, "bold")).pack(
+        ttk.Label(frame, text="\nPlayers per team:", font=self._sf(11, "bold")).pack(
             pady=10
         )
 
@@ -2117,7 +2549,7 @@ class PlayerSorterApp:
         )
         spinbox.pack(pady=5)
 
-        ttk.Label(frame, text="\nTiebreak method:", font=("Arial", 11, "bold")).pack(
+        ttk.Label(frame, text="\nTiebreak method:", font=self._sf(11, "bold")).pack(
             pady=10
         )
 
@@ -2160,7 +2592,7 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         title = ttk.Label(
-            frame, text="Knockout - Tournament Settings", font=("Arial", 16, "bold")
+            frame, text="Knockout - Tournament Settings", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
@@ -2172,7 +2604,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 10, "bold"),
+                font=self._sf(10, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -2205,7 +2637,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 10, "bold"),
+                font=self._sf(10, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -2232,7 +2664,7 @@ class PlayerSorterApp:
             "• No half-byes (players must compete)\n"
             "• No withdrawals (single elimination)\n"
             "• Natural end (continues to 1 winner)",
-            font=("Arial", 9),
+            font=self._sf(9),
             justify=tk.LEFT,
         ).pack()
 
@@ -2244,7 +2676,7 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(pady=5)
 
             # Minimum ELO
@@ -2259,7 +2691,7 @@ class PlayerSorterApp:
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, min: 100)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
             # Maximum ELO
@@ -2274,7 +2706,7 @@ class PlayerSorterApp:
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no limit)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
         # Buttons
@@ -2363,22 +2795,12 @@ class PlayerSorterApp:
         frame.pack(expand=True, fill=tk.BOTH)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Tournament Settings", font=("Arial", 22, "bold")
+            frame, text="Scheveningen - Tournament Settings", font=self._sf(22, "bold")
         )
         title.pack(pady=20)
 
         # Scrollable frame
-        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Rating Mode
         rating_frame = ttk.LabelFrame(
@@ -2390,7 +2812,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="automatic_otb")
@@ -2423,7 +2845,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="Should trophy ratings be updated?",
-                font=("Arial", 12, "bold"),
+                font=self._sf(12, "bold"),
             ).pack(pady=5)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -2448,7 +2870,7 @@ class PlayerSorterApp:
         ttk.Label(
             hb_frame,
             text="Allow players to request half-byes (0.5 points) between rounds?",
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=5)
 
@@ -2478,7 +2900,7 @@ class PlayerSorterApp:
                 "Allow players to withdraw from the tournament between rounds?\n"
                 "Withdrawn players keep their score but stop playing."
             ),
-            font=("Arial", 11),
+            font=self._sf(11),
             wraplength=700,
         ).pack(pady=5)
 
@@ -2509,7 +2931,7 @@ class PlayerSorterApp:
                 f"Total rounds: {self.scheveningen_team_size} "
                 "(each player plays each opponent once)"
             ),
-            font=("Arial", 10),
+            font=self._sf(10),
             justify=tk.LEFT,
         ).pack()
 
@@ -2523,7 +2945,7 @@ class PlayerSorterApp:
             ttk.Label(
                 elo_frame,
                 text="Set minimum and maximum Rating for tournament participants:",
-                font=("Arial", 11),
+                font=self._sf(11),
             ).pack(pady=5)
 
             # Minimum ELO
@@ -2538,7 +2960,7 @@ class PlayerSorterApp:
             ttk.Label(
                 min_elo_frame,
                 text="(default: 1000, absolute minimum: 100)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
             # Maximum ELO
@@ -2553,11 +2975,8 @@ class PlayerSorterApp:
             ttk.Label(
                 max_elo_frame,
                 text="(leave empty for no upper limit)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -2676,12 +3095,27 @@ class PlayerSorterApp:
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         title = ttk.Label(
-            main_frame, text=f"{game_name} - {mode_name}", font=("Arial", 20, "bold")
+            main_frame, text=f"{game_name} - {mode_name}", font=self._sf(20, "bold")
         )
         title.pack(pady=15)
 
+        # Everything between the title and the action buttons goes in a
+        # scrollable region. This screen's content (the input form, plus
+        # the FIDE Info sub-section for chess tournaments, plus the
+        # players list) can add up to more vertical space than fits on a
+        # smaller screen or at a higher UI scale - without this, the
+        # "Start Game"/"Back" buttons at the bottom could be pushed
+        # completely off-screen with no way to reach them. Wrapping the
+        # middle section in a canvas means it gets a scrollbar instead,
+        # while the action buttons (packed into main_frame further below,
+        # after the canvas) always keep their guaranteed space at the
+        # bottom of the window.
+        scrollable_frame = self.make_scrollable_region(main_frame)
+
         # Input frame with larger font
-        input_frame = ttk.LabelFrame(main_frame, text="Add/Edit Player", padding="15")
+        input_frame = ttk.LabelFrame(
+            scrollable_frame, text="Add/Edit Player", padding="15"
+        )
         input_frame.pack(fill=tk.X, padx=20, pady=10)
 
         # Determine which fields are required based on game type and mode
@@ -2692,29 +3126,29 @@ class PlayerSorterApp:
         # Row 0: First Name, Last Name
         # Row 1: Nickname, Rating, Add Button
 
-        ttk.Label(input_frame, text="First Name:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="First Name:", font=self._sf(11)).grid(
             row=0, column=0, sticky=tk.W, padx=10, pady=8
         )
-        self.first_name_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.first_name_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.first_name_entry.grid(row=0, column=1, padx=10, pady=8)
 
-        ttk.Label(input_frame, text="Last Name:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="Last Name:", font=self._sf(11)).grid(
             row=0, column=2, sticky=tk.W, padx=10, pady=8
         )
-        self.last_name_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.last_name_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.last_name_entry.grid(row=0, column=3, padx=10, pady=8)
 
-        ttk.Label(input_frame, text="Nickname:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text="Nickname:", font=self._sf(11)).grid(
             row=1, column=0, sticky=tk.W, padx=10, pady=8
         )
-        self.nickname_entry = ttk.Entry(input_frame, width=20, font=("Arial", 11))
+        self.nickname_entry = ttk.Entry(input_frame, width=20, font=self._sf(11))
         self.nickname_entry.grid(row=1, column=1, padx=10, pady=8)
 
         # Rating input
-        ttk.Label(input_frame, text=f"{rating_name}:", font=("Arial", 11)).grid(
+        ttk.Label(input_frame, text=f"{rating_name}:", font=self._sf(11)).grid(
             row=1, column=2, sticky=tk.W, padx=10, pady=8
         )
-        self.rating_entry = ttk.Entry(input_frame, width=15, font=("Arial", 11))
+        self.rating_entry = ttk.Entry(input_frame, width=15, font=self._sf(11))
         self.rating_entry.grid(row=1, column=3, padx=10, pady=8)
 
         # Add/Update button
@@ -2735,46 +3169,46 @@ class PlayerSorterApp:
             )
             fide_frame.grid(row=2, column=0, columnspan=5, sticky=tk.W, pady=(5, 0))
 
-            ttk.Label(fide_frame, text="Sex:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Sex:", font=self._sf(10)).grid(
                 row=0, column=0, sticky=tk.W, padx=6, pady=4
             )
             self.sex_combo = ttk.Combobox(
-                fide_frame, width=5, font=("Arial", 10),
+                fide_frame, width=5, font=self._sf(10),
                 values=["", "m", "w"], state="readonly",
             )
             self.sex_combo.set("")
             self.sex_combo.grid(row=0, column=1, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Title:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Title:", font=self._sf(10)).grid(
                 row=0, column=2, sticky=tk.W, padx=6, pady=4
             )
             self.title_combo = ttk.Combobox(
-                fide_frame, width=6, font=("Arial", 10),
+                fide_frame, width=6, font=self._sf(10),
                 values=["", "GM", "IM", "WGM", "FM", "WIM", "CM", "WFM", "WCM"],
                 state="readonly",
             )
             self.title_combo.set("")
             self.title_combo.grid(row=0, column=3, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Federation:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Federation:", font=self._sf(10)).grid(
                 row=0, column=4, sticky=tk.W, padx=6, pady=4
             )
             self.federation_entry = ttk.Entry(
-                fide_frame, width=6, font=("Arial", 10)
+                fide_frame, width=6, font=self._sf(10)
             )
             self.federation_entry.grid(row=0, column=5, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="FIDE ID:", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="FIDE ID:", font=self._sf(10)).grid(
                 row=1, column=0, sticky=tk.W, padx=6, pady=4
             )
-            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=("Arial", 10))
+            self.fide_id_entry = ttk.Entry(fide_frame, width=12, font=self._sf(10))
             self.fide_id_entry.grid(row=1, column=1, padx=6, pady=4)
 
-            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=("Arial", 10)).grid(
+            ttk.Label(fide_frame, text="Birth date (YYYY/MM/DD):", font=self._sf(10)).grid(
                 row=1, column=2, columnspan=2, sticky=tk.W, padx=6, pady=4
             )
             self.birth_date_entry = ttk.Entry(
-                fide_frame, width=12, font=("Arial", 10)
+                fide_frame, width=12, font=self._sf(10)
             )
             self.birth_date_entry.grid(row=1, column=4, padx=6, pady=4)
 
@@ -2788,12 +3222,12 @@ class PlayerSorterApp:
             req_text = "Required: Nickname | Optional: First Name + Last Name"
 
         req_label = ttk.Label(
-            input_frame, text=req_text, font=("Arial", 9, "italic"), foreground="blue"
+            input_frame, text=req_text, font=self._sf(9, "italic"), foreground="blue"
         )
         req_label.grid(row=3, column=0, columnspan=5, pady=5)
 
         # Player list with more height
-        list_frame = ttk.LabelFrame(main_frame, text="Players", padding="15")
+        list_frame = ttk.LabelFrame(scrollable_frame, text="Players", padding="15")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
         # Treeview for player list - larger height and columns
@@ -2808,8 +3242,12 @@ class PlayerSorterApp:
             "winrate",
         ]
 
+        # height=8 rather than a much larger fixed count: the treeview
+        # already gets its own internal scrollbar for viewing more players
+        # than fit, so a smaller default footprint here leaves more room
+        # for everything else on this screen.
         self.tree = ttk.Treeview(
-            list_frame, columns=columns, show="headings", height=15
+            list_frame, columns=columns, show="headings", height=8
         )
         self.tree.heading("name", text="Name")
         self.tree.heading("rating", text=rating_name)
@@ -2832,8 +3270,8 @@ class PlayerSorterApp:
 
         # Configure treeview font
         style = ttk.Style()
-        style.configure("Treeview", font=("Arial", 10), rowheight=25)
-        style.configure("Treeview.Heading", font=("Arial", 11, "bold"))
+        style.configure("Treeview", font=self._sf(10), rowheight=25)
+        style.configure("Treeview.Heading", font=self._sf(11, "bold"))
 
         # Bind selection event
         self.tree.bind("<<TreeviewSelect>>", self.on_player_select)
@@ -2847,7 +3285,12 @@ class PlayerSorterApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Buttons frame
+        # Buttons frame - packed into main_frame as a sibling of the
+        # scrollable region's own container (not into the scrollable
+        # region itself). Plain side=tk.TOP (the default) is correct here:
+        # since the canvas+scrollbar are isolated inside their own
+        # container by make_scrollable_region(), this stacks normally
+        # below it, full-width, in the order these are packed.
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, padx=10, pady=10)
 
@@ -3705,7 +4148,7 @@ class PlayerSorterApp:
 
         mode_name = self.sort_mode.replace("_", " ").title()
         title = ttk.Label(
-            frame, text=f"{mode_name} - Rating Settings", font=("Arial", 16, "bold")
+            frame, text=f"{mode_name} - Rating Settings", font=self._sf(16, "bold")
         )
         title.pack(pady=20)
 
@@ -3719,7 +4162,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text="How should ratings change after games?",
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             ).pack(pady=10)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -3762,7 +4205,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rating_frame,
                 text=f"Should {rating_name} ratings be updated?",
-                font=("Arial", 11, "bold"),
+                font=self._sf(11, "bold"),
             ).pack(pady=10)
 
             self.rating_mode_var = tk.StringVar(value="unranked")
@@ -3788,7 +4231,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rounds_frame,
                 text="Set maximum number of rounds (optional):",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(pady=5)
 
             rounds_input_frame = ttk.Frame(rounds_frame)
@@ -3802,7 +4245,7 @@ class PlayerSorterApp:
             ttk.Label(
                 rounds_input_frame,
                 text="(leave empty for unlimited)",
-                font=("Arial", 9, "italic"),
+                font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
         # Buttons
@@ -3914,7 +4357,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Dual Mode - Round {self.current_round}",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=10)
 
@@ -3950,18 +4393,18 @@ class PlayerSorterApp:
 
             # Player 1
             p1_label = f"{p1.name} ({rating_name}: {p1.rating}, WR: {p1.win_rate:.1f}%)"
-            ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
+            ttk.Label(pair_frame, text=p1_label, font=self._sf(10)).grid(
                 row=0, column=0, sticky=tk.W, padx=5
             )
 
             # VS
-            ttk.Label(pair_frame, text="vs", font=("Arial", 10, "italic")).grid(
+            ttk.Label(pair_frame, text="vs", font=self._sf(10, "italic")).grid(
                 row=0, column=1, padx=10
             )
 
             # Player 2
             p2_label = f"{p2.name} ({rating_name}: {p2.rating}, WR: {p2.win_rate:.1f}%)"
-            ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
+            ttk.Label(pair_frame, text=p2_label, font=self._sf(10)).grid(
                 row=0, column=2, sticky=tk.W, padx=5
             )
 
@@ -3999,7 +4442,7 @@ class PlayerSorterApp:
                     f"{leftover.name} ({rating_name}: {leftover.rating}, "
                     f"WR: {leftover.win_rate:.1f}%)"
                 ),
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W)
             # Bye round counts as 1 full point
             self.dual_results.append(
@@ -4088,7 +4531,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Dual Mode - Standings After Round {self.current_round}",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=10)
 
@@ -4199,7 +4642,7 @@ class PlayerSorterApp:
 
         # Title
         title = ttk.Label(
-            frame, text="Dual Mode - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Dual Mode - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -4211,7 +4654,7 @@ class PlayerSorterApp:
         if sorted_players:
             winner = sorted_players[0]
             ttk.Label(
-                frame, text=f"🏆 Winner: {winner.name} 🏆", font=("Arial", 16, "bold")
+                frame, text=f"🏆 Winner: {winner.name} 🏆", font=self._sf(16, "bold")
             ).pack(pady=10)
 
         # Results table
@@ -4303,7 +4746,7 @@ class PlayerSorterApp:
                 f"Battle Royale - Round {self.current_round} "
                 f"({len(active_players)} players remaining)"
             ),
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4311,12 +4754,12 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Add wins, losses, or draws for each player, then finish the round.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
         ttk.Label(
             frame,
             text="Bottom 3 players will be eliminated after each round.",
-            font=("Arial", 9, "italic"),
+            font=self._sf(9, "italic"),
         ).pack(pady=2)
 
         # Player table with action buttons
@@ -4472,7 +4915,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Round {self.current_round} - Eliminations",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         )
         title.pack(pady=20)
 
@@ -4484,13 +4927,13 @@ class PlayerSorterApp:
             ttk.Label(
                 elim_frame,
                 text=f"❌ {player.name} (Win Rate: {player.win_rate:.1f}%)",
-                font=("Arial", 12),
+                font=self._sf(12),
             ).pack(pady=5)
 
         # Remaining count
         remaining = len([p for p in self.players if not p.eliminated])
         ttk.Label(
-            frame, text=f"{remaining} players remaining", font=("Arial", 11)
+            frame, text=f"{remaining} players remaining", font=self._sf(11)
         ).pack(pady=10)
 
         # Button
@@ -4534,21 +4977,21 @@ class PlayerSorterApp:
         winner = active_players[0]
 
         # Title
-        ttk.Label(frame, text="🏆 WINNER! 🏆", font=("Arial", 24, "bold")).pack(pady=20)
+        ttk.Label(frame, text="🏆 WINNER! 🏆", font=self._sf(24, "bold")).pack(pady=20)
 
         # Winner info
         winner_frame = ttk.LabelFrame(frame, text="Champion", padding="20")
         winner_frame.pack(pady=20)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
-        ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
+        ttk.Label(winner_frame, text=winner.name, font=self._sf(20, "bold")).pack(
             pady=10
         )
         ttk.Label(
-            winner_frame, text=f"{rating_name}: {winner.rating}", font=("Arial", 14)
+            winner_frame, text=f"{rating_name}: {winner.rating}", font=self._sf(14)
         ).pack(pady=5)
         ttk.Label(
-            winner_frame, text=f"Win Rate: {winner.win_rate:.1f}%", font=("Arial", 14)
+            winner_frame, text=f"Win Rate: {winner.win_rate:.1f}%", font=self._sf(14)
         ).pack(pady=5)
 
         record = f"Record: {winner.wins}W - {winner.losses}L - {winner.draws}D"
@@ -4557,7 +5000,7 @@ class PlayerSorterApp:
         if winner.half_byes > 0:
             record += f" - {winner.half_byes}½Bye"
 
-        ttk.Label(winner_frame, text=record, font=("Arial", 12)).pack(pady=5)
+        ttk.Label(winner_frame, text=record, font=self._sf(12)).pack(pady=5)
 
         # Buttons
         btn_frame = ttk.Frame(frame)
@@ -4581,7 +5024,7 @@ class PlayerSorterApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         title = ttk.Label(
-            frame, text="Battle Royale - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Battle Royale - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -4702,7 +5145,7 @@ class PlayerSorterApp:
         frame = ttk.Frame(dialog, padding="20")
         frame.pack(expand=True)
 
-        ttk.Label(frame, text="Number of Teams:", font=("Arial", 11)).pack(pady=10)
+        ttk.Label(frame, text="Number of Teams:", font=self._sf(11)).pack(pady=10)
 
         num_teams_var = tk.IntVar(value=2)
         spinbox = ttk.Spinbox(
@@ -4745,7 +5188,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Teams Mode - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4753,7 +5196,7 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Add wins, losses, or draws for each player, then finish the round.",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
         # Teams display with player stats
@@ -4801,7 +5244,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}%)"
                 )
                 ttk.Label(
-                    player_frame, text=info_text, font=("Arial", 9), width=40
+                    player_frame, text=info_text, font=self._sf(9), width=40
                 ).pack(side=tk.LEFT)
 
                 # Action buttons
@@ -4876,7 +5319,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Teams Mode - Standings After Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -4930,13 +5373,13 @@ class PlayerSorterApp:
             if mvp:
                 mvp_frame = ttk.Frame(team_frame)
                 mvp_frame.pack(fill=tk.X, pady=5)
-                ttk.Label(mvp_frame, text="🏅 MVP:", font=("Arial", 10, "bold")).pack(
+                ttk.Label(mvp_frame, text="🏅 MVP:", font=self._sf(10, "bold")).pack(
                     side=tk.LEFT
                 )
                 ttk.Label(
                     mvp_frame,
                     text=f"{mvp.name} (WR: {mvp.win_rate:.1f}%)",
-                    font=("Arial", 10),
+                    font=self._sf(10),
                 ).pack(side=tk.LEFT, padx=5)
 
             # Players
@@ -4946,7 +5389,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}% "
                     f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
-                ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
+                ttk.Label(team_frame, text=player_text, font=self._sf(9)).pack(
                     anchor=tk.W, pady=1
                 )
 
@@ -4992,7 +5435,7 @@ class PlayerSorterApp:
 
         # Title
         title = ttk.Label(
-            frame, text="Teams Mode - Final Standings", font=("Arial", 18, "bold")
+            frame, text="Teams Mode - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -5021,7 +5464,7 @@ class PlayerSorterApp:
             ttk.Label(
                 frame,
                 text=f"🏆 Winning Team: Team {winning_team[0]} 🏆",
-                font=("Arial", 16, "bold"),
+                font=self._sf(16, "bold"),
             ).pack(pady=10)
 
         # Display teams
@@ -5061,13 +5504,13 @@ class PlayerSorterApp:
             if mvp:
                 mvp_frame = ttk.Frame(team_frame)
                 mvp_frame.pack(fill=tk.X, pady=5)
-                ttk.Label(mvp_frame, text="🏅 MVP:", font=("Arial", 10, "bold")).pack(
+                ttk.Label(mvp_frame, text="🏅 MVP:", font=self._sf(10, "bold")).pack(
                     side=tk.LEFT
                 )
                 ttk.Label(
                     mvp_frame,
                     text=f"{mvp.name} (WR: {mvp.win_rate:.1f}%)",
-                    font=("Arial", 10),
+                    font=self._sf(10),
                 ).pack(side=tk.LEFT, padx=5)
 
             # Players
@@ -5077,7 +5520,7 @@ class PlayerSorterApp:
                     f"WR: {player.win_rate:.1f}% "
                     f"({player.wins}W-{player.losses}L-{player.draws}D)"
                 )
-                ttk.Label(team_frame, text=player_text, font=("Arial", 9)).pack(
+                ttk.Label(team_frame, text=player_text, font=self._sf(9)).pack(
                     anchor=tk.W, pady=1
                 )
 
@@ -5192,14 +5635,14 @@ class PlayerSorterApp:
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
         title = ttk.Label(
-            frame, text=f"Update {rating_name} Ratings", font=("Arial", 16, "bold")
+            frame, text=f"Update {rating_name} Ratings", font=self._sf(16, "bold")
         )
         title.pack(pady=10)
 
         ttk.Label(
             frame,
             text=f"Manually adjust {rating_name} ratings based on round performance:",
-            font=("Arial", 10),
+            font=self._sf(10),
         ).pack(pady=5)
 
         # Scrollable player list with rating inputs
@@ -5440,7 +5883,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Swiss System - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -5939,7 +6382,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Round-Robin - Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -6152,7 +6595,7 @@ class PlayerSorterApp:
             round_name = f"Round {self.current_round}"
 
         title = ttk.Label(
-            frame, text=f"Knockout - {round_name}", font=("Arial", 16, "bold")
+            frame, text=f"Knockout - {round_name}", font=self._sf(16, "bold")
         )
         title.pack(pady=10)
 
@@ -6234,7 +6677,7 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Scheveningen - Round {self.schev_round}/{self.schev_total_rounds}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
 
@@ -6397,16 +6840,22 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"Scheveningen - Standings After Round {self.schev_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
+
+        # Everything between the title and the action buttons goes in a
+        # scrollable region - see show_tournament_standings for why (the
+        # half-bye/withdrawal checklists further down can add up to a lot
+        # of vertical space with a large player count).
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Combine both teams for standings
         all_players = self.schev_team_a + self.schev_team_b
         sorted_players = self.apply_tiebreak(all_players)
 
         # Display standings
-        results_frame = ttk.Frame(frame)
+        results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
         tree = ttk.Treeview(
@@ -6483,7 +6932,7 @@ class PlayerSorterApp:
         # Half-bye request section (if enabled)
         if self.half_bye_enabled:
             halfbye_frame = ttk.LabelFrame(
-                frame, text="Half-Bye Requests for Next Round", padding="10"
+                scrollable_frame, text="Half-Bye Requests for Next Round", padding="10"
             )
             halfbye_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -6493,7 +6942,7 @@ class PlayerSorterApp:
                     "Players can request a half-bye (0.5 points) "
                     "to skip the next round."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -6519,7 +6968,7 @@ class PlayerSorterApp:
         # Withdrawal request section (if enabled)
         if self.withdrawal_enabled:
             withdrawal_frame = ttk.LabelFrame(
-                frame, text="Player Withdrawals", padding="10"
+                scrollable_frame, text="Player Withdrawals", padding="10"
             )
             withdrawal_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -6529,7 +6978,7 @@ class PlayerSorterApp:
                     "Select players to withdraw from the tournament "
                     "(they keep their current score)."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -6596,7 +7045,7 @@ class PlayerSorterApp:
         frame.pack(fill=tk.BOTH, expand=True)
 
         title = ttk.Label(
-            frame, text="Scheveningen - Final Results", font=("Arial", 18, "bold")
+            frame, text="Scheveningen - Final Results", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -6612,7 +7061,7 @@ class PlayerSorterApp:
         else:
             winner_text = f"Draw! ({team_a_score} - {team_b_score})"
 
-        ttk.Label(frame, text=winner_text, font=("Arial", 16, "bold")).pack(pady=20)
+        ttk.Label(frame, text=winner_text, font=self._sf(16, "bold")).pack(pady=20)
 
         # Display teams with individual scores
         teams_frame = ttk.Frame(frame)
@@ -6628,7 +7077,7 @@ class PlayerSorterApp:
             ttk.Label(
                 team_a_frame,
                 text=f"{p.name}: {p.points} pts ({p.wins}W-{p.losses}L-{p.draws}D)",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W, pady=2)
 
         # Team B
@@ -6641,7 +7090,7 @@ class PlayerSorterApp:
             ttk.Label(
                 team_b_frame,
                 text=f"{p.name}: {p.points} pts ({p.wins}W-{p.losses}L-{p.draws}D)",
-                font=("Arial", 10),
+                font=self._sf(10),
             ).pack(anchor=tk.W, pady=2)
 
         btn_frame = ttk.Frame(frame)
@@ -6790,7 +7239,7 @@ class PlayerSorterApp:
                     ttk.Label(
                         pair_frame,
                         text=f"{p1.name} - HALF-BYE (0.5 points)",
-                        font=("Arial", 11, "bold"),
+                        font=self._sf(11, "bold"),
                         foreground="blue",
                     ).pack(anchor=tk.W)
                     result_var = tk.StringVar(value="half_bye")
@@ -6798,7 +7247,7 @@ class PlayerSorterApp:
                     ttk.Label(
                         pair_frame,
                         text=f"{p1.name} - BYE (1 point)",
-                        font=("Arial", 11, "bold"),
+                        font=self._sf(11, "bold"),
                     ).pack(anchor=tk.W)
                     result_var = tk.StringVar(value="bye")
                 self.tournament_results.append((pairing, result_var))
@@ -6821,12 +7270,12 @@ class PlayerSorterApp:
                     f"{p1.name}{p1_color_suffix} "
                     f"({rating_name}: {p1.rating}, Pts: {p1.points})"
                 )
-                ttk.Label(pair_frame, text=p1_label, font=("Arial", 10)).grid(
+                ttk.Label(pair_frame, text=p1_label, font=self._sf(10)).grid(
                     row=0, column=0, sticky=tk.W, padx=5
                 )
 
                 # VS
-                ttk.Label(pair_frame, text="vs", font=("Arial", 10, "italic")).grid(
+                ttk.Label(pair_frame, text="vs", font=self._sf(10, "italic")).grid(
                     row=0, column=1, padx=10
                 )
 
@@ -6835,7 +7284,7 @@ class PlayerSorterApp:
                     f"{p2.name}{p2_color_suffix} "
                     f"({rating_name}: {p2.rating}, Pts: {p2.points})"
                 )
-                ttk.Label(pair_frame, text=p2_label, font=("Arial", 10)).grid(
+                ttk.Label(pair_frame, text=p2_label, font=self._sf(10)).grid(
                     row=0, column=2, sticky=tk.W, padx=5
                 )
 
@@ -7033,15 +7482,23 @@ class PlayerSorterApp:
         title = ttk.Label(
             frame,
             text=f"{system_name} - Standings After Round {self.current_round}",
-            font=("Arial", 16, "bold"),
+            font=self._sf(16, "bold"),
         )
         title.pack(pady=10)
+
+        # Everything between the title and the action buttons goes in a
+        # scrollable region. With half-byes and withdrawals both enabled
+        # and a large player count (30+), the two checkbox sections below
+        # can add up to a lot of vertical space - without this, the
+        # "Next Round"/"Back to Setup" buttons at the bottom could be
+        # pushed completely off-screen with no way to reach them.
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Sort with tiebreak
         sorted_players = self.apply_tiebreak(self.players)
 
         # Display standings
-        results_frame = ttk.Frame(frame)
+        results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
         tree = ttk.Treeview(
@@ -7119,7 +7576,7 @@ class PlayerSorterApp:
         # Half-bye request section (if enabled)
         if self.half_bye_enabled:
             halfbye_frame = ttk.LabelFrame(
-                frame, text="Half-Bye Requests for Next Round", padding="10"
+                scrollable_frame, text="Half-Bye Requests for Next Round", padding="10"
             )
             halfbye_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -7129,7 +7586,7 @@ class PlayerSorterApp:
                     "Players can request a half-bye (0.5 points) "
                     "to skip the next round."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each player, keyed by player object
@@ -7154,7 +7611,7 @@ class PlayerSorterApp:
         # Withdrawal request section (if enabled)
         if self.withdrawal_enabled:
             withdrawal_frame = ttk.LabelFrame(
-                frame, text="Player Withdrawals", padding="10"
+                scrollable_frame, text="Player Withdrawals", padding="10"
             )
             withdrawal_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -7164,7 +7621,7 @@ class PlayerSorterApp:
                     "Select players to withdraw from the tournament "
                     "(they keep their current score)."
                 ),
-                font=("Arial", 9),
+                font=self._sf(9),
             ).pack(pady=5)
 
             # Create checkboxes for each active player, keyed by player
@@ -7454,7 +7911,7 @@ class PlayerSorterApp:
         system_name = system_names.get(self.tournament_system, "Tournament")
 
         title = ttk.Label(
-            frame, text=f"{system_name} - Final Standings", font=("Arial", 18, "bold")
+            frame, text=f"{system_name} - Final Standings", font=self._sf(18, "bold")
         )
         title.pack(pady=10)
 
@@ -7465,7 +7922,7 @@ class PlayerSorterApp:
         if sorted_players:
             winner = sorted_players[0][0]
             ttk.Label(
-                frame, text=f"🏆 Winner: {winner.name} 🏆", font=("Arial", 16, "bold")
+                frame, text=f"🏆 Winner: {winner.name} 🏆", font=self._sf(16, "bold")
             ).pack(pady=10)
 
         # Display full standings
@@ -7564,20 +8021,20 @@ class PlayerSorterApp:
         frame.pack(expand=True)
 
         ttk.Label(
-            frame, text="🏆 TOURNAMENT WINNER! 🏆", font=("Arial", 24, "bold")
+            frame, text="🏆 TOURNAMENT WINNER! 🏆", font=self._sf(24, "bold")
         ).pack(pady=20)
 
         winner_frame = ttk.LabelFrame(frame, text="Champion", padding="20")
         winner_frame.pack(pady=20)
 
-        ttk.Label(winner_frame, text=winner.name, font=("Arial", 20, "bold")).pack(
+        ttk.Label(winner_frame, text=winner.name, font=self._sf(20, "bold")).pack(
             pady=10
         )
-        ttk.Label(winner_frame, text=f"Rating: {winner.rating}", font=("Arial", 14)).pack(
+        ttk.Label(winner_frame, text=f"Rating: {winner.rating}", font=self._sf(14)).pack(
             pady=5
         )
         ttk.Label(
-            winner_frame, text=f"Points: {winner.points}", font=("Arial", 14)
+            winner_frame, text=f"Points: {winner.points}", font=self._sf(14)
         ).pack(pady=5)
 
         record = f"Record: {winner.wins}W - {winner.losses}L - {winner.draws}D"
@@ -7586,7 +8043,7 @@ class PlayerSorterApp:
         if winner.half_byes > 0:
             record += f" - {winner.half_byes}½Bye"
 
-        ttk.Label(winner_frame, text=record, font=("Arial", 12)).pack(pady=5)
+        ttk.Label(winner_frame, text=record, font=self._sf(12)).pack(pady=5)
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=20)
@@ -8088,7 +8545,7 @@ class PlayerSorterApp:
             frame,
             text="These details are optional (except leaving Tournament\n"
             "Name blank is allowed too) - fill in what you have.",
-            font=("Arial", 9, "italic"),
+            font=self._sf(9, "italic"),
         ).grid(row=0, column=0, columnspan=2, pady=(0, 10), sticky=tk.W)
 
         fields = [
@@ -8103,10 +8560,10 @@ class PlayerSorterApp:
         ]
         entries = {}
         for i, (key, label, default) in enumerate(fields, start=1):
-            ttk.Label(frame, text=label, font=("Arial", 10)).grid(
+            ttk.Label(frame, text=label, font=self._sf(10)).grid(
                 row=i, column=0, sticky=tk.W, padx=5, pady=4
             )
-            entry = ttk.Entry(frame, width=30, font=("Arial", 10))
+            entry = ttk.Entry(frame, width=30, font=self._sf(10))
             entry.insert(0, default)
             entry.grid(row=i, column=1, padx=5, pady=4)
             entries[key] = entry
@@ -8676,14 +9133,14 @@ class PlayerSorterApp:
         ttk.Label(
             frame,
             text="Tournament Round-by-Round Details",
-            font=("Arial", 18, "bold"),
+            font=self._sf(18, "bold"),
         ).pack(pady=10)
 
         # Round selector
         selector_frame = ttk.Frame(frame)
         selector_frame.pack(pady=5)
 
-        ttk.Label(selector_frame, text="Select Round:", font=("Arial", 12)).pack(
+        ttk.Label(selector_frame, text="Select Round:", font=self._sf(12)).pack(
             side=tk.LEFT, padx=5
         )
 
@@ -8696,7 +9153,7 @@ class PlayerSorterApp:
             values=round_labels,
             state="readonly",
             width=15,
-            font=("Arial", 11),
+            font=self._sf(11),
         )
         round_dropdown.pack(side=tk.LEFT, padx=5)
 
@@ -8908,7 +9365,36 @@ class PlayerSorterApp:
             widget.destroy()
 
 
+def _configure_platform_dpi_awareness() -> None:
+    """Tell Windows this process handles its own DPI scaling, so Tk's
+    reported DPI/resolution reflects the user's actual display-scaling
+    setting instead of a fixed 96 DPI default. This has to run before any
+    Tk window is created to take effect, which is why it's called at the
+    very top of main() rather than from PlayerSorterApp.__init__().
+
+    Safely a no-op on non-Windows platforms, and on Windows versions that
+    lack the relevant API (falls back to the older, coarser
+    SetProcessDPIAware() call, then simply gives up if that's missing too)
+    - this must never block or break startup.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        try:
+            # PROCESS_PER_MONITOR_DPI_AWARE - available on Windows 8.1+.
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except (AttributeError, OSError):
+            # Windows 8 and earlier don't have shcore; this coarser,
+            # system-wide (not per-monitor) API goes back to Vista.
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass  # Best-effort only.
+
+
 def main():
+    _configure_platform_dpi_awareness()
     root = tk.Tk()
     PlayerSorterApp(root)
     root.mainloop()
