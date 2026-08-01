@@ -32,7 +32,7 @@ from typing import List
 # ── Version / update-check constants ──────────────────────────────────────────
 # Bump this on every release. Used solely to compare against the latest GitHub
 # release tag to power the startup "Update available" check below.
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 
 # owner/repo slug for the GitHub API's "latest release" endpoint. That endpoint
 # already resolves to the newest non-draft, non-prerelease release, so no
