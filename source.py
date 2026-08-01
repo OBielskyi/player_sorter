@@ -1142,6 +1142,58 @@ class PlayerSorterApp:
         self._current_scale_pct = scale_pct
         self._scale_multiplier = scale_pct / 100.0
     
+    def make_scrollable_region(self, parent):
+        """Create a scrollable region - a themed canvas plus a vertical
+        scrollbar plus an inner content frame - that expands to fill
+        whatever space is left in `parent`.
+
+        Returns `scrollable_frame`: pack your actual content into that,
+        not into `parent` directly.
+
+        Usage:
+            scrollable = self.make_scrollable_region(main_frame)
+            ttk.Label(scrollable, text="...").pack(...)
+            # then, still packing into main_frame (NOT scrollable):
+            btn_frame = ttk.Frame(main_frame)
+            btn_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=10)
+
+        IMPORTANT: this packs an intermediate container into `parent` with
+        side=tk.TOP, fill=tk.BOTH, expand=True. Any other widget you pack
+        directly into `parent` (e.g. a row of action buttons below the
+        scrollable content) MUST use side=tk.TOP (the default) or
+        side=tk.BOTTOM - never side=tk.LEFT/tk.RIGHT. Earlier hand-rolled
+        copies of this pattern packed the canvas itself with side=tk.LEFT
+        directly into the same parent as a later side=tk.TOP button frame;
+        mixing LEFT/RIGHT and TOP/BOTTOM siblings in one parent makes Tk's
+        packer carve a LEFT-anchored column for the canvas that spans the
+        *entire* remaining height, leaving only a slim leftover strip (to
+        the canvas's right) for anything packed afterward - so the button
+        row would end up squeezed into a column near the top-right corner
+        instead of spanning the bottom, exactly as reported. Wrapping the
+        canvas+scrollbar in their own intermediate container (packed
+        side=tk.TOP like everything else) keeps the LEFT/RIGHT pairing
+        contained to that inner frame, so siblings packed afterward into
+        `parent` stack normally below it, full-width, as intended.
+        """
+        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
+        container = ttk.Frame(parent)
+        container.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(container, bg=theme["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        return scrollable_frame
+
     def _scaled_px(self, base_px: int, floor_px: int = 6) -> int:
         """Scale a plain pixel dimension - NOT a font - by the current UI
         scale, with its own floor.
@@ -2153,17 +2205,7 @@ class PlayerSorterApp:
         title.pack(pady=20)
 
         # Scrollable frame for all options - larger height
-        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Rating Mode Option - larger fonts
         rating_frame = ttk.LabelFrame(
@@ -2377,9 +2419,6 @@ class PlayerSorterApp:
                 text="(leave empty for no upper limit)",
                 font=self._sf(10, "italic"),
             ).pack(side=tk.LEFT, padx=8)
-
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
         # Buttons - larger
         btn_frame = ttk.Frame(frame)
@@ -2761,17 +2800,7 @@ class PlayerSorterApp:
         title.pack(pady=20)
 
         # Scrollable frame
-        theme = THEMES.get(self.current_theme, THEMES["Simple Light"])
-        canvas = tk.Canvas(frame, bg=theme["bg"], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
-        scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollable_frame = self.make_scrollable_region(frame)
 
         # Rating Mode
         rating_frame = ttk.LabelFrame(
@@ -2949,9 +2978,6 @@ class PlayerSorterApp:
                 font=self._sf(9, "italic"),
             ).pack(side=tk.LEFT, padx=5)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
         # Buttons
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=20)
@@ -3073,8 +3099,23 @@ class PlayerSorterApp:
         )
         title.pack(pady=15)
 
+        # Everything between the title and the action buttons goes in a
+        # scrollable region. This screen's content (the input form, plus
+        # the FIDE Info sub-section for chess tournaments, plus the
+        # players list) can add up to more vertical space than fits on a
+        # smaller screen or at a higher UI scale - without this, the
+        # "Start Game"/"Back" buttons at the bottom could be pushed
+        # completely off-screen with no way to reach them. Wrapping the
+        # middle section in a canvas means it gets a scrollbar instead,
+        # while the action buttons (packed into main_frame further below,
+        # after the canvas) always keep their guaranteed space at the
+        # bottom of the window.
+        scrollable_frame = self.make_scrollable_region(main_frame)
+
         # Input frame with larger font
-        input_frame = ttk.LabelFrame(main_frame, text="Add/Edit Player", padding="15")
+        input_frame = ttk.LabelFrame(
+            scrollable_frame, text="Add/Edit Player", padding="15"
+        )
         input_frame.pack(fill=tk.X, padx=20, pady=10)
 
         # Determine which fields are required based on game type and mode
@@ -3186,7 +3227,7 @@ class PlayerSorterApp:
         req_label.grid(row=3, column=0, columnspan=5, pady=5)
 
         # Player list with more height
-        list_frame = ttk.LabelFrame(main_frame, text="Players", padding="15")
+        list_frame = ttk.LabelFrame(scrollable_frame, text="Players", padding="15")
         list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
 
         # Treeview for player list - larger height and columns
@@ -3201,8 +3242,12 @@ class PlayerSorterApp:
             "winrate",
         ]
 
+        # height=8 rather than a much larger fixed count: the treeview
+        # already gets its own internal scrollbar for viewing more players
+        # than fit, so a smaller default footprint here leaves more room
+        # for everything else on this screen.
         self.tree = ttk.Treeview(
-            list_frame, columns=columns, show="headings", height=15
+            list_frame, columns=columns, show="headings", height=8
         )
         self.tree.heading("name", text="Name")
         self.tree.heading("rating", text=rating_name)
@@ -3240,7 +3285,12 @@ class PlayerSorterApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Buttons frame
+        # Buttons frame - packed into main_frame as a sibling of the
+        # scrollable region's own container (not into the scrollable
+        # region itself). Plain side=tk.TOP (the default) is correct here:
+        # since the canvas+scrollbar are isolated inside their own
+        # container by make_scrollable_region(), this stacks normally
+        # below it, full-width, in the order these are packed.
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(fill=tk.X, padx=10, pady=10)
 
@@ -6794,12 +6844,18 @@ class PlayerSorterApp:
         )
         title.pack(pady=10)
 
+        # Everything between the title and the action buttons goes in a
+        # scrollable region - see show_tournament_standings for why (the
+        # half-bye/withdrawal checklists further down can add up to a lot
+        # of vertical space with a large player count).
+        scrollable_frame = self.make_scrollable_region(frame)
+
         # Combine both teams for standings
         all_players = self.schev_team_a + self.schev_team_b
         sorted_players = self.apply_tiebreak(all_players)
 
         # Display standings
-        results_frame = ttk.Frame(frame)
+        results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
         tree = ttk.Treeview(
@@ -6876,7 +6932,7 @@ class PlayerSorterApp:
         # Half-bye request section (if enabled)
         if self.half_bye_enabled:
             halfbye_frame = ttk.LabelFrame(
-                frame, text="Half-Bye Requests for Next Round", padding="10"
+                scrollable_frame, text="Half-Bye Requests for Next Round", padding="10"
             )
             halfbye_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -6912,7 +6968,7 @@ class PlayerSorterApp:
         # Withdrawal request section (if enabled)
         if self.withdrawal_enabled:
             withdrawal_frame = ttk.LabelFrame(
-                frame, text="Player Withdrawals", padding="10"
+                scrollable_frame, text="Player Withdrawals", padding="10"
             )
             withdrawal_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -7430,11 +7486,19 @@ class PlayerSorterApp:
         )
         title.pack(pady=10)
 
+        # Everything between the title and the action buttons goes in a
+        # scrollable region. With half-byes and withdrawals both enabled
+        # and a large player count (30+), the two checkbox sections below
+        # can add up to a lot of vertical space - without this, the
+        # "Next Round"/"Back to Setup" buttons at the bottom could be
+        # pushed completely off-screen with no way to reach them.
+        scrollable_frame = self.make_scrollable_region(frame)
+
         # Sort with tiebreak
         sorted_players = self.apply_tiebreak(self.players)
 
         # Display standings
-        results_frame = ttk.Frame(frame)
+        results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
 
         tree = ttk.Treeview(
@@ -7512,7 +7576,7 @@ class PlayerSorterApp:
         # Half-bye request section (if enabled)
         if self.half_bye_enabled:
             halfbye_frame = ttk.LabelFrame(
-                frame, text="Half-Bye Requests for Next Round", padding="10"
+                scrollable_frame, text="Half-Bye Requests for Next Round", padding="10"
             )
             halfbye_frame.pack(fill=tk.X, pady=5, padx=10)
 
@@ -7547,7 +7611,7 @@ class PlayerSorterApp:
         # Withdrawal request section (if enabled)
         if self.withdrawal_enabled:
             withdrawal_frame = ttk.LabelFrame(
-                frame, text="Player Withdrawals", padding="10"
+                scrollable_frame, text="Player Withdrawals", padding="10"
             )
             withdrawal_frame.pack(fill=tk.X, pady=5, padx=10)
 
