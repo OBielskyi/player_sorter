@@ -623,6 +623,14 @@ class PlayerSorterApp:
         self.editing_player_index = None  # Index of player being edited, or None
         self.half_bye_enabled = False  # Track if half-byes are allowed
         self.withdrawal_enabled = False  # Track if withdrawals are allowed
+        # Chess-only, Swiss/Round-Robin/Scheveningen-only. When on, each
+        # round is played as two games per pairing: the normal pairing,
+        # then the same two players again with colours swapped. Set only
+        # when starting a NEW tournament (see show_half_bye_option /
+        # show_scheveningen_settings) - never offered when resuming a
+        # saved tournament, and never available for Knockout, Dual,
+        # Battle Royale, or Teams.
+        self.double_games_enabled = False
         self.max_rounds = None  # Maximum rounds (None = unlimited)
         self.tournament_history = []
         # List of round dicts, populated during tournament play
@@ -1186,8 +1194,36 @@ class PlayerSorterApp:
         scrollable_frame.bind(
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -2059,6 +2095,9 @@ class PlayerSorterApp:
             self.tournament_system = None
             self.tiebreak_method = None
             self.half_bye_enabled = False
+            # Dual/Battle Royale/Teams don't support double games - no
+            # pairing concept to double against.
+            self.double_games_enabled = False
             self.show_player_input()
 
     def show_tournament_system_selection(self):
@@ -2128,6 +2167,7 @@ class PlayerSorterApp:
             self.tiebreak_method = None
             self.half_bye_enabled = False
             self.withdrawal_enabled = False
+            self.double_games_enabled = False
             self.max_rounds = None
             self.show_player_input()
 
@@ -2367,6 +2407,41 @@ class PlayerSorterApp:
             font=self._sf(10, "italic"),
         ).pack(side=tk.LEFT, padx=8)
 
+        # Double Games (Chess only) - larger
+        if self.game_type == "chess":
+            dg_frame = ttk.LabelFrame(
+                scrollable_frame, text="Double Games", padding="20",
+                style="Large.TLabelframe",
+            )
+            dg_frame.pack(pady=15, padx=30, fill=tk.X)
+
+            ttk.Label(
+                dg_frame,
+                text=(
+                    "Play each round as two games per pairing? Players "
+                    "first play the normal pairing, then immediately play "
+                    "again with colours swapped."
+                ),
+                font=self._sf(11),
+                wraplength=700,
+            ).pack(pady=8)
+
+            self.double_games_var = tk.BooleanVar(value=False)
+            ttk.Radiobutton(
+                dg_frame,
+                text="Yes - Two games per pairing each round",
+                variable=self.double_games_var,
+                value=True,
+                style="Large.TRadiobutton",
+            ).pack(anchor=tk.W, pady=4)
+            ttk.Radiobutton(
+                dg_frame,
+                text="No - One game per pairing each round",
+                variable=self.double_games_var,
+                value=False,
+                style="Large.TRadiobutton",
+            ).pack(anchor=tk.W, pady=4)
+
         # ELO Limits (Chess only) - larger
         if self.game_type == "chess":
             elo_frame = ttk.LabelFrame(
@@ -2451,6 +2526,9 @@ class PlayerSorterApp:
 
         self.half_bye_enabled = self.half_bye_var.get()
         self.withdrawal_enabled = self.withdrawal_var.get()
+        self.double_games_enabled = (
+            self.double_games_var.get() if self.game_type == "chess" else False
+        )
 
         # Parse max rounds
         max_rounds_str = self.max_rounds_var.get().strip()
@@ -2738,6 +2816,7 @@ class PlayerSorterApp:
         # Knockout doesn't support these features
         self.half_bye_enabled = False
         self.withdrawal_enabled = False
+        self.double_games_enabled = False
         self.max_rounds = None
 
         # Parse ELO limits (Chess only)
@@ -2935,6 +3014,39 @@ class PlayerSorterApp:
             justify=tk.LEFT,
         ).pack()
 
+        # Double Games (Chess only)
+        if self.game_type == "chess":
+            dg_frame = ttk.LabelFrame(
+                scrollable_frame, text="Double Games", padding="15"
+            )
+            dg_frame.pack(pady=15, padx=30, fill=tk.X)
+
+            ttk.Label(
+                dg_frame,
+                text=(
+                    "Play each round as two games per pairing? Players "
+                    "first play the normal pairing, then immediately play "
+                    "again with colours swapped. Team match scores are "
+                    "the natural sum of both games."
+                ),
+                font=self._sf(11),
+                wraplength=700,
+            ).pack(pady=5)
+
+            self.double_games_var = tk.BooleanVar(value=False)
+            ttk.Radiobutton(
+                dg_frame,
+                text="Yes - Two games per pairing each round",
+                variable=self.double_games_var,
+                value=True,
+            ).pack(anchor=tk.W, pady=2)
+            ttk.Radiobutton(
+                dg_frame,
+                text="No - One game per pairing each round",
+                variable=self.double_games_var,
+                value=False,
+            ).pack(anchor=tk.W, pady=2)
+
         # ELO Limits (Chess only)
         if self.game_type == "chess":
             elo_frame = ttk.LabelFrame(
@@ -3008,6 +3120,9 @@ class PlayerSorterApp:
 
         self.half_bye_enabled = self.half_bye_var.get()
         self.withdrawal_enabled = self.withdrawal_var.get()
+        self.double_games_enabled = (
+            self.double_games_var.get() if self.game_type == "chess" else False
+        )
 
         # Scheveningen has fixed rounds based on team size
         self.max_rounds = None
@@ -3886,6 +4001,7 @@ class PlayerSorterApp:
             "tiebreak_method": getattr(self, "tiebreak_method", None),
             "half_bye_enabled": getattr(self, "half_bye_enabled", False),
             "withdrawal_enabled": getattr(self, "withdrawal_enabled", False),
+            "double_games_enabled": getattr(self, "double_games_enabled", False),
             "max_rounds": getattr(self, "max_rounds", None),
             "rating_mode": getattr(self, "rating_mode", None),
             "elo_submode": getattr(self, "elo_submode", None),
@@ -4045,6 +4161,11 @@ class PlayerSorterApp:
         self.tiebreak_method = data.get("tiebreak_method")
         self.half_bye_enabled = data.get("half_bye_enabled", False)
         self.withdrawal_enabled = data.get("withdrawal_enabled", False)
+        # Older saves predate this setting entirely - absent key means
+        # the tournament was necessarily played without double games,
+        # so False is not just a fallback default here, it's the only
+        # historically correct value.
+        self.double_games_enabled = data.get("double_games_enabled", False)
         self.max_rounds = data.get("max_rounds")
         self.rating_mode = data.get("rating_mode", "unranked")
         self.elo_submode = data.get("elo_submode")
@@ -4376,8 +4497,36 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
@@ -5212,8 +5361,36 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
@@ -5351,8 +5528,36 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
@@ -5482,8 +5687,36 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
@@ -5658,8 +5891,36 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         # Store rating entry widgets, keyed by player object (not name) so
         # two players who happen to share a display name don't collide
@@ -6061,6 +6322,39 @@ class PlayerSorterApp:
         # 6) ...otherwise (true round-1-style tie) decide by lot.
         return (a, b) if random.random() < 0.5 else (b, a)
 
+    def _double_up_real_games(self, pairings):
+        """Double Games (Swiss/Round-Robin/Scheveningen, chess only): if
+        enabled, split every REAL pairing into two boards played back to
+        back within the same round - the pairing as already
+        colour-decided by the normal cascade, then the identical two
+        players again with colours swapped.
+
+        Byes and half-byes are left exactly as they are: a bye has no
+        opponent to swap colours with, and doubling it would let a
+        player earn more from sitting out a round than from playing one.
+
+        Because `finish_tournament_round`/`_record_round_to_history`
+        already treat pairing[0] as White and pairing[1] as Black purely
+        by position (see the comment there), simply swapping the two
+        players' order for the second board is sufficient - no other
+        code needs to know this round has two boards per pairing instead
+        of one. The second board's tag ("game2") is only ever read by
+        the results-entry UI, for labelling.
+        """
+        if not getattr(self, "double_games_enabled", False):
+            return pairings
+
+        doubled = []
+        for pairing in pairings:
+            first, second, tag = pairing
+            if second is None:
+                # Bye / half-bye - stays single, untouched.
+                doubled.append(pairing)
+                continue
+            doubled.append([first, second, "game1"])
+            doubled.append([second, first, "game2"])
+        return doubled
+
     def generate_swiss_pairings(self):
         """Generate Swiss system pairings"""
         active = [p for p in self.players if not p.eliminated and not p.withdrawn]
@@ -6106,7 +6400,7 @@ class PlayerSorterApp:
                     white, black = self._assign_colors(a, b)
                     pairings.append([white, black, None])
 
-        return pairings
+        return self._double_up_real_games(pairings)
 
     def _find_swiss_matching(self, playing_players):
         """Find a full pairing of playing_players (already sorted by
@@ -6559,7 +6853,7 @@ class PlayerSorterApp:
 
                 pairings.append([white, black, None])
 
-        return pairings
+        return self._double_up_real_games(pairings)
 
     # ===== KNOCKOUT =====
 
@@ -6828,7 +7122,7 @@ class PlayerSorterApp:
             else:
                 pairings.append([b_player, None, "bye"])
 
-        return pairings
+        return self._double_up_real_games(pairings)
 
     def show_scheveningen_standings(self):
         """Show Scheveningen standings after a round"""
@@ -7114,6 +7408,37 @@ class PlayerSorterApp:
         ).pack(side=tk.LEFT, padx=5)
 
     # ===== SHARED TOURNAMENT METHODS =====
+    def _assign_board_numbers(self, pairing_triples):
+        """Given a flat list of pairing triples exactly as they appear in
+        a round's pairings/self.tournament_results (i.e. possibly
+        containing consecutive "game1"/"game2" legs from a Double Games
+        pairing), return a parallel list of 1-based board numbers where
+        both legs of a double-games pairing share one number - matching
+        how they're grouped into a single "Board N" LabelFrame in
+        display_tournament_pairings. Both that function and
+        _record_round_to_history call this SAME helper so the on-screen
+        board numbering and the recorded/exported board numbering can
+        never drift apart from each other."""
+        numbers = []
+        board_num = 0
+        i = 0
+        n = len(pairing_triples)
+        while i < n:
+            tag = pairing_triples[i][2]
+            board_num += 1
+            if (
+                tag == "game1"
+                and i + 1 < n
+                and pairing_triples[i + 1][2] == "game2"
+            ):
+                numbers.append(board_num)
+                numbers.append(board_num)
+                i += 2
+            else:
+                numbers.append(board_num)
+                i += 1
+        return numbers
+
     def _record_round_to_history(self, system):
         """Capture the current round's pairings and standings into tournament_history.
         Call this AFTER results have been applied to Player objects."""
@@ -7125,7 +7450,11 @@ class PlayerSorterApp:
 
         # Build pairings record from self.tournament_results
         pairings_record = []
-        for board_idx, (pairing, result_var) in enumerate(self.tournament_results, 1):
+        raw_pairings = [pairing for pairing, _ in self.tournament_results]
+        board_numbers = self._assign_board_numbers(raw_pairings)
+        for board_num, (pairing, result_var) in zip(
+            board_numbers, self.tournament_results
+        ):
             p1, p2, pairing_type = pairing
             result = result_var.get()
 
@@ -7136,8 +7465,22 @@ class PlayerSorterApp:
             # than leaving it as an implicit positional convention) so
             # history/exports/older code reading this back stay
             # unambiguous even if that convention ever changes.
+            #
+            # Double Games: pairing_type is "game1"/"game2" for the two
+            # legs of a doubled pairing (see _double_up_real_games), or
+            # None for a normal single-game pairing/bye. "game" records
+            # which leg this is (1, 2, or None when the tournament wasn't
+            # played with double games) - "board" now comes from the
+            # shared _assign_board_numbers helper, so both legs of one
+            # double-games pairing share a single board number, matching
+            # what the director actually saw on screen as one "Board N".
             entry = {
-                "board": board_idx,
+                "board": board_num,
+                "game": (
+                    1 if pairing_type == "game1"
+                    else 2 if pairing_type == "game2"
+                    else None
+                ),
                 "player1": p1.name if p1 else None,
                 "player2": p2.name if p2 else None,
                 "player1_color": "white" if p2 else None,
@@ -7219,97 +7562,175 @@ class PlayerSorterApp:
             "<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
         )
 
-        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas_window = canvas.create_window(
+            (0, 0), window=scrollable_frame, anchor="nw"
+        )
         canvas.configure(yscrollcommand=scrollbar.set)
+
+        def _on_canvas_configure(event, _canvas=canvas, _window=canvas_window,
+                                  _frame=scrollable_frame):
+            # Stretch the embedded frame to match the canvas's own current
+            # width. canvas.create_window() otherwise sizes the window to
+            # its content's natural (shrink-wrapped) width only, so on a
+            # wide or scaled-up window the frame - and everything packed
+            # inside it - stays squeezed near its minimum width while the
+            # canvas itself fills the screen, leaving a large blank strip
+            # to its right.
+            _canvas.itemconfig(_window, width=event.width)
+            # Height: use whichever is BIGGER, the content's own natural
+            # height or the canvas viewport's height - never force it to
+            # exactly the viewport height, or a tournament with enough
+            # players/half-byes/withdrawals to need MORE than one screen
+            # would get clipped instead of scrolling. Short content (a
+            # handful of players, nothing else enabled) fills the
+            # available space instead of leaving dead space below it;
+            # long content still grows past the viewport and scrolls
+            # exactly as before.
+            content_height = _frame.winfo_reqheight()
+            _canvas.itemconfig(
+                _window, height=max(content_height, event.height)
+            )
+
+        canvas.bind("<Configure>", _on_canvas_configure)
 
         rating_name = "Rating" if self.game_type == "chess" else "Trophies"
 
         self.tournament_results = []
 
-        for i, pairing in enumerate(pairings):
-            p1, p2, result = pairing
+        # Double Games: _double_up_real_games() emits a real pairing's two
+        # legs as two CONSECUTIVE entries tagged "game1"/"game2" (same two
+        # players, colours swapped). Group them back together here so they
+        # share one "Board N" number and one LabelFrame, instead of being
+        # numbered/framed as if they were two unrelated boards. Byes and
+        # half-byes are never doubled (see _double_up_real_games) and in
+        # single-game mode every real pairing's tag is plain None, so both
+        # of those cases fall through as a group of exactly one entry -
+        # meaning this grouping step is a complete no-op, and the UI is
+        # pixel-identical to before this feature, whenever double games
+        # isn't in play. Uses the same _assign_board_numbers helper that
+        # _record_round_to_history uses, so on-screen board numbers and
+        # recorded/exported board numbers can never drift apart.
+        board_numbers = self._assign_board_numbers(pairings)
+        board_groups = []
+        last_num = None
+        for pairing, num in zip(pairings, board_numbers):
+            if num == last_num:
+                board_groups[-1].append(pairing)
+            else:
+                board_groups.append([pairing])
+            last_num = num
 
+        for board_num, group in enumerate(board_groups, 1):
             pair_frame = ttk.LabelFrame(
-                scrollable_frame, text=f"Board {i + 1}", padding="10"
+                scrollable_frame, text=f"Board {board_num}", padding="10"
             )
             pair_frame.pack(fill=tk.X, padx=5, pady=5)
 
-            if p2 is None:  # Bye or Half-bye
-                if result == "half_bye":
+            is_double_board = len(group) == 2
+
+            for leg_idx, pairing in enumerate(group):
+                p1, p2, result = pairing
+
+                if is_double_board:
+                    if leg_idx == 1:
+                        ttk.Separator(pair_frame, orient="horizontal").pack(
+                            fill=tk.X, pady=6
+                        )
+                    leg_frame = ttk.Frame(pair_frame)
+                    leg_frame.pack(fill=tk.X)
                     ttk.Label(
-                        pair_frame,
-                        text=f"{p1.name} - HALF-BYE (0.5 points)",
-                        font=self._sf(11, "bold"),
-                        foreground="blue",
-                    ).pack(anchor=tk.W)
-                    result_var = tk.StringVar(value="half_bye")
+                        leg_frame,
+                        text=f"Game {leg_idx + 1} of 2",
+                        font=self._sf(9, "italic"),
+                        foreground="gray",
+                    ).pack(anchor=tk.W, pady=(0, 2))
+                    # Separate sub-frame for the grid-managed content below
+                    # (name/vs/name row, radio-button row) - it can't share
+                    # leg_frame itself, since that already has the "Game X
+                    # of 2" label placed with pack(), and Tk refuses to mix
+                    # pack and grid children within the same container.
+                    leg_content = ttk.Frame(leg_frame)
+                    leg_content.pack(fill=tk.X)
+                    content = leg_content
                 else:
-                    ttk.Label(
-                        pair_frame,
-                        text=f"{p1.name} - BYE (1 point)",
-                        font=self._sf(11, "bold"),
-                    ).pack(anchor=tk.W)
-                    result_var = tk.StringVar(value="bye")
-                self.tournament_results.append((pairing, result_var))
-            else:
-                # Colour Balancing: p1/p2 arrive here already decided as
-                # White/Black respectively (chess tournament formats
-                # only) - show it so the director can see it, not just
-                # infer it after the fact from exports.
-                show_colors = self.game_type == "chess" and system in (
-                    "swiss",
-                    "round_robin",
-                    "knockout",
-                    "scheveningen",
-                )
-                p1_color_suffix = " (White)" if show_colors else ""
-                p2_color_suffix = " (Black)" if show_colors else ""
+                    content = pair_frame
 
-                # Player 1
-                p1_label = (
-                    f"{p1.name}{p1_color_suffix} "
-                    f"({rating_name}: {p1.rating}, Pts: {p1.points})"
-                )
-                ttk.Label(pair_frame, text=p1_label, font=self._sf(10)).grid(
-                    row=0, column=0, sticky=tk.W, padx=5
-                )
+                if p2 is None:  # Bye or Half-bye
+                    if result == "half_bye":
+                        ttk.Label(
+                            content,
+                            text=f"{p1.name} - HALF-BYE (0.5 points)",
+                            font=self._sf(11, "bold"),
+                            foreground="blue",
+                        ).pack(anchor=tk.W)
+                        result_var = tk.StringVar(value="half_bye")
+                    else:
+                        ttk.Label(
+                            content,
+                            text=f"{p1.name} - BYE (1 point)",
+                            font=self._sf(11, "bold"),
+                        ).pack(anchor=tk.W)
+                        result_var = tk.StringVar(value="bye")
+                    self.tournament_results.append((pairing, result_var))
+                else:
+                    # Colour Balancing: p1/p2 arrive here already decided as
+                    # White/Black respectively (chess tournament formats
+                    # only) - show it so the director can see it, not just
+                    # infer it after the fact from exports.
+                    show_colors = self.game_type == "chess" and system in (
+                        "swiss",
+                        "round_robin",
+                        "knockout",
+                        "scheveningen",
+                    )
+                    p1_color_suffix = " (White)" if show_colors else ""
+                    p2_color_suffix = " (Black)" if show_colors else ""
 
-                # VS
-                ttk.Label(pair_frame, text="vs", font=self._sf(10, "italic")).grid(
-                    row=0, column=1, padx=10
-                )
+                    # Player 1
+                    p1_label = (
+                        f"{p1.name}{p1_color_suffix} "
+                        f"({rating_name}: {p1.rating}, Pts: {p1.points})"
+                    )
+                    ttk.Label(content, text=p1_label, font=self._sf(10)).grid(
+                        row=0, column=0, sticky=tk.W, padx=5
+                    )
 
-                # Player 2
-                p2_label = (
-                    f"{p2.name}{p2_color_suffix} "
-                    f"({rating_name}: {p2.rating}, Pts: {p2.points})"
-                )
-                ttk.Label(pair_frame, text=p2_label, font=self._sf(10)).grid(
-                    row=0, column=2, sticky=tk.W, padx=5
-                )
+                    # VS
+                    ttk.Label(content, text="vs", font=self._sf(10, "italic")).grid(
+                        row=0, column=1, padx=10
+                    )
 
-                # Result selection
-                result_var = tk.StringVar(value="")
-                self.tournament_results.append((pairing, result_var))
+                    # Player 2
+                    p2_label = (
+                        f"{p2.name}{p2_color_suffix} "
+                        f"({rating_name}: {p2.rating}, Pts: {p2.points})"
+                    )
+                    ttk.Label(content, text=p2_label, font=self._sf(10)).grid(
+                        row=0, column=2, sticky=tk.W, padx=5
+                    )
 
-                result_frame = ttk.Frame(pair_frame)
-                result_frame.grid(row=1, column=0, columnspan=3, pady=5)
+                    # Result selection
+                    result_var = tk.StringVar(value="")
+                    self.tournament_results.append((pairing, result_var))
 
-                ttk.Radiobutton(
-                    result_frame,
-                    text=f"{p1.name} Wins",
-                    variable=result_var,
-                    value="p1_win",
-                ).pack(side=tk.LEFT, padx=5)
-                ttk.Radiobutton(
-                    result_frame, text="Draw", variable=result_var, value="draw"
-                ).pack(side=tk.LEFT, padx=5)
-                ttk.Radiobutton(
-                    result_frame,
-                    text=f"{p2.name} Wins",
-                    variable=result_var,
-                    value="p2_win",
-                ).pack(side=tk.LEFT, padx=5)
+                    result_frame = ttk.Frame(content)
+                    result_frame.grid(row=1, column=0, columnspan=3, pady=5)
+
+                    ttk.Radiobutton(
+                        result_frame,
+                        text=f"{p1.name} Wins",
+                        variable=result_var,
+                        value="p1_win",
+                    ).pack(side=tk.LEFT, padx=5)
+                    ttk.Radiobutton(
+                        result_frame, text="Draw", variable=result_var, value="draw"
+                    ).pack(side=tk.LEFT, padx=5)
+                    ttk.Radiobutton(
+                        result_frame,
+                        text=f"{p2.name} Wins",
+                        variable=result_var,
+                        value="p2_win",
+                    ).pack(side=tk.LEFT, padx=5)
 
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
@@ -8155,6 +8576,9 @@ class PlayerSorterApp:
                 )
                 w.writerow(["Tiebreak Method", tiebreak_display])
                 w.writerow(
+                    ["Double Games", "Yes" if meta.get("double_games_enabled") else "No"]
+                )
+                w.writerow(
                     ["Total Rounds Played", meta.get("current_round", len(history))]
                 )
 
@@ -8216,11 +8640,19 @@ class PlayerSorterApp:
 
                     w.writerow([])
                     w.writerow([f"ROUND {rnum} – PAIRINGS"])
-                    w.writerow(["Board", "Player 1 (White)", "Result", "Player 2 (Black)"])
+                    w.writerow(
+                        ["Board", "Game", "Player 1 (White)", "Result", "Player 2 (Black)"]
+                    )
                     for p in rnd.get("pairings", []):
                         p2_disp = p["player2"] if p["player2"] else "—"
                         res_disp = result_map.get(p["result"], p["result"])
-                        w.writerow([p["board"], p["player1"], res_disp, p2_disp])
+                        # Double Games: two rows share one board number,
+                        # distinguished by "1 of 2"/"2 of 2" - single-game
+                        # pairings and byes show "—" here, unchanged.
+                        game_disp = f"{p['game']} of 2" if p.get("game") else "—"
+                        w.writerow(
+                            [p["board"], game_disp, p["player1"], res_disp, p2_disp]
+                        )
 
                     w.writerow([])
                     w.writerow([f"ROUND {rnum} – STANDINGS AFTER ROUND"])
@@ -8306,6 +8738,7 @@ class PlayerSorterApp:
             "finished": data.get("finished", False),
             "tiebreak_method": data.get("tiebreak_method", ""),
             "current_round": data.get("current_round", len(history)),
+            "double_games_enabled": data.get("double_games_enabled", False),
         }
         self.export_tournament_to_csv(history, meta)
 
@@ -8590,10 +9023,22 @@ class PlayerSorterApp:
     def _write_trf16(
         self, players, history, starting_rank_names, tournament_system,
         default_name, team_a=None, team_b=None, team_a_name="Team A",
-        team_b_name="Team B",
+        team_b_name="Team B", double_games_enabled=False,
     ):
-        """Shared tail end of both TRF export entry points: Knockout
-        warning, metadata dialog, save-file dialog, write."""
+        """Shared tail end of both TRF export entry points: Double Games
+        hard block, Knockout warning, metadata dialog, save-file dialog,
+        write."""
+        if double_games_enabled:
+            messagebox.showerror(
+                "TRF16 Export Not Available",
+                "TRF16 export isn't available for this tournament.\n\n"
+                "This tournament used Double Games (two games per "
+                "pairing each round). TRF16 is a strict FIDE format "
+                "allowing only one result per round per player, so it "
+                "can't represent two.",
+            )
+            return
+
         if tournament_system == "knockout":
             proceed = messagebox.askyesno(
                 "TRF16 and Knockout",
@@ -8664,6 +9109,7 @@ class PlayerSorterApp:
             default_name="",
             team_a=team_a,
             team_b=team_b,
+            double_games_enabled=getattr(self, "double_games_enabled", False),
         )
 
     def _export_trf_from_filepath(self, filepath: str) -> None:
@@ -8714,6 +9160,7 @@ class PlayerSorterApp:
                 default_name="",
                 team_a=team_a,
                 team_b=team_b,
+                double_games_enabled=data.get("double_games_enabled", False),
             )
         finally:
             self.tiebreak_method = previous_tiebreak_method
@@ -8977,15 +9424,19 @@ class PlayerSorterApp:
         def pairings_table(pairings: list) -> str:
             header_html = "".join(
                 f"<th>{esc(h)}</th>"
-                for h in ["Board", "Player 1 (White)", "Result", "Player 2 (Black)"]
+                for h in ["Board", "Game", "Player 1 (White)", "Result", "Player 2 (Black)"]
             )
             body_rows = []
             for p in pairings:
                 p2_disp = p.get("player2") if p.get("player2") else "—"
                 res_disp = result_map.get(p.get("result"), p.get("result"))
+                # Double Games: two rows share one board number,
+                # distinguished by "1 of 2"/"2 of 2" - single-game
+                # pairings and byes show "—" here, unchanged.
+                game_disp = f"{p['game']} of 2" if p.get("game") else "—"
                 tds = "".join(
                     f"<td>{cell(v)}</td>"
-                    for v in [p.get("board"), p.get("player1"), res_disp, p2_disp]
+                    for v in [p.get("board"), game_disp, p.get("player1"), res_disp, p2_disp]
                 )
                 body_rows.append(f"<tr>{tds}</tr>")
             return (
@@ -9030,6 +9481,10 @@ class PlayerSorterApp:
             parts.append(
                 f'<tr><td class="meta-label">Tiebreak Method</td>'
                 f'<td>{cell(tiebreak_display)}</td></tr>'
+            )
+            parts.append(
+                f'<tr><td class="meta-label">Double Games</td>'
+                f'<td>{cell("Yes" if meta.get("double_games_enabled") else "No")}</td></tr>'
             )
             parts.append(
                 f'<tr><td class="meta-label">Total Rounds Played</td>'
@@ -9105,6 +9560,7 @@ class PlayerSorterApp:
             "finished": data.get("finished", False),
             "tiebreak_method": data.get("tiebreak_method", ""),
             "current_round": data.get("current_round", len(history)),
+            "double_games_enabled": data.get("double_games_enabled", False),
         }
         self.export_tournament_to_html(history, meta)
 
@@ -9296,6 +9752,9 @@ class PlayerSorterApp:
                     "finished": True,
                     "tiebreak_method": getattr(self, "tiebreak_method", None),
                     "current_round": getattr(self, "current_round", len(history)),
+                    "double_games_enabled": getattr(
+                        self, "double_games_enabled", False
+                    ),
                 },
             ),
         ).pack(side=tk.LEFT, padx=5)
@@ -9312,6 +9771,9 @@ class PlayerSorterApp:
                     "finished": True,
                     "tiebreak_method": getattr(self, "tiebreak_method", None),
                     "current_round": getattr(self, "current_round", len(history)),
+                    "double_games_enabled": getattr(
+                        self, "double_games_enabled", False
+                    ),
                 },
             ),
         ).pack(side=tk.LEFT, padx=5)
