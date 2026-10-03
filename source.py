@@ -422,6 +422,118 @@ def _migrate_cwd_tournaments() -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# ── Tiebreak configuration ────────────────────────────────────────────────────
+# Swiss / Round-Robin / Scheveningen support an ORDERED chain of up to
+# TIEBREAK_MAX_CHAIN tiebreak methods (primary, secondary, tertiary). Players
+# are ranked by points first; players still tied are separated by the first
+# method, players still tied after that by the second, and so on.
+TIEBREAK_METHODS = (
+    "buchholz",
+    "sonneborn_berger",
+    "direct_encounter",
+    "schmuljan",
+    "rating",
+)
+TIEBREAK_MAX_CHAIN = 3
+TIEBREAK_DISPLAY = {
+    "buchholz": "Buchholz",
+    "sonneborn_berger": "Sonneborn-Berger",
+    "direct_encounter": "Direct Encounter",
+    "schmuljan": "Schmuljan",
+    "rating": "Rating",
+}
+TIEBREAK_DESCRIPTIONS = {
+    "buchholz": "Sum of opponents' scores",
+    "sonneborn_berger": "Weighted opponents' scores",
+    "direct_encounter": "Head-to-head among tied players (only if all have met)",
+    "schmuljan": "Opponents' scores, wins add/losses subtract",
+    "rating": "Higher rating ranks first (ends the chain)",
+}
+
+
+def _normalize_tiebreak_chain(raw) -> list:
+    """Clean an arbitrary value into a valid tiebreak chain: unknown methods
+    and duplicates are dropped, nothing is kept after "rating" (ratings are
+    effectively unique, so anything after it could never matter), and the
+    result is capped at TIEBREAK_MAX_CHAIN entries."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    chain = []
+    for method in raw:
+        if method in TIEBREAK_METHODS and method not in chain:
+            chain.append(method)
+            if method == "rating":
+                break
+        if len(chain) >= TIEBREAK_MAX_CHAIN:
+            break
+    return chain
+
+
+def _tiebreak_chain_from_save(data: dict) -> list:
+    """Read the tiebreak chain out of a tournament save dict. New saves have
+    "tiebreak_methods" (a list); older saves only have the single
+    "tiebreak_method" string, which becomes a one-element chain."""
+    raw = data.get("tiebreak_methods")
+    if not isinstance(raw, list):
+        legacy = data.get("tiebreak_method")
+        raw = [legacy] if isinstance(legacy, str) and legacy else []
+    return _normalize_tiebreak_chain(raw)
+
+
+def _tiebreak_chain_display(chain) -> str:
+    return " \u2192 ".join(TIEBREAK_DISPLAY.get(m, m) for m in chain)
+
+
+def _meta_tiebreak_chain(meta: dict) -> list:
+    chain = _normalize_tiebreak_chain(meta.get("tiebreak_methods"))
+    if not chain:
+        chain = _normalize_tiebreak_chain([meta.get("tiebreak_method")])
+    return chain
+
+
+def _meta_tiebreak_display(meta: dict) -> str:
+    chain = _meta_tiebreak_chain(meta)
+    if chain:
+        return _tiebreak_chain_display(chain)
+    raw = meta.get("tiebreak_method") or ""
+    return raw.replace("_", " ").title() if raw else "\u2014"
+
+
+def _standing_tb_values(standing: dict, n: int) -> list:
+    """The n tiebreak values of one history-snapshot standings row, whether
+    it was saved by a newer version ("tiebreaks" list) or an older one (a
+    single "tiebreak" number)."""
+    vals = standing.get("tiebreaks")
+    if not isinstance(vals, list):
+        vals = [standing.get("tiebreak")]
+    vals = list(vals)[:n]
+    return vals + [None] * (n - len(vals))
+
+
+def _history_tb_count(history: list) -> int:
+    """How many tiebreak columns a tournament history needs (at least 1)."""
+    n = 1
+    for rnd in history:
+        for s in rnd.get("standings_after_round", []):
+            vals = s.get("tiebreaks")
+            if isinstance(vals, list):
+                n = max(n, len(vals))
+    return n
+
+
+def _tb_headers(n: int, chain=None, short: bool = False) -> list:
+    if n <= 1:
+        return ["TB" if short else "Tiebreak"]
+    headers = []
+    for i in range(n):
+        if short:
+            headers.append(f"TB{i + 1}")
+        else:
+            name = TIEBREAK_DISPLAY.get(chain[i]) if chain and i < len(chain) else None
+            headers.append(f"Tiebreak {i + 1}" + (f" ({name})" if name else ""))
+    return headers
+
+
 def _normalize_name_casing(name: str) -> str:
     """Convert a first/last name to standard title-case formatting,
     regardless of how the user typed it ("mcdonald", "MCDONALD",
@@ -652,6 +764,31 @@ class PlayerSorterApp:
         self._check_for_updates()
 
         self.show_theme_selection()
+
+    # ── Tiebreak chain state ────────────────────────────────────────────────
+    # `tiebreak_chain` is the real state (an ordered list of method ids).
+    # `tiebreak_method` is kept as a compatibility view of the PRIMARY method
+    # so every existing read/assignment of it (and old code paths) keeps
+    # working: reading gives the first method (or None), assigning a method
+    # makes it a one-element chain, assigning None clears the chain. Backing
+    # the state with a property also means an app that hasn't chosen anything
+    # yet safely reports an empty chain instead of raising AttributeError.
+    @property
+    def tiebreak_chain(self) -> list:
+        return list(getattr(self, "_tiebreak_chain", []))
+
+    @tiebreak_chain.setter
+    def tiebreak_chain(self, value) -> None:
+        self._tiebreak_chain = _normalize_tiebreak_chain(value)
+
+    @property
+    def tiebreak_method(self):
+        chain = getattr(self, "_tiebreak_chain", [])
+        return chain[0] if chain else None
+
+    @tiebreak_method.setter
+    def tiebreak_method(self, value) -> None:
+        self.tiebreak_chain = [value] if value else []
 
     def _toggle_fullscreen(self, event=None):
         """Toggle true fullscreen mode (F11 / Alt+Enter)."""
@@ -2153,6 +2290,10 @@ class PlayerSorterApp:
     def select_tournament_system(self, system: str):
         """Handle tournament system selection"""
         self.tournament_system = system
+        # A new system choice always starts with a clean tiebreak chain so
+        # a previous tournament's choices can never leak into this one.
+        self.tiebreak_chain = []
+        self._tiebreak_draft = []
 
         if system in ["swiss", "round_robin"]:
             self.show_tiebreak_selection()
@@ -2171,60 +2312,117 @@ class PlayerSorterApp:
             self.max_rounds = None
             self.show_player_input()
 
-    def show_tiebreak_selection(self):
-        """Show tiebreak method selection"""
+    def show_tiebreak_selection(self, slot: int = 0):
+        """Show the tiebreak selection screen for one slot of the chain
+        (0 = primary, 1 = secondary, 2 = tertiary). Shared by Swiss,
+        Round-Robin and Scheveningen. Picking a method advances to the next
+        slot; secondary/tertiary slots also offer "No further tiebreak", and
+        the chain ends automatically after Rating (nothing can be tied after
+        it) or once TIEBREAK_MAX_CHAIN methods are chosen."""
+        draft = list(getattr(self, "_tiebreak_draft", []))[:slot]
+        self._tiebreak_draft = draft
         self.clear_window()
 
         frame = ttk.Frame(self.root, padding="40")
         frame.pack(expand=True, fill=tk.BOTH)
 
-        system_name = (
-            "Swiss System" if self.tournament_system == "swiss" else "Round-Robin"
-        )
-        title = ttk.Label(
+        system_name = {
+            "swiss": "Swiss System",
+            "round_robin": "Round-Robin",
+            "scheveningen": "Scheveningen",
+        }.get(self.tournament_system, "Tournament")
+        ttk.Label(
             frame, text=f"{system_name} - Configuration", font=self._sf(24, "bold")
-        )
-        title.pack(pady=30)
+        ).pack(pady=30)
 
-        # Tiebreak selection
-        ttk.Label(frame, text="Select Tiebreak Method:", font=self._sf(14)).pack(
-            pady=20
-        )
+        slot_name = ("Primary", "Secondary", "Tertiary")[slot]
+        heading = f"Select {slot_name} Tiebreak Method:"
+        if slot > 0:
+            heading += " (optional)"
+        ttk.Label(frame, text=heading, font=self._sf(14)).pack(pady=(20, 6))
+        if slot > 0:
+            ttk.Label(
+                frame,
+                text=(
+                    "Only used to separate players still tied after: "
+                    + _tiebreak_chain_display(draft)
+                ),
+                font=self._sf(11, "italic"),
+            ).pack(pady=(0, 10))
 
-        tiebreaks = [
-            ("Buchholz", "buchholz", "Sum of opponents' scores"),
-            ("Sonneborn-Berger", "sonneborn_berger", "Weighted opponents' scores"),
-            ("Direct Encounter", "direct_encounter", "Head-to-head result"),
-            ("Schmuljan", "schmuljan", "Opponents' scores, wins add/losses subtract"),
-            ("None (Rating)", "rating", "Use rating as tiebreak"),
-        ]
+        options = []
+        for method in TIEBREAK_METHODS:
+            if method in draft:
+                continue  # Each method can appear only once in a chain.
+            if method == "rating" and slot == 0:
+                options.append(("None (Rating)", method, "Use rating as tiebreak"))
+            else:
+                options.append(
+                    (TIEBREAK_DISPLAY[method], method, TIEBREAK_DESCRIPTIONS[method])
+                )
+        if slot > 0:
+            options.append(
+                ("No further tiebreak", None, "Players still tied keep their entry order")
+            )
 
         # Create buttons in a centered, left-aligned grid so every button and
         # description lines up on the same column regardless of description length
         btn_container = ttk.Frame(frame)
         btn_container.pack(pady=10)
 
-        for row, (tb_name, tb_id, description) in enumerate(tiebreaks):
+        for row, (tb_name, tb_id, description) in enumerate(options):
             btn = ttk.Button(
                 btn_container,
                 text=tb_name,
                 width=25,
-                command=lambda t=tb_id: self.set_tiebreak_and_continue(t),
+                command=lambda t=tb_id: self._choose_tiebreak(slot, t),
             )
-            btn.grid(row=row, column=0, padx=10, pady=12, sticky="w")
+            btn.grid(row=row, column=0, padx=10, pady=8, sticky="w")
 
             ttk.Label(
                 btn_container, text=f"- {description}", font=self._sf(11)
-            ).grid(row=row, column=1, padx=10, pady=12, sticky="w")
+            ).grid(row=row, column=1, padx=10, pady=8, sticky="w")
 
         ttk.Button(
-            frame, text="← Back", command=self.show_tournament_system_selection
+            frame, text="← Back", command=lambda: self._tiebreak_back(slot)
         ).pack(pady=30)
 
-    def set_tiebreak_and_continue(self, tiebreak: str):
-        """Set tiebreak and show half-bye option"""
-        self.tiebreak_method = tiebreak
-        self.show_half_bye_option()
+    def _choose_tiebreak(self, slot: int, method):
+        """Record the choice for `slot` (method=None means "no further
+        tiebreak") and either advance to the next slot or finish the chain."""
+        draft = list(getattr(self, "_tiebreak_draft", []))[:slot]
+        if method is not None:
+            draft.append(method)
+        self._tiebreak_draft = draft
+
+        if method is None or method == "rating" or len(draft) >= TIEBREAK_MAX_CHAIN:
+            self.tiebreak_chain = draft
+            self._continue_after_tiebreak()
+        else:
+            self.show_tiebreak_selection(slot + 1)
+
+    def _tiebreak_back(self, slot: int):
+        """Back button of the tiebreak screens."""
+        if slot > 0:
+            self.show_tiebreak_selection(slot - 1)
+        elif self.tournament_system == "scheveningen":
+            self.show_scheveningen_setup()
+        else:
+            self.show_tournament_system_selection()
+
+    def _reopen_tiebreak_selection(self):
+        """Back-target for the settings screens that follow the tiebreak
+        chain: returns to the LAST tiebreak screen the user went through."""
+        chain = self.tiebreak_chain
+        self._tiebreak_draft = chain
+        self.show_tiebreak_selection(max(0, len(chain) - 1))
+
+    def _continue_after_tiebreak(self):
+        """Move on to the tournament settings once the chain is final."""
+        if self.tournament_system == "scheveningen":
+            self.show_scheveningen_settings()
+        else:
+            self.show_half_bye_option()
 
     def show_half_bye_option(self):
         """Show tournament configuration options
@@ -2500,7 +2698,7 @@ class PlayerSorterApp:
         btn_frame.pack(pady=25)
 
         ttk.Button(
-            btn_frame, text="← Back", width=15, command=self.show_tiebreak_selection
+            btn_frame, text="← Back", width=15, command=self._reopen_tiebreak_selection
         ).pack(side=tk.LEFT, padx=10)
         ttk.Button(
             btn_frame,
@@ -2627,23 +2825,11 @@ class PlayerSorterApp:
         )
         spinbox.pack(pady=5)
 
-        ttk.Label(frame, text="\nTiebreak method:", font=self._sf(11, "bold")).pack(
-            pady=10
-        )
-
-        self.schev_tiebreak_var = tk.StringVar(value="rating")
-        tiebreaks = [
-            ("Buchholz", "buchholz"),
-            ("Sonneborn-Berger", "sonneborn_berger"),
-            ("Direct Encounter", "direct_encounter"),
-            ("Schmuljan", "schmuljan"),
-            ("Rating", "rating"),
-        ]
-
-        for tb_name, tb_id in tiebreaks:
-            ttk.Radiobutton(
-                frame, text=tb_name, variable=self.schev_tiebreak_var, value=tb_id
-            ).pack(pady=2)
+        ttk.Label(
+            frame,
+            text="\nTiebreak methods are chosen on the next screens.",
+            font=self._sf(10, "italic"),
+        ).pack(pady=10)
 
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=20)
@@ -2658,8 +2844,9 @@ class PlayerSorterApp:
     def confirm_scheveningen_setup(self):
         """Confirm Scheveningen setup and proceed"""
         self.scheveningen_team_size = self.schev_team_size_var.get()
-        self.tiebreak_method = self.schev_tiebreak_var.get()
-        self.show_scheveningen_settings()
+        self.tiebreak_chain = []
+        self._tiebreak_draft = []
+        self.show_tiebreak_selection(0)
 
     def show_knockout_settings(self):
         """Show Knockout tournament settings
@@ -3094,7 +3281,9 @@ class PlayerSorterApp:
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(pady=20)
 
-        ttk.Button(btn_frame, text="← Back", command=self.show_scheveningen_setup).pack(
+        ttk.Button(
+            btn_frame, text="← Back", command=self._reopen_tiebreak_selection
+        ).pack(
             side=tk.LEFT, padx=5
         )
         ttk.Button(
@@ -3998,7 +4187,10 @@ class PlayerSorterApp:
         data = {
             "finished": finished,
             "tournament_system": getattr(self, "tournament_system", None),
+            # Legacy single value (the primary method) is still written so
+            # older versions of the app can open new saves.
             "tiebreak_method": getattr(self, "tiebreak_method", None),
+            "tiebreak_methods": self.tiebreak_chain,
             "half_bye_enabled": getattr(self, "half_bye_enabled", False),
             "withdrawal_enabled": getattr(self, "withdrawal_enabled", False),
             "double_games_enabled": getattr(self, "double_games_enabled", False),
@@ -4158,7 +4350,8 @@ class PlayerSorterApp:
 
         # Restore settings
         self.tournament_system = data.get("tournament_system")
-        self.tiebreak_method = data.get("tiebreak_method")
+        # New saves carry the full chain; older ones only the single method.
+        self.tiebreak_chain = _tiebreak_chain_from_save(data)
         self.half_bye_enabled = data.get("half_bye_enabled", False)
         self.withdrawal_enabled = data.get("withdrawal_enabled", False)
         # Older saves predate this setting entirely - absent key means
@@ -7146,7 +7339,7 @@ class PlayerSorterApp:
 
         # Combine both teams for standings
         all_players = self.schev_team_a + self.schev_team_b
-        sorted_players = self.apply_tiebreak(all_players)
+        sorted_players = self.rank_players_with_tiebreaks(all_players)
 
         # Display standings
         results_frame = ttk.Frame(scrollable_frame)
@@ -7165,7 +7358,7 @@ class PlayerSorterApp:
                 "draws",
                 "byes",
                 "hbyes",
-                "tiebreak",
+                *self._tb_column_ids(),
             ],
             show="headings",
             height=12,
@@ -7181,7 +7374,7 @@ class PlayerSorterApp:
         tree.heading("draws", text="D")
         tree.heading("byes", text="Bye")
         tree.heading("hbyes", text="½Bye")
-        tree.heading("tiebreak", text="TB")
+        self._setup_tb_columns(tree, 60)
 
         tree.column("rank", width=45)
         tree.column("team", width=55)
@@ -7193,9 +7386,8 @@ class PlayerSorterApp:
         tree.column("draws", width=35)
         tree.column("byes", width=35)
         tree.column("hbyes", width=40)
-        tree.column("tiebreak", width=60)
 
-        for i, (player, tb_score) in enumerate(sorted_players, 1):
+        for i, (player, tb_values) in enumerate(sorted_players, 1):
             # Determine team
             team = "A" if player in self.schev_team_a else "B"
 
@@ -7213,7 +7405,7 @@ class PlayerSorterApp:
                     player.draws,
                     player.byes,
                     player.half_byes,
-                    f"{tb_score:.1f}" if tb_score is not None else "-",
+                    *self._tb_display_cells(tb_values),
                 ),
             )
 
@@ -7496,12 +7688,12 @@ class PlayerSorterApp:
             all_players = getattr(self, "schev_team_a", []) + getattr(
                 self, "schev_team_b", []
             )
-            sorted_snap = self.apply_tiebreak(all_players)
+            sorted_snap = self.rank_players_with_tiebreaks(all_players)
         else:
-            sorted_snap = self.apply_tiebreak(self.players)
+            sorted_snap = self.rank_players_with_tiebreaks(self.players)
 
         standings_snapshot = []
-        for rank, (player, tb_score) in enumerate(sorted_snap, 1):
+        for rank, (player, tb_values) in enumerate(sorted_snap, 1):
             # Determine status for display
             if player.withdrawn:
                 status = f"Withdrew after R{player.withdrawal_round}"
@@ -7531,7 +7723,16 @@ class PlayerSorterApp:
                     "half_byes": player.half_byes,
                     "white_games": player.white_games,
                     "black_games": player.black_games,
-                    "tiebreak": round(tb_score, 2) if tb_score is not None else None,
+                    # "tiebreak" = primary value (legacy field, still read by
+                    # older versions); "tiebreaks" = one value per chain slot.
+                    "tiebreak": (
+                        round(tb_values[0], 2)
+                        if tb_values and tb_values[0] is not None
+                        else None
+                    ),
+                    "tiebreaks": [
+                        round(v, 2) if v is not None else None for v in tb_values
+                    ],
                     "status": status,
                     "team": team,
                 }
@@ -7916,7 +8117,7 @@ class PlayerSorterApp:
         scrollable_frame = self.make_scrollable_region(frame)
 
         # Sort with tiebreak
-        sorted_players = self.apply_tiebreak(self.players)
+        sorted_players = self.rank_players_with_tiebreaks(self.players)
 
         # Display standings
         results_frame = ttk.Frame(scrollable_frame)
@@ -7936,7 +8137,7 @@ class PlayerSorterApp:
                 "hbyes",
                 "white",
                 "black",
-                "tiebreak",
+                *self._tb_column_ids(),
             ],
             show="headings",
             height=12,
@@ -7953,7 +8154,7 @@ class PlayerSorterApp:
         tree.heading("hbyes", text="½Bye")
         tree.heading("white", text="White")
         tree.heading("black", text="Black")
-        tree.heading("tiebreak", text="TB")
+        self._setup_tb_columns(tree, 60)
 
         tree.column("rank", width=45)
         tree.column("name", width=110)
@@ -7966,9 +8167,8 @@ class PlayerSorterApp:
         tree.column("hbyes", width=40)
         tree.column("white", width=45)
         tree.column("black", width=45)
-        tree.column("tiebreak", width=60)
 
-        for i, (player, tb_score) in enumerate(sorted_players, 1):
+        for i, (player, tb_values) in enumerate(sorted_players, 1):
             tree.insert(
                 "",
                 tk.END,
@@ -7984,7 +8184,7 @@ class PlayerSorterApp:
                     player.half_byes,
                     player.white_games,
                     player.black_games,
-                    f"{tb_score:.1f}" if tb_score is not None else "-",
+                    *self._tb_display_cells(tb_values),
                 ),
             )
 
@@ -8156,106 +8356,209 @@ class PlayerSorterApp:
         self._flush_pending_round_requests()
         self.next_tournament_round()
 
-    def apply_tiebreak(self, players):
-        """Apply tiebreak method and return sorted players with tiebreak scores"""
-        # Separate withdrawn and active players
+    # ============ TIEBREAK ENGINE ============
+
+    def _active_tb_count(self) -> int:
+        """Number of tiebreak columns the standings tables need (>= 1)."""
+        return max(1, len(self.tiebreak_chain))
+
+    def _tb_column_ids(self) -> list:
+        n = self._active_tb_count()
+        return ["tiebreak"] if n == 1 else [f"tb{i + 1}" for i in range(n)]
+
+    def _setup_tb_columns(self, tree, width: int, short: bool = True) -> None:
+        """Set headings/widths for the tiebreak column(s) of a standings
+        Treeview created with *self._tb_column_ids() in its column list."""
+        n = self._active_tb_count()
+        if n == 1:
+            headings = ["TB" if short else "Tiebreak"]
+        else:
+            headings = _tb_headers(n, None, short=True)
+        for col_id, text in zip(self._tb_column_ids(), headings):
+            tree.heading(col_id, text=text)
+            tree.column(col_id, width=width)
+
+    def _tb_display_cells(self, tb_values) -> list:
+        n = self._active_tb_count()
+        vals = (list(tb_values or []) + [None] * n)[:n]
+        return [f"{v:.1f}" if v is not None else "-" for v in vals]
+
+    def _opponent_results(self, player) -> list:
+        """(opponent_name, outcome) pairs for a player. opponents and
+        results_vs_opponents are parallel lists - pair them up safely even if
+        an old save has a length mismatch (results missing or shorter),
+        treating any unmatched entry as unknown ("")."""
+        opponent_results = list(zip(player.opponents, player.results_vs_opponents))
+        if len(player.opponents) > len(opponent_results):
+            opponent_results += [
+                (n, "") for n in player.opponents[len(opponent_results):]
+            ]
+        return opponent_results
+
+    def _tiebreak_value(self, method, player, players):
+        """The numeric value of one CONTEXT-FREE tiebreak method for one
+        player (it depends only on the player's own games and the current
+        scores of the whole field, never on who else happens to be tied with
+        them). Direct Encounter is deliberately not handled here - it is only
+        meaningful relative to a specific tied group, see
+        _direct_encounter_scores."""
+        opponent_results = self._opponent_results(player)
+
+        if method == "buchholz":
+            # Sum of opponents' scores
+            tb_score = 0
+            for opp_name in player.opponents:
+                for p in players:
+                    if p.name == opp_name:
+                        tb_score += p.points
+                        break
+            return tb_score
+        if method == "sonneborn_berger":
+            # Sum of each opponent's own score, weighted by how the player
+            # did against THEM specifically: full credit for a win, half for
+            # a draw, nothing for a loss (or an unknown result from an old
+            # save).
+            tb_score = 0
+            for opp_name, outcome in opponent_results:
+                for p in players:
+                    if p.name == opp_name:
+                        if outcome == "win":
+                            tb_score += p.points
+                        elif outcome == "draw":
+                            tb_score += p.points * 0.5
+                        break
+            return tb_score
+        if method == "schmuljan":
+            # Sum of each opponent's own score, ADDED for a win against them
+            # and SUBTRACTED for a loss to them. Draws contribute nothing at
+            # all. The score can legitimately go negative.
+            tb_score = 0
+            for opp_name, outcome in opponent_results:
+                for p in players:
+                    if p.name == opp_name:
+                        if outcome == "win":
+                            tb_score += p.points
+                        elif outcome == "loss":
+                            tb_score -= p.points
+                        break
+            return tb_score
+        if method == "rating":
+            return player.rating
+        return None
+
+    def _direct_encounter_scores(self, group):
+        """FIDE-style Direct Encounter for ONE tied group.
+
+        Returns {id(player): score in games against the OTHER members of
+        the group} (win 1, draw 0.5, loss 0), or None if Direct Encounter
+        cannot be applied to this group and the tie must be left to the next
+        tiebreak. It is only applicable when every member of the group has
+        played every other member at least once - if even one pair never
+        met, the members' scores would not be comparable (they would be
+        based on different sets of games). A recorded result that is
+        missing/unrecognised (old saves) also makes it non-applicable rather
+        than silently counting as a loss.
+
+        If a pair met more than once (Double Games, a replayed knockout
+        draw), all of their games count.
+        """
+        if len(group) < 2:
+            return None
+        by_name = {p.name: p for p in group}
+        if len(by_name) != len(group):
+            return None  # Duplicate names - can't attribute games reliably.
+
+        met = {p.name: set() for p in group}
+        scores = {id(p): 0.0 for p in group}
+        for p in group:
+            for opp_name, outcome in self._opponent_results(p):
+                if opp_name in by_name and opp_name != p.name:
+                    if outcome not in ("win", "draw", "loss"):
+                        return None
+                    met[p.name].add(opp_name)
+                    if outcome == "win":
+                        scores[id(p)] += 1.0
+                    elif outcome == "draw":
+                        scores[id(p)] += 0.5
+
+        everyone = set(by_name)
+        for p in group:
+            if met[p.name] != everyone - {p.name}:
+                return None
+        return scores
+
+    def rank_players_with_tiebreaks(self, players, methods=None):
+        """Rank players using points, then an ordered chain of tiebreaks.
+
+        Returns a list of (player, values) where `values` has one entry per
+        tiebreak method in the chain (None where a value doesn't apply, e.g.
+        for withdrawn players or a Direct Encounter that wasn't applicable).
+
+        Ranking rules:
+          * Points first (higher is better).
+          * Players tied on points are ordered by the first method; players
+            still tied after that by the second, and so on. Each later
+            method is applied only WITHIN the group still tied - so a
+            player already separated from the others never influences
+            them.
+          * Direct Encounter is evaluated per tied group (see
+            _direct_encounter_scores); if it isn't applicable to a group,
+            that group simply moves on to the next method.
+          * Players still tied after the whole chain keep their original
+            relative order (stable sort).
+          * Withdrawn players are ranked among the others by points, then
+            score rate, then games played, with active players ahead at
+            equal points - exactly as before.
+        """
+        methods = [m for m in (self.tiebreak_chain if methods is None else methods) if m]
+        n = len(methods)
+
         active_players = [p for p in players if not p.withdrawn]
         withdrawn_players = [p for p in players if p.withdrawn]
 
-        result = []
+        values = {id(p): [None] * n for p in active_players}
+        for idx, method in enumerate(methods):
+            if method != "direct_encounter":
+                for p in active_players:
+                    values[id(p)][idx] = self._tiebreak_value(method, p, players)
 
-        # Process active players with tiebreaks
-        for player in active_players:
-            tb_score = None
+        def resolve(group, start):
+            """Order a group that is tied on everything before `start`."""
+            if len(group) < 2 or start >= n:
+                return group
+            method = methods[start]
+            if method == "direct_encounter":
+                scores = self._direct_encounter_scores(group)
+                if scores is None:
+                    return resolve(group, start + 1)  # Not applicable here.
+                for p in group:
+                    values[id(p)][start] = scores[id(p)]
+            # Stable, descending: equal players keep their relative order.
+            ordered = sorted(group, key=lambda p: values[id(p)][start], reverse=True)
+            out = []
+            i = 0
+            while i < len(ordered):
+                j = i + 1
+                while (
+                    j < len(ordered)
+                    and values[id(ordered[j])][start] == values[id(ordered[i])][start]
+                ):
+                    j += 1
+                out.extend(resolve(ordered[i:j], start + 1))
+                i = j
+            return out
 
-            # opponents/results_vs_opponents are parallel lists - pair them
-            # up safely even if an old save has a length mismatch (results
-            # missing or shorter), treating any unmatched entry as unknown.
-            opponent_results = list(
-                zip(player.opponents, player.results_vs_opponents)
-            )
-            if len(player.opponents) > len(opponent_results):
-                opponent_results += [
-                    (n, "") for n in player.opponents[len(opponent_results) :]
-                ]
+        by_points = sorted(active_players, key=lambda p: p.points, reverse=True)
+        ordered_active = []
+        i = 0
+        while i < len(by_points):
+            j = i + 1
+            while j < len(by_points) and by_points[j].points == by_points[i].points:
+                j += 1
+            ordered_active.extend(resolve(by_points[i:j], 0))
+            i = j
 
-            if self.tiebreak_method == "buchholz":
-                # Sum of opponents' scores
-                tb_score = 0
-                for opp_name in player.opponents:
-                    for p in players:
-                        if p.name == opp_name:
-                            tb_score += p.points
-                            break
-            elif self.tiebreak_method == "sonneborn_berger":
-                # Sum of each opponent's own score, weighted by how the
-                # player did against THEM specifically: full credit for a
-                # win, half for a draw, nothing for a loss. This is the
-                # standard FIDE definition - it depends on the outcome of
-                # each individual game, not just who was played.
-                tb_score = 0
-                for opp_name, outcome in opponent_results:
-                    for p in players:
-                        if p.name == opp_name:
-                            if outcome == "win":
-                                tb_score += p.points
-                            elif outcome == "draw":
-                                tb_score += p.points * 0.5
-                            # "loss" (or unknown, from an old save)
-                            # contributes 0.
-                            break
-            elif self.tiebreak_method == "schmuljan":
-                # Sum of each opponent's own score, ADDED for a win against
-                # them and SUBTRACTED for a loss to them. Draws contribute
-                # nothing at all (not half, unlike Sonneborn-Berger - draws
-                # are simply excluded from this evaluation). This means the
-                # score can legitimately go negative, e.g. for a player who
-                # beat weak opponents but lost to strong ones.
-                tb_score = 0
-                for opp_name, outcome in opponent_results:
-                    for p in players:
-                        if p.name == opp_name:
-                            if outcome == "win":
-                                tb_score += p.points
-                            elif outcome == "loss":
-                                tb_score -= p.points
-                            # "draw" (or unknown, from an old save)
-                            # contributes 0.
-                            break
-            elif self.tiebreak_method == "rating":
-                tb_score = player.rating
-            elif self.tiebreak_method == "direct_encounter":
-                # Result of the head-to-head game(s) against opponents who
-                # are tied with this player on points - the standard
-                # Direct Encounter definition. Restricting to opponents
-                # with the SAME points total is what makes this a
-                # standalone numeric score rather than a special grouping
-                # pass: a player's score only reflects games that are
-                # actually relevant to resolving their current tie.
-                #
-                # If the tied players never played each other (common in
-                # Swiss events, since pairings aren't guaranteed to cover
-                # every tied pair), this naturally comes out to 0 for
-                # everyone involved - an honest "unresolved" result,
-                # rather than a guess. There's no secondary tiebreak
-                # configured in this app to fall back to in that case.
-                tb_score = 0
-                for opp_name, outcome in opponent_results:
-                    for p in players:
-                        if p.name == opp_name and p.points == player.points:
-                            if outcome == "win":
-                                tb_score += 1.0
-                            elif outcome == "draw":
-                                tb_score += 0.5
-                            # "loss" contributes 0.
-                            break
-
-            result.append((player, tb_score))
-
-        # Sort active players by points (primary) and tiebreak (secondary)
-        result.sort(
-            key=lambda x: (x[0].points, x[1] if x[1] is not None else 0), reverse=True
-        )
+        result = [(p, values[id(p)]) for p in ordered_active]
 
         # Sort withdrawn players by points (primary), then score_rate, then games_played
         # This ensures fair ranking: 3/3 (withdrawn) > 2/2 (withdrawn) > 2/5 (active)
@@ -8265,17 +8568,16 @@ class PlayerSorterApp:
             reverse=True,
         )
 
-        # Integrate withdrawn players into the main ranking based on points
-        """Players with equal points: active players rank first
-        (they completed the tournament)"""
+        # Integrate withdrawn players into the main ranking based on points.
+        # Players with equal points: active players rank first
+        # (they completed the tournament)
         final_result = []
         active_idx = 0
         withdrawn_idx = 0
 
         while active_idx < len(result) or withdrawn_idx < len(withdrawn_sorted):
-            # If we've exhausted one list, add from the other
             if active_idx >= len(result):
-                final_result.append((withdrawn_sorted[withdrawn_idx], None))
+                final_result.append((withdrawn_sorted[withdrawn_idx], [None] * n))
                 withdrawn_idx += 1
                 continue
 
@@ -8284,26 +8586,33 @@ class PlayerSorterApp:
                 active_idx += 1
                 continue
 
-            # Compare points - higher points come first regardless of withdrawal status
-            active_player, active_tb = result[active_idx]
+            active_player, active_vals = result[active_idx]
             withdrawn_player = withdrawn_sorted[withdrawn_idx]
 
             if active_player.points > withdrawn_player.points:
-                # Active player has more points - they rank higher
-                final_result.append((active_player, active_tb))
+                final_result.append((active_player, active_vals))
                 active_idx += 1
             elif withdrawn_player.points > active_player.points:
-                # Withdrawn player has more points - they rank higher
                 # Example: 3/3 withdrawn ranks above 2/5 active
-                final_result.append((withdrawn_player, None))
+                final_result.append((withdrawn_player, [None] * n))
                 withdrawn_idx += 1
             else:
-                # Equal points - active players rank first (completed tournament)
                 # Example: 2/5 active ranks above 2/2 withdrawn (same 2 points)
-                final_result.append((active_player, active_tb))
+                final_result.append((active_player, active_vals))
                 active_idx += 1
 
         return final_result
+
+    def apply_tiebreak(self, players, methods=None):
+        """Backward-compatible wrapper: same ordering as
+        rank_players_with_tiebreaks, but returns (player, primary_value)
+        tuples - the shape every older call site expects."""
+        return [
+            (p, vals[0] if vals else None)
+            for p, vals in self.rank_players_with_tiebreaks(players, methods)
+        ]
+
+    # ============ END TIEBREAK ENGINE ============
 
     def next_tournament_round(self):
         """Continue to next tournament round"""
@@ -8337,7 +8646,7 @@ class PlayerSorterApp:
         title.pack(pady=10)
 
         # Get sorted players with tiebreak
-        sorted_players = self.apply_tiebreak(self.players)
+        sorted_players = self.rank_players_with_tiebreaks(self.players)
 
         # Show winner
         if sorted_players:
@@ -8359,7 +8668,7 @@ class PlayerSorterApp:
                 "points",
                 "record",
                 "status",
-                "tiebreak",
+                *self._tb_column_ids(),
             ],
             show="headings",
             height=15,
@@ -8371,7 +8680,7 @@ class PlayerSorterApp:
         tree.heading("points", text="Points")
         tree.heading("record", text="Record")
         tree.heading("status", text="Status")
-        tree.heading("tiebreak", text="Tiebreak")
+        self._setup_tb_columns(tree, 80, short=False)
 
         tree.column("rank", width=50)
         tree.column("name", width=130)
@@ -8379,9 +8688,8 @@ class PlayerSorterApp:
         tree.column("points", width=70)
         tree.column("record", width=120)
         tree.column("status", width=100)
-        tree.column("tiebreak", width=80)
 
-        for i, (player, tb_score) in enumerate(sorted_players, 1):
+        for i, (player, tb_values) in enumerate(sorted_players, 1):
             record = f"{player.wins}W-{player.losses}L-{player.draws}D"
             if player.byes > 0:
                 record += f"-{player.byes}Bye"
@@ -8404,7 +8712,7 @@ class PlayerSorterApp:
                     player.points,
                     record,
                     status,
-                    f"{tb_score:.1f}" if tb_score is not None else "-",
+                    *self._tb_display_cells(tb_values),
                 ),
             )
 
@@ -8542,14 +8850,9 @@ class PlayerSorterApp:
             "scheveningen": "Scheveningen",
         }.get(system, system.replace("_", " ").title())
 
-        tiebreak_raw = meta.get("tiebreak_method") or ""
-        tiebreak_display = {
-            "buchholz": "Buchholz",
-            "sonneborn_berger": "Sonneborn-Berger",
-            "direct_encounter": "Direct Encounter",
-            "schmuljan": "Schmuljan",
-            "rating": "Rating",
-        }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
+        tiebreak_display = _meta_tiebreak_display(meta)
+        tb_n = _history_tb_count(history)
+        tb_headers = _tb_headers(tb_n, _meta_tiebreak_chain(meta))
 
         result_map = {
             "p1_win": "1 – 0",
@@ -8592,7 +8895,7 @@ class PlayerSorterApp:
                     w.writerow(
                         ["Rank", "Team", "Name", "Rating", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "White", "Black", "Tiebreak", "Status"]
+                         "White", "Black", *tb_headers, "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -8608,14 +8911,14 @@ class PlayerSorterApp:
                             s["half_byes"],
                             s.get("white_games", "—"),
                             s.get("black_games", "—"),
-                            s["tiebreak"] if s["tiebreak"] is not None else "—",
+                            *[("—" if v is None else v) for v in _standing_tb_values(s, tb_n)],
                             s["status"],
                         ])
                 else:
                     w.writerow(
                         ["Rank", "Name", "Rating", "Points",
                          "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                         "White", "Black", "Tiebreak", "Status"]
+                         "White", "Black", *tb_headers, "Status"]
                     )
                     for s in standings:
                         w.writerow([
@@ -8630,7 +8933,7 @@ class PlayerSorterApp:
                             s["half_byes"],
                             s.get("white_games", "—"),
                             s.get("black_games", "—"),
-                            s["tiebreak"] if s["tiebreak"] is not None else "—",
+                            *[("—" if v is None else v) for v in _standing_tb_values(s, tb_n)],
                             s["status"],
                         ])
 
@@ -8662,7 +8965,7 @@ class PlayerSorterApp:
                         w.writerow(
                             ["Rank", "Team", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "White", "Black", "Tiebreak", "Status"]
+                             "White", "Black", *tb_headers, "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -8677,14 +8980,14 @@ class PlayerSorterApp:
                                 s["half_byes"],
                                 s.get("white_games", "—"),
                                 s.get("black_games", "—"),
-                                s["tiebreak"] if s["tiebreak"] is not None else "—",
+                                *[("—" if v is None else v) for v in _standing_tb_values(s, tb_n)],
                                 s["status"],
                             ])
                     else:
                         w.writerow(
                             ["Rank", "Name", "Points",
                              "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                             "White", "Black", "Tiebreak", "Status"]
+                             "White", "Black", *tb_headers, "Status"]
                         )
                         for s in round_standings:
                             w.writerow([
@@ -8698,7 +9001,7 @@ class PlayerSorterApp:
                                 s["half_byes"],
                                 s.get("white_games", "—"),
                                 s.get("black_games", "—"),
-                                s["tiebreak"] if s["tiebreak"] is not None else "—",
+                                *[("—" if v is None else v) for v in _standing_tb_values(s, tb_n)],
                                 s["status"],
                             ])
 
@@ -8737,6 +9040,7 @@ class PlayerSorterApp:
             "tournament_start_time": data.get("tournament_start_time", ""),
             "finished": data.get("finished", False),
             "tiebreak_method": data.get("tiebreak_method", ""),
+            "tiebreak_methods": data.get("tiebreak_methods"),
             "current_round": data.get("current_round", len(history)),
             "double_games_enabled": data.get("double_games_enabled", False),
         }
@@ -9142,15 +9446,15 @@ class PlayerSorterApp:
             team_a = [by_name[n] for n in schev_a_names if n in by_name]
             team_b = [by_name[n] for n in schev_b_names if n in by_name]
 
-        # apply_tiebreak reads self.tiebreak_method - temporarily swap it
+        # apply_tiebreak reads self.tiebreak_chain - temporarily swap it
         # to the SAVED file's own setting for this export, then restore
         # whatever it was before. Without the restore, exporting some
         # OTHER, past tournament from the "browse saved tournaments"
         # screen while a different tournament is live in memory would
         # silently corrupt that live tournament's tiebreak calculations
         # from this point on.
-        previous_tiebreak_method = getattr(self, "tiebreak_method", None)
-        self.tiebreak_method = data.get("tiebreak_method")
+        previous_tiebreak_chain = self.tiebreak_chain
+        self.tiebreak_chain = _tiebreak_chain_from_save(data)
         try:
             self._write_trf16(
                 players,
@@ -9163,7 +9467,7 @@ class PlayerSorterApp:
                 double_games_enabled=data.get("double_games_enabled", False),
             )
         finally:
-            self.tiebreak_method = previous_tiebreak_method
+            self.tiebreak_chain = previous_tiebreak_chain
 
     # ============ END TRF16 EXPORT ============
 
@@ -9340,14 +9644,9 @@ class PlayerSorterApp:
             "scheveningen": "Scheveningen",
         }.get(system, system.replace("_", " ").title())
 
-        tiebreak_raw = meta.get("tiebreak_method") or ""
-        tiebreak_display = {
-            "buchholz": "Buchholz",
-            "sonneborn_berger": "Sonneborn-Berger",
-            "direct_encounter": "Direct Encounter",
-            "schmuljan": "Schmuljan",
-            "rating": "Rating",
-        }.get(tiebreak_raw, tiebreak_raw.replace("_", " ").title() if tiebreak_raw else "—")
+        tiebreak_display = _meta_tiebreak_display(meta)
+        tb_n = _history_tb_count(history)
+        tb_headers = _tb_headers(tb_n, _meta_tiebreak_chain(meta))
 
         result_map = {
             "p1_win": "1 – 0",
@@ -9384,7 +9683,7 @@ class PlayerSorterApp:
                 headers.append("Rating")
             headers += [
                 "Points", "Wins", "Losses", "Draws", "Byes", "Half-Byes",
-                "White", "Black", "Tiebreak", "Status",
+                "White", "Black", *tb_headers, "Status",
             ]
             header_html = "".join(f"<th>{esc(h)}</th>" for h in headers)
 
@@ -9403,7 +9702,7 @@ class PlayerSorterApp:
                     s.get("points"), s.get("wins"), s.get("losses"),
                     s.get("draws"), s.get("byes"), s.get("half_byes"),
                     s.get("white_games"), s.get("black_games"),
-                    s.get("tiebreak"),
+                    *_standing_tb_values(s, tb_n),
                 ]
 
                 tds = "".join(f"<td>{cell(v)}</td>" for v in values)
@@ -9559,6 +9858,7 @@ class PlayerSorterApp:
             "tournament_start_time": data.get("tournament_start_time", ""),
             "finished": data.get("finished", False),
             "tiebreak_method": data.get("tiebreak_method", ""),
+            "tiebreak_methods": data.get("tiebreak_methods"),
             "current_round": data.get("current_round", len(history)),
             "double_games_enabled": data.get("double_games_enabled", False),
         }
@@ -9677,7 +9977,15 @@ class PlayerSorterApp:
             )
             right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(5, 0))
 
-            cols = ["rank", "name", "points", "record", "white", "black", "tiebreak", "status"]
+            tb_n_view = _history_tb_count(history)
+            tb_ids = (
+                ["tiebreak"] if tb_n_view == 1
+                else [f"tb{i + 1}" for i in range(tb_n_view)]
+            )
+            cols = [
+                "rank", "name", "points", "record", "white", "black",
+                *tb_ids, "status",
+            ]
             stand_tree = ttk.Treeview(
                 right_frame, columns=cols, show="headings", height=14
             )
@@ -9687,7 +9995,8 @@ class PlayerSorterApp:
             stand_tree.heading("record", text="W-L-D")
             stand_tree.heading("white", text="White")
             stand_tree.heading("black", text="Black")
-            stand_tree.heading("tiebreak", text="TB")
+            for tb_id, tb_head in zip(tb_ids, _tb_headers(tb_n_view, None, short=True)):
+                stand_tree.heading(tb_id, text=tb_head)
             stand_tree.heading("status", text="Status")
             stand_tree.column("rank", width=30)
             stand_tree.column("name", width=140)
@@ -9695,7 +10004,8 @@ class PlayerSorterApp:
             stand_tree.column("record", width=80)
             stand_tree.column("white", width=45)
             stand_tree.column("black", width=45)
-            stand_tree.column("tiebreak", width=55)
+            for tb_id in tb_ids:
+                stand_tree.column(tb_id, width=55)
             stand_tree.column("status", width=120)
 
             for s in round_data["standings_after_round"]:
@@ -9710,7 +10020,7 @@ class PlayerSorterApp:
                         record,
                         s.get("white_games", "—"),
                         s.get("black_games", "—"),
-                        s["tiebreak"] if s["tiebreak"] is not None else "-",
+                        *["-" if v is None else v for v in _standing_tb_values(s, tb_n_view)],
                         s["status"],
                     ),
                 )
@@ -9751,6 +10061,7 @@ class PlayerSorterApp:
                     ),
                     "finished": True,
                     "tiebreak_method": getattr(self, "tiebreak_method", None),
+                    "tiebreak_methods": self.tiebreak_chain,
                     "current_round": getattr(self, "current_round", len(history)),
                     "double_games_enabled": getattr(
                         self, "double_games_enabled", False
@@ -9770,6 +10081,7 @@ class PlayerSorterApp:
                     ),
                     "finished": True,
                     "tiebreak_method": getattr(self, "tiebreak_method", None),
+                    "tiebreak_methods": self.tiebreak_chain,
                     "current_round": getattr(self, "current_round", len(history)),
                     "double_games_enabled": getattr(
                         self, "double_games_enabled", False
