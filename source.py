@@ -535,6 +535,38 @@ def _history_tb_count(history: list) -> int:
     return n
 
 
+TIEBREAK_DE_FOOTNOTE = (
+    "A dash in a Direct Encounter column means it did not apply to that "
+    "player: either nobody was still tied with them at that point, or the "
+    "tied players' games against each other could not separate them "
+    "(FIDE C.07 Art. 6)."
+)
+
+
+def _rows_have_blank_de(rows: list, chain) -> bool:
+    """True if any ACTIVE player's Direct Encounter value is blank in these
+    standings rows (so the dash-explaining footnote is worth showing).
+    Withdrawn players show dashes in every column and don't count."""
+    slots = [i for i, m in enumerate(chain) if m == "direct_encounter"]
+    if not slots:
+        return False
+    n = max(1, len(chain))
+    for s in rows:
+        if str(s.get("status", "")).startswith("Withdrew"):
+            continue
+        vals = _standing_tb_values(s, n)
+        if any(vals[i] is None for i in slots):
+            return True
+    return False
+
+
+def _history_has_blank_de(history: list, chain) -> bool:
+    return any(
+        _rows_have_blank_de(rnd.get("standings_after_round", []), chain)
+        for rnd in history
+    )
+
+
 def _tb_headers(n: int, chain=None, short: bool = False) -> list:
     if n <= 1:
         return ["TB" if short else "Tiebreak"]
@@ -7363,6 +7395,7 @@ class PlayerSorterApp:
         # Display standings
         results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        self._add_de_footnote(scrollable_frame)
 
         tree = ttk.Treeview(
             results_frame,
@@ -8141,6 +8174,7 @@ class PlayerSorterApp:
         # Display standings
         results_frame = ttk.Frame(scrollable_frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        self._add_de_footnote(scrollable_frame)
 
         tree = ttk.Treeview(
             results_frame,
@@ -8396,6 +8430,19 @@ class PlayerSorterApp:
         for col_id, text in zip(self._tb_column_ids(), headings):
             tree.heading(col_id, text=text)
             tree.column(col_id, width=width)
+
+    def _add_de_footnote(self, parent) -> None:
+        """Small italic note under a standings table explaining the dash
+        in Direct Encounter columns (only when Direct Encounter is used)."""
+        if "direct_encounter" not in self.tiebreak_chain:
+            return
+        ttk.Label(
+            parent,
+            text=TIEBREAK_DE_FOOTNOTE,
+            font=self._sf(9, "italic"),
+            wraplength=self._scaled_px(900, floor_px=300),
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, padx=10, pady=(0, 6))
 
     def _tb_display_cells(self, tb_values) -> list:
         n = self._active_tb_count()
@@ -8779,6 +8826,7 @@ class PlayerSorterApp:
         # Display full standings
         results_frame = ttk.Frame(frame)
         results_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        self._add_de_footnote(frame)
 
         tree = ttk.Treeview(
             results_frame,
@@ -8972,8 +9020,13 @@ class PlayerSorterApp:
         }.get(system, system.replace("_", " ").title())
 
         tiebreak_display = _meta_tiebreak_display(meta)
+        tb_chain = _meta_tiebreak_chain(meta)
+        tiebreak_label = "Tiebreak Methods" if len(tb_chain) > 1 else "Tiebreak Method"
+        de_footnote = (
+            TIEBREAK_DE_FOOTNOTE if _history_has_blank_de(history, tb_chain) else None
+        )
         tb_n = _history_tb_count(history)
-        tb_headers = _tb_headers(tb_n, _meta_tiebreak_chain(meta))
+        tb_headers = _tb_headers(tb_n, tb_chain)
 
         result_map = {
             "p1_win": "1 – 0",
@@ -8998,7 +9051,7 @@ class PlayerSorterApp:
                 w.writerow(
                     ["Status", "Finished" if meta.get("finished", True) else "Unfinished"]
                 )
-                w.writerow(["Tiebreak Method", tiebreak_display])
+                w.writerow([tiebreak_label, tiebreak_display])
                 w.writerow(
                     ["Double Games", "Yes" if meta.get("double_games_enabled") else "No"]
                 )
@@ -9125,6 +9178,10 @@ class PlayerSorterApp:
                                 *[("—" if v is None else v) for v in _standing_tb_values(s, tb_n)],
                                 s["status"],
                             ])
+
+                if de_footnote:
+                    w.writerow([])
+                    w.writerow(["Note", de_footnote])
 
             messagebox.showinfo(
                 "Export Successful", f"Tournament exported to:\n{save_path}"
@@ -9841,8 +9898,13 @@ class PlayerSorterApp:
         }.get(system, system.replace("_", " ").title())
 
         tiebreak_display = _meta_tiebreak_display(meta)
+        tb_chain = _meta_tiebreak_chain(meta)
+        tiebreak_label = "Tiebreak Methods" if len(tb_chain) > 1 else "Tiebreak Method"
+        de_footnote = (
+            TIEBREAK_DE_FOOTNOTE if _history_has_blank_de(history, tb_chain) else None
+        )
         tb_n = _history_tb_count(history)
-        tb_headers = _tb_headers(tb_n, _meta_tiebreak_chain(meta))
+        tb_headers = _tb_headers(tb_n, tb_chain)
 
         result_map = {
             "p1_win": "1 – 0",
@@ -9974,7 +10036,7 @@ class PlayerSorterApp:
                 f'<td>{cell("Finished" if meta.get("finished", True) else "Unfinished")}</td></tr>'
             )
             parts.append(
-                f'<tr><td class="meta-label">Tiebreak Method</td>'
+                f'<tr><td class="meta-label">{esc(tiebreak_label)}</td>'
                 f'<td>{cell(tiebreak_display)}</td></tr>'
             )
             parts.append(
@@ -10009,6 +10071,12 @@ class PlayerSorterApp:
 
                 parts.append("</details>")
 
+            if de_footnote:
+                parts.append(
+                    '<p class="footnote" style="margin-top:24px;'
+                    'color:var(--subtitle-fg);font-size:13px">'
+                    f'{esc(de_footnote)}</p>'
+                )
             parts.append(
                 "<footer>Generated by Player Sorter — "
                 f'{esc(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))}</footer>'
@@ -10221,6 +10289,17 @@ class PlayerSorterApp:
                     ),
                 )
 
+            if _rows_have_blank_de(
+                round_data["standings_after_round"], self.tiebreak_chain
+            ):
+                # Packed at the BOTTOM first so it always keeps its space.
+                ttk.Label(
+                    right_frame,
+                    text=TIEBREAK_DE_FOOTNOTE,
+                    font=self._sf(9, "italic"),
+                    wraplength=self._scaled_px(520, floor_px=260),
+                    justify=tk.LEFT,
+                ).pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
             stand_scroll = ttk.Scrollbar(
                 right_frame, orient=tk.VERTICAL, command=stand_tree.yview
             )

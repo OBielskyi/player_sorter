@@ -45,12 +45,16 @@ Player Sorter is a comprehensive desktop application designed to organize and ma
 ### Chess-Specific Enhancements
 
 **Tiebreak Methods:**
-Swiss and Round-Robin tournaments support a choice of tiebreak method, selected when the tournament is configured:
+Swiss, Round-Robin and Scheveningen tournaments let you choose up to three tiebreaks (primary, secondary, tertiary) when the tournament is configured. Players tied on points are separated by the first method, those still tied by the second, and so on:
 - Buchholz (sum of opponents' scores)
 - Sonneborn-Berger (opponents' scores weighted by result)
-- Direct Encounter (head-to-head result between tied players)
+- Direct Encounter (results between the tied players themselves, following FIDE rules - see below)
 - Schmuljan (opponents' scores, with wins adding and losses subtracting)
-- None (fall back to rating)
+- Rating (ends the chain; when chosen first it appears as "None (Rating)")
+
+*Direct Encounter* follows FIDE's Tie-Break Regulations (C.07, Article 6): only games among the tied players count (repeated games are averaged), players who stay tied are looked at again among themselves, and in Swiss tournaments a player can still be ranked first (or second, and so on) if no result of the games not yet played could change that. It can appear more than once in a chain, but not twice in a row. A dash in its column means it didn't apply to that player - a footnote on the standings explains this.
+
+Tournaments saved by older versions open as usual.
 
 **FIDE-Compliant Colour Balancing:**
 Swiss, Round-Robin, Knockout, and Scheveningen tournaments automatically balance White/Black assignments, modelled on FIDE's own colour-allocation rules (Handbook C.04.1/C.04.3). This includes preventing three same-colour games in a row, honouring absolute vs. soft colour preferences, and falling back to alternation, rating, or a coin flip when no other criterion applies. Byes and half-byes are treated as colourless and don't affect the balance.
