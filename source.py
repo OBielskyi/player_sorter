@@ -26,6 +26,7 @@ import threading
 import tkinter as tk
 import urllib.error
 import urllib.request
+from fractions import Fraction
 from tkinter import filedialog, messagebox, ttk
 from typing import List
 
@@ -445,7 +446,7 @@ TIEBREAK_DISPLAY = {
 TIEBREAK_DESCRIPTIONS = {
     "buchholz": "Sum of opponents' scores",
     "sonneborn_berger": "Weighted opponents' scores",
-    "direct_encounter": "Head-to-head among tied players (only if all have met)",
+    "direct_encounter": "Head-to-head among tied players (FIDE C.07 Art. 6)",
     "schmuljan": "Opponents' scores, wins add/losses subtract",
     "rating": "Higher rating ranks first (ends the chain)",
 }
@@ -453,17 +454,30 @@ TIEBREAK_DESCRIPTIONS = {
 
 def _normalize_tiebreak_chain(raw) -> list:
     """Clean an arbitrary value into a valid tiebreak chain: unknown methods
-    and duplicates are dropped, nothing is kept after "rating" (ratings are
-    effectively unique, so anything after it could never matter), and the
-    result is capped at TIEBREAK_MAX_CHAIN entries."""
+    are dropped, nothing is kept after "rating" (ratings are effectively
+    unique, so anything after it could never matter), and the result is
+    capped at TIEBREAK_MAX_CHAIN entries.
+
+    Every method may appear only once EXCEPT Direct Encounter: FIDE C.07
+    lists it as "multi-listable" because its outcome depends on which
+    players are still tied when it is applied (e.g. Direct Encounter ->
+    Buchholz -> Direct Encounter is meaningful). It is still never kept
+    twice in a row, since re-applying it immediately cannot separate
+    anything new - Direct Encounter already re-applies itself internally."""
     if not isinstance(raw, (list, tuple)):
         return []
     chain = []
     for method in raw:
-        if method in TIEBREAK_METHODS and method not in chain:
-            chain.append(method)
-            if method == "rating":
-                break
+        if method not in TIEBREAK_METHODS:
+            continue
+        if method == "direct_encounter":
+            if chain and chain[-1] == "direct_encounter":
+                continue
+        elif method in chain:
+            continue
+        chain.append(method)
+        if method == "rating":
+            break
         if len(chain) >= TIEBREAK_MAX_CHAIN:
             break
     return chain
@@ -2352,8 +2366,13 @@ class PlayerSorterApp:
 
         options = []
         for method in TIEBREAK_METHODS:
-            if method in draft:
-                continue  # Each method can appear only once in a chain.
+            if method == "direct_encounter":
+                # FIDE allows Direct Encounter more than once in a list, but
+                # repeating it right away could never separate anything new.
+                if draft and draft[-1] == "direct_encounter":
+                    continue
+            elif method in draft:
+                continue  # Every other method can appear only once.
             if method == "rating" and slot == 0:
                 options.append(("None (Rating)", method, "Use rating as tiebreak"))
             else:
@@ -8401,7 +8420,7 @@ class PlayerSorterApp:
         scores of the whole field, never on who else happens to be tied with
         them). Direct Encounter is deliberately not handled here - it is only
         meaningful relative to a specific tied group, see
-        _direct_encounter_scores."""
+        _direct_encounter_blocks."""
         opponent_results = self._opponent_results(player)
 
         if method == "buchholz":
@@ -8446,48 +8465,137 @@ class PlayerSorterApp:
             return player.rating
         return None
 
-    def _direct_encounter_scores(self, group):
-        """FIDE-style Direct Encounter for ONE tied group.
+    def _direct_encounter_blocks(self, group, swiss):
+        """Apply FIDE Play-Off and Tie-Break Regulations (C.07, effective
+        1 March 2026) Article 6 "Direct Encounter" to ONE tied group.
 
-        Returns {id(player): score in games against the OTHER members of
-        the group} (win 1, draw 0.5, loss 0), or None if Direct Encounter
-        cannot be applied to this group and the tie must be left to the next
-        tiebreak. It is only applicable when every member of the group has
-        played every other member at least once - if even one pair never
-        met, the members' scores would not be comparable (they would be
-        based on different sets of games). A recorded result that is
-        missing/unrecognised (old saves) also makes it non-applicable rather
-        than silently counting as a loss.
+        Returns (blocks, shown):
+          blocks - the group split into an ordered list (best first) of
+                   sub-lists; the players inside one sub-list are still
+                   tied (keeping their original relative order). A single
+                   block means Direct Encounter separated nobody.
+          shown  - {id(player): separate-standings score} for display
+                   (empty when nothing was separated).
 
-        If a pair met more than once (Double Games, a replayed knockout
-        draw), all of their games count.
+        The rules, as implemented:
+          6.1    The "separate standings" are built only from the games
+                 played among the tied players. If two players met more
+                 than once, they contribute the AVERAGE score of those
+                 games (6.1.2), not the sum. (The app has no forfeits, so
+                 the forfeit exclusion of 6.1.1 never applies.) A game
+                 without a recorded result counts as not played.
+          6.2    If ALL tied players have met each other, the separate
+                 standings decide their order; any players still level get
+                 Article 6 re-applied to just them, repeatedly, until
+                 nothing more can be separated.
+          6.3    Swiss only. If not everyone has met everyone, a player is
+                 ranked first when they would be alone at the top of the
+                 separate standings WHATEVER the results of the games not
+                 yet played among the group (i.e. even their worst case
+                 beats every rival's best case); then the same for second
+                 place, and so on. Article 6 is then re-applied to all
+                 players still unranked, with new separate standings
+                 built from only their mutual games.
+        Outside Swiss tournaments only 6.2 exists, so a group in which not
+        everyone has met everyone is left tied.
+
+        Scores are exact Fractions so averages never suffer float noise.
         """
-        if len(group) < 2:
-            return None
+        pos = {id(p): i for i, p in enumerate(group)}
         by_name = {p.name: p for p in group}
         if len(by_name) != len(group):
-            return None  # Duplicate names - can't attribute games reliably.
+            return [list(group)], {}  # Duplicate names - can't attribute games.
 
-        met = {p.name: set() for p in group}
-        scores = {id(p): 0.0 for p in group}
+        points_for = {
+            "win": Fraction(1),
+            "draw": Fraction(1, 2),
+            "loss": Fraction(0),
+        }
+        # Every recorded game with a known result, per ordered pair.
+        games = {}
         for p in group:
             for opp_name, outcome in self._opponent_results(p):
-                if opp_name in by_name and opp_name != p.name:
-                    if outcome not in ("win", "draw", "loss"):
-                        return None
-                    met[p.name].add(opp_name)
-                    if outcome == "win":
-                        scores[id(p)] += 1.0
-                    elif outcome == "draw":
-                        scores[id(p)] += 0.5
+                q = by_name.get(opp_name)
+                if q is None or q is p or outcome not in points_for:
+                    continue
+                games.setdefault((id(p), id(q)), []).append(points_for[outcome])
 
-        everyone = set(by_name)
-        for p in group:
-            if met[p.name] != everyone - {p.name}:
-                return None
-        return scores
+        def standings(members):
+            """Separate standings of `members`: score[id] = sum over the
+            other members of the average result against them; unmet[id] =
+            how many other members this player has no (two-sided) recorded
+            game against."""
+            score, unmet = {}, {}
+            for p in members:
+                s, u = Fraction(0), 0
+                for q in members:
+                    if q is p:
+                        continue
+                    gp = games.get((id(p), id(q)))
+                    gq = games.get((id(q), id(p)))
+                    if gp and gq:
+                        s += sum(gp) / len(gp)
+                    else:
+                        u += 1
+                score[id(p)], unmet[id(p)] = s, u
+            return score, unmet
 
-    def rank_players_with_tiebreaks(self, players, methods=None):
+        def in_entry_order(players):
+            return sorted(players, key=lambda p: pos[id(p)])
+
+        def apply_article_6(members):
+            if len(members) < 2:
+                return [list(members)]
+            score, unmet = standings(members)
+
+            if all(unmet[id(p)] == 0 for p in members):
+                # 6.2: everyone has met everyone.
+                ordered = sorted(members, key=lambda p: score[id(p)], reverse=True)
+                subsets = []
+                for p in ordered:
+                    if subsets and score[id(subsets[-1][0])] == score[id(p)]:
+                        subsets[-1].append(p)
+                    else:
+                        subsets.append([p])
+                if len(subsets) == 1:
+                    return [in_entry_order(members)]  # All level: no progress.
+                blocks = []
+                for subset in subsets:
+                    blocks.extend(apply_article_6(in_entry_order(subset)))
+                return blocks
+
+            if not swiss:
+                return [list(members)]  # 6.3 exists only for Swiss tournaments.
+
+            # 6.3: rank from the top while someone is certain to be first.
+            ranked, remaining = [], list(members)
+            while len(remaining) > 1:
+                top = None
+                for p in remaining:
+                    # p's worst case (every missing game lost) must beat every
+                    # rival's best case (every missing game won).
+                    if all(
+                        score[id(p)] > score[id(q)] + unmet[id(q)]
+                        for q in remaining
+                        if q is not p
+                    ):
+                        top = p
+                        break
+                if top is None:
+                    break
+                ranked.append([top])
+                remaining.remove(top)
+            if not ranked:
+                return [list(members)]
+            return ranked + apply_article_6(in_entry_order(remaining))
+
+        blocks = apply_article_6(list(group))
+        if len(blocks) == 1:
+            return blocks, {}
+        first_level, _ = standings(list(group))
+        return blocks, {id(p): float(first_level[id(p)]) for p in group}
+
+    def rank_players_with_tiebreaks(self, players, methods=None, swiss=None):
         """Rank players using points, then an ordered chain of tiebreaks.
 
         Returns a list of (player, values) where `values` has one entry per
@@ -8501,9 +8609,15 @@ class PlayerSorterApp:
             method is applied only WITHIN the group still tied - so a
             player already separated from the others never influences
             them.
-          * Direct Encounter is evaluated per tied group (see
-            _direct_encounter_scores); if it isn't applicable to a group,
-            that group simply moves on to the next method.
+          * Direct Encounter is evaluated per tied group following FIDE
+            C.07 Article 6 (see _direct_encounter_blocks), including
+            its re-application to still-tied subsets and, in Swiss
+            tournaments, its partial rule; whatever it cannot separate
+            moves on, still tied, to the next method. Its value in the
+            results is the player's score in the separate standings of
+            the group it was applied to (None if it separated nobody).
+            `swiss` says whether the Swiss-only partial rule applies
+            (default: whether this app's tournament_system is Swiss).
           * Players still tied after the whole chain keep their original
             relative order (stable sort).
           * Withdrawn players are ranked among the others by points, then
@@ -8512,6 +8626,8 @@ class PlayerSorterApp:
         """
         methods = [m for m in (self.tiebreak_chain if methods is None else methods) if m]
         n = len(methods)
+        if swiss is None:
+            swiss = getattr(self, "tournament_system", None) == "swiss"
 
         active_players = [p for p in players if not p.withdrawn]
         withdrawn_players = [p for p in players if p.withdrawn]
@@ -8528,11 +8644,16 @@ class PlayerSorterApp:
                 return group
             method = methods[start]
             if method == "direct_encounter":
-                scores = self._direct_encounter_scores(group)
-                if scores is None:
-                    return resolve(group, start + 1)  # Not applicable here.
+                blocks, shown = self._direct_encounter_blocks(group, swiss)
+                if len(blocks) == 1:
+                    # Separated nobody: the whole group moves on, still tied.
+                    return resolve(group, start + 1)
                 for p in group:
-                    values[id(p)][start] = scores[id(p)]
+                    values[id(p)][start] = shown[id(p)]
+                out = []
+                for block in blocks:
+                    out.extend(resolve(block, start + 1))
+                return out
             # Stable, descending: equal players keep their relative order.
             ordered = sorted(group, key=lambda p: values[id(p)][start], reverse=True)
             out = []
@@ -8603,13 +8724,13 @@ class PlayerSorterApp:
 
         return final_result
 
-    def apply_tiebreak(self, players, methods=None):
+    def apply_tiebreak(self, players, methods=None, swiss=None):
         """Backward-compatible wrapper: same ordering as
         rank_players_with_tiebreaks, but returns (player, primary_value)
         tuples - the shape every older call site expects."""
         return [
             (p, vals[0] if vals else None)
-            for p, vals in self.rank_players_with_tiebreaks(players, methods)
+            for p, vals in self.rank_players_with_tiebreaks(players, methods, swiss)
         ]
 
     # ============ END TIEBREAK ENGINE ============
@@ -9206,6 +9327,72 @@ class PlayerSorterApp:
             self._trf_set(line, col, str(rank) if rank else "", 4)
         return "".join(line).rstrip()
 
+    def _trf_saved_standing_ranks(self, players: list, history: list):
+        """Standing ranks (name -> rank) taken from the tournament history's
+        LAST recorded round, i.e. exactly the final ranking that was shown on
+        screen and is printed in the CSV/HTML exports - or None when that
+        snapshot can't be trusted for this export.
+
+        Using the saved ranking (instead of recomputing it) guarantees the
+        TRF agrees with everything else exported from the same tournament,
+        and stays correct even if the ranking rules change in a later
+        version of the app (e.g. files saved before Direct Encounter became
+        FIDE-strict). The snapshot is rejected - and the caller recomputes -
+        unless it matches the players being exported exactly:
+          * it has a standings list with a numeric rank and name per row;
+          * the names are exactly the exported players' names (no missing,
+            extra or duplicate names);
+          * the ranks are exactly 1..N with no gaps or repeats;
+          * every player's saved points AND withdrawn status equal their
+            current ones (if either differs, the live state has moved past
+            the snapshot - e.g. someone withdrew after the last recorded
+            round - so the saved ranks no longer describe the players being
+            exported, and the TRF's own points column would disagree).
+        """
+        if not history:
+            return None
+        rows = history[-1].get("standings_after_round")
+        if not isinstance(rows, list) or not rows:
+            return None
+        ranks = {}
+        saved_points = {}
+        saved_withdrawn = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            name, rank = row.get("name"), row.get("rank")
+            if not isinstance(name, str) or isinstance(rank, bool) or not isinstance(rank, int):
+                return None
+            if name in ranks:
+                return None
+            status = row.get("status")
+            if not isinstance(status, str):
+                return None  # Can't verify withdrawn status (very old save).
+            ranks[name] = rank
+            saved_points[name] = row.get("points")
+            saved_withdrawn[name] = status.startswith("Withdrew")
+        names = [p.name for p in players]
+        if len(set(names)) != len(names) or set(names) != set(ranks):
+            return None
+        if sorted(ranks.values()) != list(range(1, len(names) + 1)):
+            return None
+        for p in players:
+            if saved_points.get(p.name) != p.points:
+                return None
+            if saved_withdrawn.get(p.name) != bool(p.withdrawn):
+                return None
+        return ranks
+
+    def _trf_standing_ranks(self, players: list, history: list) -> dict:
+        """name -> standing rank for TRF column 86-89: the saved ranking when
+        it is trustworthy (see _trf_saved_standing_ranks), otherwise
+        recomputed with the current tiebreak chain."""
+        saved = self._trf_saved_standing_ranks(players, history)
+        if saved is not None:
+            return saved
+        sorted_players = self.apply_tiebreak(players)
+        return {p.name: i + 1 for i, (p, _tb) in enumerate(sorted_players)}
+
     def build_trf16_content(
         self, players: list, history: list, starting_rank_names: list, meta: dict,
         team_a=None, team_b=None, team_a_name="Team A", team_b_name="Team B",
@@ -9234,12 +9421,12 @@ class PlayerSorterApp:
 
         lines = self._trf_tournament_lines(meta)
 
-        # Standing rank (column 86-89) reflects FINAL tiebreak-resolved
-        # standing, not starting rank - these are two different numbers
-        # in TRF and this app already computes the former via
-        # apply_tiebreak exactly as the standings screens do.
-        sorted_players = self.apply_tiebreak(players)
-        standing_rank = {p.name: i + 1 for i, (p, _tb) in enumerate(sorted_players)}
+        # Standing rank (column 86-89) reflects the FINAL tiebreak-resolved
+        # standing, not starting rank - two different numbers in TRF. It is
+        # taken from the saved ranking of the last recorded round (so the
+        # TRF always agrees with the standings/CSV/HTML of the same
+        # tournament) and only recomputed if that snapshot is unusable.
+        standing_rank = self._trf_standing_ranks(players, history)
 
         for player in sorted(players, key=lambda p: rank_by_name.get(p.name, 1 << 30)):
             starting_rank = rank_by_name[player.name]
@@ -9455,6 +9642,11 @@ class PlayerSorterApp:
         # from this point on.
         previous_tiebreak_chain = self.tiebreak_chain
         self.tiebreak_chain = _tiebreak_chain_from_save(data)
+        # Direct Encounter's Swiss-only partial rule depends on the system,
+        # so the saved file's system is swapped in too (and restored).
+        _unset = object()
+        previous_system = getattr(self, "tournament_system", _unset)
+        self.tournament_system = data.get("tournament_system")
         try:
             self._write_trf16(
                 players,
@@ -9468,6 +9660,10 @@ class PlayerSorterApp:
             )
         finally:
             self.tiebreak_chain = previous_tiebreak_chain
+            if previous_system is _unset:
+                self.__dict__.pop("tournament_system", None)
+            else:
+                self.tournament_system = previous_system
 
     # ============ END TRF16 EXPORT ============
 
