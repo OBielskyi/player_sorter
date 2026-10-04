@@ -52,7 +52,7 @@ Swiss, Round-Robin and Scheveningen tournaments let you choose up to three tiebr
 - Schmuljan (opponents' scores, with wins adding and losses subtracting)
 - Rating (ends the chain; when chosen first it appears as "None (Rating)")
 
-*Direct Encounter* follows FIDE's Tie-Break Regulations (C.07, Article 6): only games among the tied players count (repeated games are averaged), players who stay tied are looked at again among themselves, and in Swiss tournaments a player can still be ranked first (or second, and so on) if no result of the games not yet played could change that. It can appear more than once in a chain, but not twice in a row. A dash in its column means it didn't apply to that player - a footnote on the standings explains this.
+*Direct Encounter* follows FIDE's Tie-Break Regulations (C.07, Article 6): only games among the tied players count (repeated games are averaged), players who stay tied are looked at again among themselves, and in Swiss tournaments a player can still be ranked first (or second, and so on) if no result of the games not yet played could change that. It can appear more than once in a chain, but not twice in a row.
 
 Tournaments saved by older versions open as usual.
 
