@@ -2445,10 +2445,23 @@ class PlayerSorterApp:
 
     def _reopen_tiebreak_selection(self):
         """Back-target for the settings screens that follow the tiebreak
-        chain: returns to the LAST tiebreak screen the user went through."""
+        chain: returns to the LAST tiebreak screen the user went through.
+
+        That is the screen where the chain was ended. If it ended because
+        the user chose "No further tiebreak" (so the chain is shorter than
+        the maximum and doesn't end in Rating), it is the screen of the
+        NEXT slot, where that button was clicked. Otherwise (Rating chosen,
+        or the maximum length reached) it is the screen of the last
+        method in the chain."""
         chain = self.tiebreak_chain
         self._tiebreak_draft = chain
-        self.show_tiebreak_selection(max(0, len(chain) - 1))
+        ended_by_no_further = (
+            bool(chain)
+            and chain[-1] != "rating"
+            and len(chain) < TIEBREAK_MAX_CHAIN
+        )
+        slot = len(chain) if ended_by_no_further else max(0, len(chain) - 1)
+        self.show_tiebreak_selection(slot)
 
     def _continue_after_tiebreak(self):
         """Move on to the tournament settings once the chain is final."""
